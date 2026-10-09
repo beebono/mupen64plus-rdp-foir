@@ -390,6 +390,7 @@ void foir_stats_flush(void);   /* write the statistics to $FOIR_STATE_STATS_FILE
 void raster_draw(struct rdp *r, struct span *rows, int jlo, int start, int end);
 /* Render rows of a job on worker context w: rows y with (y / FOIR_STRIPE) % nworkers == worker_id. */
 void raster_render_job(struct rdp *w, const struct span *rows, int jlo, int start, int end);
+void raster_render_job_ref(struct rdp *w, const struct span *rows, int jlo, int start, int end);   /* portable span builder (tests) */
 void raster_init_tables(void);
 void kernels_scalar_init_tables(void);
 

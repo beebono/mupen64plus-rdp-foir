@@ -13,7 +13,11 @@
  * stage, the RDRAM it wrote) are compared with the reference.
  *
  * Stages: 1 texture, 2 combine, 4 zcmp, 8 blend, 16 store, 32 copy (the COPY-cycle span kernel: random tile / TLUT / mask /
- * shift state, random spans including ones that touch the row ends, compared on the whole colour buffer and its hidden bits).
+ * shift state, random spans including ones that touch the row ends, compared on the whole colour buffer and its hidden bits),
+ * 64 batch builder (raster.c, not one of the pixel stages: random rows of edge-walker spans -- four subscanlines with edge positions,
+ * invalid subscanlines, both directions, spans past the row end, 1-4 workers -- through raster_render_job and through its portable
+ * reference raster_render_job_ref with the pixel stages replaced by a recorder; every batch must be identical. Not part of the default
+ * mask: -m 64. The offline replays cannot see this one: the "scalar" replay uses the same batch builder).
  *
  * -S also walks through the shape-specialised combiner kernels (the sixth table, spec.h "Shape kernels"): the state
  * is the random one with random combiner selectors / operands of the kernel's shape written over it
@@ -35,6 +39,7 @@
 #include <string.h>
 #include "../src/rdp.h"
 #include "../src/spec.h"
+#include "../src/mt.h"
 
 #define RDRAM_BYTES 0x200000
 #define FB_BASE 0x10000
@@ -610,6 +615,224 @@ static int run_copy(uint64_t seed, int verbose)
     return bad != 0;
 }
 
+/* ---- batch builder ------------------------------------------------------------------------------- */
+
+/* The span driver (raster.c: raster_render_job) against its portable reference (raster_render_job_ref). Random
+ * primitives and rows of spans the way the edge walker makes them (four subscanlines with edge positions, invalid
+ * subscanlines, both directions, spans that run off the row end), random pipe flags and interpolant steps. The pixel
+ * stages are replaced by a recorder; every batch that would be handed to them must be the same in both builders. */
+
+#define CAP_MAXB 160
+struct cap_batch {
+    int n, all_full, fbrange;
+    uint32_t fbmin, fbmax;
+    uint32_t fbidx[FOIR_BATCH];
+    uint8_t ditidx[FOIR_BATCH], cvg[FOIR_BATCH], cvbit[FOIR_BATCH], offx[FOIR_BATCH], offy[FOIR_BATCH];
+    int16_t xpos[FOIR_BATCH];
+    int32_t s[FOIR_BATCH], t[FOIR_BATCH], w[FOIR_BATCH], cr[FOIR_BATCH], cg[FOIR_BATCH], cb[FOIR_BATCH], ca[FOIR_BATCH], cz[FOIR_BATCH];
+};
+static struct cap_batch g_cap[2][CAP_MAXB];
+static int g_ncap[2], g_cap_slot;
+static long g_bld_batches, g_bld_partial, g_bld_edges;
+
+static void cap_nop(struct rdp *r, struct px_batch *b) { (void)r; (void)b; }
+static void cap_combine(struct rdp *r, struct px_batch *b)
+{
+    (void)r;
+    if (g_ncap[g_cap_slot] >= CAP_MAXB) return;
+    struct cap_batch *c = &g_cap[g_cap_slot][g_ncap[g_cap_slot]++];
+    memset(c, 0, sizeof(*c));
+    c->n = b->n; c->all_full = b->all_full; c->fbrange = b->fbrange; c->fbmin = b->fbmin; c->fbmax = b->fbmax;
+    const int n = b->n;
+    memcpy(c->fbidx, b->fbidx, 4 * n); memcpy(c->ditidx, b->ditidx, n); memcpy(c->xpos, b->xpos, 2 * n);
+    memcpy(c->cvg, b->cvg, n); memcpy(c->cvbit, b->cvbit, n); memcpy(c->offx, b->offx, n); memcpy(c->offy, b->offy, n);
+    memcpy(c->s, b->s, 4 * n); memcpy(c->t, b->t, 4 * n); memcpy(c->w, b->w, 4 * n);
+    memcpy(c->cr, b->cr, 4 * n); memcpy(c->cg, b->cg, 4 * n); memcpy(c->cb, b->cb, 4 * n); memcpy(c->ca, b->ca, 4 * n); memcpy(c->cz, b->cz, 4 * n);
+}
+
+static int32_t bld_step(void)
+{
+    switch (rndn(5)) {
+    case 0: return 0;
+    case 1: return (int32_t)rndn(64) - 32;
+    case 2: return (int32_t)(rnd() & 0xffff) - 0x8000;
+    case 3: return (int32_t)rnd() >> 8;
+    default: return (int32_t)rnd();
+    }
+}
+
+static int bld_cmp(const char *what, const void *a, const void *b, size_t sz, int n, int bi)
+{
+    const uint8_t *pa = a, *pb = b;
+    for (int i = 0; i < n; i++)
+        if (memcmp(pa + (size_t)i * sz, pb + (size_t)i * sz, sz)) {
+            long va = 0, vb = 0;
+            memcpy(&va, pa + (size_t)i * sz, sz); memcpy(&vb, pb + (size_t)i * sz, sz);
+            fprintf(stderr, "  MISMATCH builder %s batch %d lane %d: neon=%ld portable=%ld\n", what, bi, i, va, vb);
+            return 1;
+        }
+    return 0;
+}
+
+static int run_builder(uint64_t seed, int verbose)
+{
+    static struct rdp r;
+    static uint8_t *mem;
+    if (!mem) mem = calloc(1, RDRAM_BYTES);
+    seed_rng(seed ^ 0xb11d3b11dull);
+    struct foir_config cfg;
+    foir_config_defaults(&cfg);
+    cfg.neon = false;
+    rdp_init(&r, &cfg);
+    rdp_attach_memory(&r, mem, RDRAM_BYTES);
+    random_state(&r);
+    cmd(&r, 0x2fu << 24 | ((uint32_t)rndn(2) << 20), rndn(4) == 0 ? 1u << 2 : 0);          /* one / two cycle, Z source select */
+    rdp_update_derived(&r);
+    r.fb_width = 16 + (int)rndn(rndn(3) ? 305 : 1000);
+    if (rndn(2)) r.scfield = (int)rndn(2);
+    r.primitive_z = rnd() & 0x7fff0000u;
+    /* pipe flags */
+    struct pipe_flags *pf = &r.pf;
+    memset(pf, 0, sizeof(*pf));
+    pf->shade_rgb = (uint8_t)rndn(2); pf->shade_a = (uint8_t)rndn(2); pf->need_cz = (uint8_t)rndn(2); pf->need_tex = (uint8_t)rndn(2);
+    pf->need_z = (uint8_t)rndn(2);
+    /* primitive */
+    struct prim_ctx *pc = &r.pc;
+    memset(pc, 0, sizeof(*pc));
+    pc->flip = (int)rndn(2);
+    pc->dr = bld_step(); pc->dg = bld_step(); pc->db = bld_step(); pc->da = bld_step();
+    pc->ds = bld_step(); pc->dt = bld_step(); pc->dw = bld_step(); pc->dz = bld_step();
+    if (rndn(3) == 0) pc->dg = pc->dr;
+    if (r.om.z_source_sel) pc->dz = 0;
+    pc->drinc = pc->flip ? pc->dr : -pc->dr; pc->dginc = pc->flip ? pc->dg : -pc->dg;
+    pc->dbinc = pc->flip ? pc->db : -pc->db; pc->dainc = pc->flip ? pc->da : -pc->da;
+    pc->dsinc = pc->flip ? pc->ds : -pc->ds; pc->dtinc = pc->flip ? pc->dt : -pc->dt;
+    pc->dwinc = pc->flip ? pc->dw : -pc->dw; pc->dzinc = pc->flip ? pc->dz : -pc->dz;
+    r.fb_address = FB_BASE + (rndn(8) << 1) * 2;
+    r.zb_address = Z_BASE + (rndn(8) << 1) * 2;
+    r.nworkers = 1 + (int)rndn(4); r.worker_id = (int)rndn((uint32_t)r.nworkers);
+    if (rndn(2)) r.nworkers = 1, r.worker_id = 0;
+
+    /* rows */
+    static struct span rows[8];
+    const int nrows = 1 + (int)rndn(6), jlo = (int)rndn(40);
+    const int shape = (int)rndn(6);                   /* 0: steep edges, 1: shallow, 2: wide, 3: thin, 4: tiny, 5: anything */
+    const int xmax = rndn(8) ? 330 : 1023;
+    for (int q = 0; q < nrows; q++) {
+        struct span *sp = &rows[q];
+        memset(sp, 0, sizeof(*sp));
+        sp->validline = rndn(10) != 0;
+        int base = (int)rndn((uint32_t)xmax * 8), w8;
+        switch (shape) {
+        case 0: w8 = (int)rndn(40 * 8); break;
+        case 1: w8 = (int)rndn(300 * 8); break;
+        case 2: w8 = (int)rndn(1000 * 8); break;
+        case 3: w8 = (int)rndn(12); break;
+        case 4: w8 = (int)rndn(3); break;
+        default: w8 = (int)rndn(rndn(2) ? 40 : 3000); break;
+        }
+        const int slope = shape == 1 ? (int)rndn(200) - 100 : shape == 0 ? (int)rndn(16) - 8 : (int)rndn(64) - 32;
+        const int allinv = rndn(30) == 0;
+        int lmin = 0x7fffffff, rmax = -1, any = 0;
+        for (int i = 0; i < 4; i++) {
+            int le = base + slope * i + (int)rndn(4) - 2, re = le + w8 + (int)rndn(5) - 2 + (shape == 5 ? (int)rndn(30) - 15 : 0);
+            if (le < 0) le = 0;
+            if (re < le && rndn(8)) re = le + (int)rndn(2);           /* mostly consistent; the rest crosses */
+            if (re < 0) re = 0;
+            if (le > 0x1fff) le = 0x1fff;
+            if (re > 0x1fff) re = 0x1fff;
+            int inv = allinv || rndn(6) == 0;
+            if (shape == 5 && rndn(4) == 0) { le = (int)rndn(0x2000); re = (int)rndn(0x2000); }
+            sp->invalyscan[i] = inv;
+            if (!pc->flip) { sp->minorx[i] = le; sp->majorx[i] = re; } else { sp->majorx[i] = le; sp->minorx[i] = re; }
+            if (!inv) {
+                any = 1;
+                if (le < lmin) lmin = le;
+                if (re > rmax) rmax = re;
+            }
+        }
+        if (!any) { sp->validline = 0; continue; }
+        /* lx / rx the way the edge walker makes them: smallest valid left edge .. largest valid right edge */
+        if (!pc->flip) { sp->lx = lmin >> 3; sp->rx = rmax >> 3; }
+        else           { sp->rx = lmin >> 3; sp->lx = rmax >> 3; }
+        sp->unscrx = sp->rx + (int)rndn(50) - 20;
+        sp->r = rnd_coord(); sp->g = rnd_coord(); sp->b = rnd_coord(); sp->a = rnd_coord();
+        sp->s = rnd_coord(); sp->t = rnd_coord(); sp->w = rnd_coord(); sp->z = rnd_coord();
+    }
+    g_bld_edges++;
+
+    const struct foir_kernels capk = { .name = "capture", .texture = cap_nop, .combine = cap_combine, .zcmp = cap_nop, .blend = cap_nop,
+                                       .store = cap_nop };
+    r.k = &capk;
+    r.spec_dirty = false; r.spec_tile = pc->tilenum;
+    int bad = 0;
+    for (int slot = 0; slot < 2; slot++) {
+        g_cap_slot = slot; g_ncap[slot] = 0;
+        memset(&r.batch, 0x6b, sizeof(r.batch));
+        if (slot == 0) raster_render_job(&r, rows, jlo, jlo, jlo + nrows - 1);
+        else raster_render_job_ref(&r, rows, jlo, jlo, jlo + nrows - 1);
+    }
+    if (g_ncap[0] != g_ncap[1]) { fprintf(stderr, "  MISMATCH builder: %d batches vs %d\n", g_ncap[0], g_ncap[1]); bad++; }
+    for (int i = 0; i < g_ncap[0] && i < g_ncap[1] && !bad; i++) {
+        const struct cap_batch *a = &g_cap[0][i], *c = &g_cap[1][i];
+        g_bld_batches++;
+        if (!a->all_full) g_bld_partial++;
+        if (a->n != c->n || a->all_full != c->all_full || a->fbrange != c->fbrange || a->fbmin != c->fbmin || a->fbmax != c->fbmax) {
+            fprintf(stderr, "  MISMATCH builder batch %d: n %d/%d all_full %d/%d fbmin %u/%u fbmax %u/%u\n", i, a->n, c->n, a->all_full, c->all_full,
+                    a->fbmin, c->fbmin, a->fbmax, c->fbmax);
+            bad++; break;
+        }
+        const int n = a->n;
+        bad += bld_cmp("fbidx", a->fbidx, c->fbidx, 4, n, i) + bld_cmp("ditidx", a->ditidx, c->ditidx, 1, n, i) + bld_cmp("xpos", a->xpos, c->xpos, 2, n, i) +
+               bld_cmp("cvg", a->cvg, c->cvg, 1, n, i) + bld_cmp("cvbit", a->cvbit, c->cvbit, 1, n, i) + bld_cmp("offx", a->offx, c->offx, 1, n, i) +
+               bld_cmp("offy", a->offy, c->offy, 1, n, i);
+        if (pf->shade_rgb) bad += bld_cmp("cr", a->cr, c->cr, 4, n, i) + bld_cmp("cg", a->cg, c->cg, 4, n, i) + bld_cmp("cb", a->cb, c->cb, 4, n, i);
+        if (pf->shade_a || pf->shade_rgb) bad += bld_cmp("ca", a->ca, c->ca, 4, n, i);
+        if (pf->need_cz) bad += bld_cmp("cz", a->cz, c->cz, 4, n, i);
+        if (pf->need_tex) bad += bld_cmp("s", a->s, c->s, 4, n, i) + bld_cmp("t", a->t, c->t, 4, n, i) + bld_cmp("w", a->w, c->w, 4, n, i);
+        if (bad) break;
+    }
+    /* worker row ownership: only rows of the worker's stripes, and the workers together render what one context does */
+    for (int i = 0; i < g_ncap[0] && !bad; i++)
+        for (int k = 0; k < g_cap[0][i].n; k++) {
+            const int row = (int)(g_cap[0][i].fbidx[k] / (uint32_t)r.fb_width);
+            if (((row >> FOIR_STRIPE_SHIFT) % r.nworkers) != r.worker_id) {
+                fprintf(stderr, "  MISMATCH builder: pixel of row %d rendered by worker %d of %d\n", row, r.worker_id, r.nworkers);
+                bad++; break;
+            }
+        }
+    if (!bad && r.nworkers > 1) {
+        long sum = 0, one = 0;
+        const int nw = r.nworkers, wid = r.worker_id;
+        for (int w = 0; w <= nw; w++) {
+            r.nworkers = w < nw ? nw : 1; r.worker_id = w < nw ? w : 0;
+            g_cap_slot = 1; g_ncap[1] = 0;
+            memset(&r.batch, 0x6b, sizeof(r.batch));
+            raster_render_job_ref(&r, rows, jlo, jlo, jlo + nrows - 1);
+            long n = 0;
+            for (int i = 0; i < g_ncap[1]; i++) n += g_cap[1][i].n;
+            if (w < nw) sum += n; else one = n;
+        }
+        r.nworkers = nw; r.worker_id = wid;
+        if (sum != one && g_ncap[1] < CAP_MAXB) { fprintf(stderr, "  MISMATCH builder: %d workers render %ld pixels, one context %ld\n", nw, sum, one); bad++; }
+    }
+    g_checks++;
+    if (bad) {
+        fprintf(stderr, "seed %llu: builder flip=%d fb_width=%d nrows=%d jlo=%d pf=%d%d%d%d\n", (unsigned long long)seed, pc->flip, r.fb_width, nrows, jlo,
+                pf->shade_rgb, pf->shade_a, pf->need_cz, pf->need_tex);
+        for (int q = 0; q < nrows; q++) {
+            const struct span *sp = &rows[q];
+            fprintf(stderr, "  row %d valid=%d lx=%d rx=%d unscrx=%d minor=%d,%d,%d,%d major=%d,%d,%d,%d inval=%d%d%d%d\n", q, sp->validline, sp->lx, sp->rx,
+                    sp->unscrx, sp->minorx[0], sp->minorx[1], sp->minorx[2], sp->minorx[3], sp->majorx[0], sp->majorx[1], sp->majorx[2], sp->majorx[3],
+                    sp->invalyscan[0], sp->invalyscan[1], sp->invalyscan[2], sp->invalyscan[3]);
+        }
+        g_bad += bad;
+    }
+    if (verbose) fprintf(stderr, "seed %llu builder done (%s)\n", (unsigned long long)seed, bad ? "BAD" : "ok");
+    rdp_destroy(&r);
+    return bad != 0;
+}
+
 int main(int argc, char **argv)
 {
     long iters = 1000;
@@ -636,7 +859,13 @@ int main(int argc, char **argv)
             failed++;
             if (failed >= 20) break;
         }
+        if ((mask & 64) && !g_spec_mode && run_builder(seed0 + (uint64_t)i, verbose)) {
+            failed++;
+            if (failed >= 20) break;
+        }
     }
+    if ((mask & 64) && !g_spec_mode)
+        printf("kfuzz builder: %ld batches compared, %ld of them with partially covered pixels\n", g_bld_batches, g_bld_partial);
     if ((mask & 32) && !g_spec_mode)
         printf("kfuzz copy: %ld spans wrote pixels; by kind: scalar fallback %ld, RGBA16 %ld, TLUT8 %ld, TLUT16 %ld, TLUT4 %ld, other texels %ld\n", g_copy_wrote,
                g_copy_kind[0], g_copy_kind[4], g_copy_kind[2], g_copy_kind[1], g_copy_kind[3], g_copy_kind[5]);

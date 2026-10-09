@@ -182,7 +182,7 @@ targets:
 	@echo "  Targets:"
 	@echo "    all           == Build the foir video plugin ($(TARGET))"
 	@echo "    replay        == Build the offline replay tool ($(REPLAY))"
-	@echo "    check         == Run the bit-exactness checks (neoncheck.py, mtfuzz.py, kfuzz incl. the COPY kernel, every specialised variant, texture any-format kernel and combiner shape kernel)"
+	@echo "    check         == Run the bit-exactness checks (neoncheck.py, mtfuzz.py, kfuzz incl. the COPY kernel, the batch builder, every specialised variant, texture any-format kernel and combiner shape kernel)"
 	@echo "    fuzz          == Build the NEON-vs-scalar kernel fuzzer ($(KFUZZ), needs an aarch64 build)"
 	@echo "    clean         == remove object files"
 	@echo "    rebuild       == clean and re-build all"
@@ -221,6 +221,7 @@ ifeq ("$(CPU)","AARCH")
 	python3 $(TOOLDIR)/mtfuzz.py -n 40 -s 2000 --tex shape --replay ./$(REPLAY) --runner "$(RUNNER)"
 	$(RUNNER) $(KFUZZ) -n 3000
 	$(RUNNER) $(KFUZZ) -m 32 -n 20000 -s 700000
+	$(RUNNER) $(KFUZZ) -m 64 -n 40000 -s 800000
 	$(RUNNER) $(KFUZZ) -S -n 15000
 	$(RUNNER) $(KFUZZ) -S -T 5 -n 15000 -s 500000
 	$(RUNNER) $(KFUZZ) -S -T 0 -n 8000 -s 900000

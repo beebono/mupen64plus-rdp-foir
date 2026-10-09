@@ -750,6 +750,123 @@ total that is 11 % smaller in Paper Mario, 18.9 -> 16.2 % in Rocket); the batch 
 `SYNC_FULL` falls from 2.8 to 2.1 ms. Both games were at the 60 fps cap before; the gain is CPU headroom (and battery), not frame rate. Rocket's frames are not comparable one to one (different scenes in the two runs), its profile only shows where the time moved.
 
 
+### Batch builder: edge-zone coverage and fixed-size ramps
+
+The batch builder (`raster_render_job` and what it inlines, `src/raster.c`) was the second largest item of the in-game profile (17-23 % of foir's CPU time) and, at one thread, instruction bound
+(IPC 0.95, about 800 cycles per span plus 17 per pixel; spans are 9 pixels long in Donkey Kong 64, 17-18 in Snap and Rocket, 40-50 in Paper Mario and Banjo-Kazooie). Inside it the cycles went to
+`ramp4` 26 %, `compute_cvg` 20 % (about 214 instructions per span: four byte read-modify-write loops per span, a `memset`, `leftcvghex` / `rightcvghex`), `fill_cvg` 15 %, `fill_idx` 10 %,
+`prefetch_piece` 8 % and the rest of `render_span_cycle` 16 %, and the function had ~40 % of all branch mispredictions of a replay. Two changes, each measured on its own and together:
+
+* **Coverage from the edge zones (`cvg_edges_init`, `cvg_mask_at`, `cvg_patch`).** Subscanline *i* covers the pixels strictly between its edges completely and the two edge pixels with the partial mask of `leftcvghex` /
+  `rightcvghex`; as a mask that is `A_i(x) & B_i(x)` with `A_i = x > le_i ? F_i : x == le_i ? L_i : 0` and `B_i = x < re_i ? F_i : x == re_i ? R_i : 0` (`F_i`: the subscanline's bits of the 8-bit mask), which also gives
+  the old answer for `le_i == re_i` (`L & R`) and for crossed edges (nothing); an invalid subscanline has no bits. The span runs from the smallest valid left edge to the largest valid right edge, so every pixel right of all left
+  edges and left of all right edges has one and the same mask (all bits of the valid subscanlines: `0xff`, or less when `invalyscan` is set). The interior therefore needs no coverage computation at all: its `cvg`, `cvbit`,
+  `offx`, `offy` are four constant vector stores (splatted from `cvarray[mask]` with one `ld4r`), and only the pixels of the two edge zones (up to the largest left edge, from the smallest right edge; normally one or two
+  pixels each, more for shallow edges) are evaluated and patched in afterwards: the four subscanlines in the four lanes of a vector (edge pixel, `F`, `L`, `R` per lane, the `L` / `R` values from a 32-byte `vqtbl2q` table), a few
+  compares, a select, a horizontal add, then `cvarray[mask]`. The per-scanline coverage buffer, its byte loops and the `memset` are gone from the NEON path (the portable builder keeps `compute_cvg`; it is the reference).
+  `all_full` is cleared per piece when the interior mask is not `0xff` or an edge pixel is not.
+* **Fixed-size ramps (`piece_fill`).** `fill_idx`, `fill_cvg` and the eight `ramp4` loops (nine variable-trip loops per piece, each ending in a data-dependent branch) are one loop over groups of four lanes in which the
+  ramps of all channels advance together (one exit branch per piece), plus whole-vector (16-lane) stores for the byte arrays; the arrays have 16 lanes of slack (`FOIR_LANES = FOIR_BATCH + 16`, a piece starts below lane 64
+  and rounds up to at most lane 79) and the lanes past the piece are ignored. The channel set (shade rgb + alpha / alpha only, Z, texture) is a compile-time constant of each of 12 instances selected by one `switch` per
+  piece, so the body has no per-channel branches and the independent channels interleave.
+
+The old and the new builder are both in the tree: `render_span_ref` (portable C, with `compute_cvg`) builds the batches of the scalar renderer and is the reference of `foir-kfuzz -m 64` (below).
+
+**Timing.** `foir-replay --fast` (the plugin's default knobs) on the rgdsplus, `performance` governor (restored to `schedutil`), the builds of one session run alternately (the order rotated every round), median of 5 rounds
+of `-n 8..150` repeats per dump and thread count; *before* = `devel` HEAD built from a clean copy, *+ coverage zones* = only the coverage change (the old `ramp4` / `fill_idx` loops), *+ ramps* = only the new ramps (old `compute_cvg` /
+`fill_cvg`), *both* = this tree. Same flags (`-O3`, generic armv8-a). Spread between rounds: < 1 % at one thread, up to 10-15 % with three workers.
+
+One thread (`-t 0`), ms per run:
+
+| dump | before | + coverage zones | + fixed-size ramps | both (this tree) |
+|---|---:|---:|---:|---:|
+| Paper Mario (900) | 12.52 | 12.16 (-2.9 %) | 12.31 (-1.7 %) | 11.95 (-4.6 %) |
+| Banjo-Kazooie (450) | 36.86 | 36.12 (-2.0 %) | 36.12 (-2.0 %) | 35.27 (-4.3 %) |
+| Donkey Kong 64 (800) | 16.68 | 15.76 (-5.5 %) | 16.61 (-0.4 %) | 15.68 (-6.0 %) |
+| Pokemon Snap (300) | 75.91 | 73.60 (-3.0 %) | 75.14 (-1.0 %) | 72.16 (-4.9 %) |
+| Rocket Robot on Wheels (1500) | 28.49 | 27.20 (-4.5 %) | 27.96 (-1.8 %) | 27.01 (-5.2 %) |
+| Super Mario 64 (650) | 20.98 | 19.98 (-4.8 %) | 20.37 (-2.9 %) | 19.21 (-8.4 %) |
+| Star Fox 64 (1000) | 18.70 | 18.22 (-2.6 %) | 18.54 (-0.8 %) | 18.15 (-2.9 %) |
+| GoldenEye 007 (900) | 6.43 | 5.95 (-7.6 %) | 6.45 (+0.3 %) | 6.03 (-6.2 %) |
+| **geometric mean of the ratios to "before"** | 1 | **0.959** | **0.987** | **0.947** |
+
+Three workers (`-t 3`; the parser thread is the other bottleneck, so only part of the worker time shows; noisy):
+
+| dump | before | + coverage zones | + fixed-size ramps | both (this tree) |
+|---|---:|---:|---:|---:|
+| Paper Mario (900) | 5.06 | 4.99 (-1.3 %) | 4.92 (-2.6 %) | 5.32 (+5.1 %) |
+| Banjo-Kazooie (450) | 14.01 | 12.77 (-8.9 %) | 12.56 (-10.3 %) | 12.34 (-11.9 %) |
+| Donkey Kong 64 (800) | 7.12 | 6.99 (-1.8 %) | 7.52 (+5.6 %) | 6.56 (-7.8 %) |
+| Pokemon Snap (300) | 29.62 | 26.77 (-9.6 %) | 28.26 (-4.6 %) | 25.63 (-13.5 %) |
+| Rocket Robot on Wheels (1500) | 11.59 | 11.46 (-1.1 %) | 11.31 (-2.4 %) | 10.57 (-8.8 %) |
+| Super Mario 64 (650) | 8.51 | 7.80 (-8.4 %) | 7.58 (-10.9 %) | 7.23 (-15.1 %) |
+| Star Fox 64 (1000) | 7.62 | 8.23 (+8.0 %) | 7.39 (-3.1 %) | 8.07 (+5.8 %) |
+| GoldenEye 007 (900) | 2.93 | 2.65 (-9.5 %) | 2.93 (+0.0 %) | 2.67 (-9.1 %) |
+| **geometric mean of the ratios to "before"** | 1 | **0.957** | **0.963** | **0.928** |
+
+A second session with only *before* and *both* (8 more rounds, 13 rounds pooled) gives the three-worker medians 5.06 -> 5.09 (Paper Mario), 13.42 -> 12.41 (Banjo-Kazooie), 7.18 -> 6.56 (Donkey Kong 64), 29.62 -> 26.05 (Pokemon Snap), 11.64 -> 10.57 (Rocket Robot on Wheels), 8.33 -> 7.27 (Super Mario 64), 7.59 -> 7.92 (Star Fox 64), 2.93 -> 2.73 (GoldenEye 007): geometric mean **0.933 (-6.7 %)**.
+Paper Mario and Star Fox 64 do not move at three workers (their frames are limited by the parser thread, 5 ms and 8 ms); single entries change by +-5 % between sessions.
+At one thread the gain is **-5.3 %** of the replay time (1.06x), -4.1 % of it from the coverage change; the ramps alone are worth -1.3 % (+0.3 % in GoldenEye, whose spans are the shortest) and add -1.2 % on top of the coverage change.
+
+**Counters** (`perf stat`, one thread, `performance` governor; whole replay per run, by difference of `-n 4` and `-n 24`; "per span": instructions saved per span of the dump, all of it in the batch builder and the libc `memset` it called):
+
+| dump | instructions before -> both | branch mispredictions before -> both | cycles before -> both |
+|---|---:|---:|---:|
+| Paper Mario (900) | 21.28 M -> 19.81 M (-6.9 %), 449 per span | 77 K -> 49 K (-37 %) | 25.97 M -> 24.82 M (-4.4 %) |
+| Banjo-Kazooie (450) | 59.66 M -> 55.76 M (-6.5 %), 615 per span | 224 K -> 128 K (-43 %) | 63.78 M -> 62.68 M (-1.7 %) |
+| Donkey Kong 64 (800) | 27.42 M -> 25.26 M (-7.9 %), 259 per span | 124 K -> 84 K (-33 %) | 32.49 M -> 30.93 M (-4.8 %) |
+| Pokemon Snap (300) | 119.60 M -> 110.04 M (-8.0 %), 387 per span | 682 K -> 386 K (-43 %) | 127.04 M -> 119.78 M (-5.7 %) |
+| Rocket Robot on Wheels (1500) | 44.36 M -> 40.83 M (-7.9 %), 385 per span | 242 K -> 146 K (-40 %) | 51.28 M -> 49.01 M (-4.4 %) |
+
+Inside `raster_render_job` alone (sampled `instructions` / `cycles` / `br_mis_pred` of the -g build, divided by the 31 passes and the span count of the dump; sampling error 5-10 %; the `memset` of the old
+`compute_cvg` is a libc call and not counted in *before*):
+
+| dump (spans per run) | instructions per span | cycles per span | mispredictions per span | share of all cycles |
+|---|---:|---:|---:|---:|
+| Paper Mario (3,272) | 1075 -> 782 | 1124 -> 862 | 9.6 -> 3.0 | 13.2 % -> 10.4 % |
+| Banjo-Kazooie (6,334) | 1414 -> 996 | 1605 -> 1215 | 18.0 -> 5.6 | 15.2 % -> 12.0 % |
+| Donkey Kong 64 (8,360) | 708 -> 498 | 702 -> 534 | 6.3 -> 2.4 | 16.9 % -> 13.4 % |
+| Pokemon Snap (24,686) | 1006 -> 663 | 1064 -> 777 | 13.9 -> 4.3 | 19.7 % -> 15.2 % |
+| Rocket Robot on Wheels (9,149) | 963 -> 651 | 1067 -> 777 | 12.4 -> 3.8 | 17.9 % -> 13.7 % |
+
+What is left inside (Donkey Kong 64, ~500 instructions and ~530 cycles a span, rough split of the samples): the span set-up and the piece bookkeeping a third, `piece_fill` (about 45 vector stores per 16-lane piece) a quarter,
+the two edge-zone pixels 2.6 per span and `cvg_edges_init` together a quarter, `prefetch_piece` 9-13 %, the row loop 6 %.
+
+**Tried and left out** (each a build of its own against the one it would extend, same method, 3-5 rounds; differences below ~1 % are noise):
+* *16-lane blocks for the ramps* (the first version of the ramps: whole 16-lane vectors for every array, a second pass only for pieces longer than 16 pixels): the loop over groups of four lanes above is 0.9 % / 0.7 % faster
+  in two sessions of five rounds (Donkey Kong 64 -1.5 %, GoldenEye -2 to -2.4 %, Rocket -1 %, SM64 -2 %, Star Fox 64 +1 %); the 16-lane version alone was worth -0.8 %.
+* *Per-channel run-time branches instead of the 12 instances* (the same block with `if (f_rgb)` ...): +0.7 % slower geometric mean over the 8 dumps (5 rounds, 16-lane version); the 12 instances are kept.
+* *Splatting channels whose step is zero* (store the base vector four times, no adds): no gain (Donkey Kong 64 -0.9 %, Banjo-Kazooie -0.9 %, Paper Mario 0.0 %, Snap -0.1 %, Rocket 0.0 %), although the
+  steps are zero often (Banjo-Kazooie: r, b and a in 99-100 % of the pieces, g in 82 %; Paper Mario: r, g, b 55 %, a 77 %, t and w 73 %; Donkey Kong 64: t and w 27 %; Snap: a 67 %) -- the add is not what the ramp costs.
+* *Eight-lane half blocks* for pieces of up to 8 pixels (one more branch per piece): same instruction count, Donkey Kong 64 +2.1 %, Paper Mario +0.2 %, Snap -1.6 % (16-lane version): not kept.
+* *`render_span_cycle` out of line* (it is inlined into the job loop and keeps ~20 vector registers live): +0.7 / +0.6 / +1.3 % (Paper Mario, Donkey Kong 64, Snap; 16-lane version).
+* *Prefetch* (`prefetch_piece`, ~50 instructions a piece): switching it off costs Donkey Kong 64 **+3.8 %** (Paper Mario -0.6 %, Snap 0.0 %), so it still pays; cheaper versions -- first and last line of each range only, or
+  without the hidden-bit lines -- are equal within noise (Donkey Kong 64 +0.7 % / -0.6 %) and were not taken over. Issuing it per span instead of per piece changes nothing (a span is 1.1 pieces on average).
+* *Visiting only the worker's own stripes* in the row loop instead of testing `(y >> 2) % nw` for every row (one integer division per row, 3 of 4 rows skipped by each of three workers): no difference at three workers
+  within the noise (-6.4 % with the stripe walk, -7.6 % with the per-row test, 5 rounds, 16-lane version); not kept.
+
+**Exactness.** The builder was not covered by the existing checks on aarch64: `foir-replay --scalar` and the other "reference" configurations of `neoncheck.py` / `mtfuzz.py` replace the kernels, not the batch builder, so a wrong NEON
+builder makes the reference and the candidate wrong in the same way (the mutations below pass `neoncheck.py`). Three checks cover it now:
+* `foir-kfuzz -m 64` (new; `make check` runs 40,000 iterations): random primitives and rows of edge-walker spans -- four subscanlines with 13-bit edge positions in the shapes of steep, shallow, wide, thin and one-pixel spans, crossed edges,
+  invalid subscanlines (also all four), both directions, spans that run off the row end, 16-1015 pixel wide framebuffers, random pipe flags (shade rgb / alpha, Z, texture), random interpolant steps (zero, small, huge), `z_source_sel`, 1-4 workers --
+  through `raster_render_job` and through `raster_render_job_ref` with the pixel stages replaced by a recorder; every batch (all lanes of `fbidx`, `ditidx`, `xpos`, the enabled ramps, `cvg`, `cvbit`, `offx`, `offy`, `n`, `all_full`,
+  `fbmin`, `fbmax`) must be identical, the rows rendered by a worker must belong to its stripes and the workers together must render as many pixels as one context. 40,000 iterations: 84,681 batches compared, 70,743 of them with partially covered pixels, **0 differences**.
+* End to end across architectures: the final RDRAM of every one of the 12 captured frames from the x86_64 scalar build (`NEON=0`, portable builder) and from the aarch64 NEON build (qemu), inline and with 3 workers: **24 of 24 byte-identical**.
+* `make all replay ref NEON=0 && python3 tools/regress.py` (the portable builder against angrylion): 15 of 15 scenes, 0 differing pixels.
+
+Also run: `make check` as a whole (`neoncheck.py`: 12 captured frames + 15 synthetic scenes, 27 scenes, 0 differing bytes in every configuration; `mtfuzz.py` 60 + 40 + 40 scenes, 0 differences; `foir-kfuzz`, `-m 32`, `-S`, `-S -T 5`,
+`-S -T 0`: 0 differences) and `FOIR_NEON_VERIFY=1 FOIR_KNOBS=exact` on the 12 captured frames at 0 and 3 workers: 504 K batches over the five stages, **0 mismatching**.
+
+**Mutations** (a deliberately wrong version is built; `foir-kfuzz -m 64`, the aarch64-vs-x86 cross check and `neoncheck.py` on the synthetic scenes are run on it):
+
+| mutation | `kfuzz -m 64` | cross check (24 renders) | `neoncheck.py` synthetic scenes |
+|---|---|---|---|
+| right-edge value of subscanline 1 at `x & 7 == 5`: bit `0x40` flipped in `cvg_rtab` | 20 failing iterations within 353 | 14 of 24 differ | 0 differences |
+| interior mask: `0x05` -> `0x04` in the mask of subscanline 3 | 20 within 46 | 14 of 24 differ | 0 differences |
+| Z ramp of a piece built from the `w` step instead of the `z` step (`dI[7]` -> `dI[6]`) | 20 within 67 | 12 of 24 differ | 0 differences |
+
+(A change of the right-edge value that only touches bits outside the subscanline's own mask is not a mutation: `A & B` hides it, as it should -- a first attempt, `^ 1`, passed everything.)
+
 ### In-game frame rate
 
 | game (VI frames ending at) | M2 scalar | NEON | NEON + 1 worker | NEON + 2 | NEON + 3 |
@@ -992,7 +1109,7 @@ the data for the decision is:
    feasibility checkpoint). Shape-specialised combiner kernels (the cheaper fallback for selector sets that no exact variant covers) are in.
    **Cheap wins after M3 -- done:** NEON COPY-cycle rectangles, inlined / hoisted / prefetched colour and Z buffer access, "any format" texture kernels and the complete Z compare list (see
    [results](#cheap-wins-after-m3)). Open items: variants for 32-bit colour buffers, the NEON COPY kernel for 8-bit colour buffers and COPY triangles, contiguous-texel fast paths for the COPY kernel,
-   the per-lane path of the groups that straddle two scanlines (a vector form was measured and does not pay on the A55), batch building (the second largest item of the in-game profile, 20 %, not looked at yet).
+   the per-lane path of the groups that straddle two scanlines (a vector form was measured and does not pay on the A55), batch building (the second largest item of the in-game profile, 20 %: first step done, see [the results](#batch-builder-edge-zone-coverage-and-fixed-size-ramps); what is left is ~500 instructions a span, mostly the 45 vector stores of a piece, the per-piece prefetch and the edge-zone pixels).
 4. **M4 -- Tuning:** per-game hints set by suxty, A53 profiling, more of the
    speed knobs (texture precision), VI filters if wanted.
 
@@ -1026,7 +1143,7 @@ performance-neutral (foir-replay 1-2.5% faster single-threaded, 2-5% slower with
 src/plugin.c          Mupen64Plus exports, [Video-Foir] config, frame skipping, UpdateScreen/ReadScreen2
 src/parser.c          DP command list reader, command dispatch, state-setting commands, derived pipeline flags
 src/setup.c           primitive setup: triangle / texrect / fillrect -> edge walker -> span records
-src/raster.c          span -> pixel-batch builder (NEON interpolant ramps, coverage), worker row ownership
+src/raster.c          span -> pixel-batch builder (NEON: fixed-size ramps, edge-zone coverage; portable reference builder), worker row ownership
 src/mt.c              worker pool: job ring, state / TMEM snapshots, hazards and barriers
 src/tmem.c            TMEM model, LOAD_TILE/BLOCK/TLUT (word-wise fast path), texel readback
 src/kernels_scalar.c  scalar reference kernels (combiner, Z, blender, FB store, FILL, COPY)
@@ -1071,6 +1188,8 @@ python3 ../../tools/vitest.py ./foir-replay                           # interlac
   variants off (`--nospec`, the generic NEON kernels) inline and with 3 workers, and with the plugin-default knobs
   (`--fast`: RelaxedPrecision, which the scalar kernels do not have) variants against generic kernels; the final RDRAM
   images must be byte-identical. It also prints the share of the pixels that ran in specialised variants per scene.
+* `foir-kfuzz -m 64` checks the batch builder (`raster.c`) against its portable reference, which the replay-based checks cannot do (they replace the kernels, not the builder); see
+  [the results](#batch-builder-edge-zone-coverage-and-fixed-size-ramps). The aarch64-vs-x86 cross check is a plain `foir-replay -o` of each dump from the `NEON=0` x86_64 build and the aarch64 build, compared with `cmp`.
 * `foir-kfuzz` (aarch64 only) draws random render states through the real command parser, random TMEM /
   framebuffer / Z contents and random pixel batches and requires every NEON stage to equal the scalar stage;
   the store stage is checked on the resulting RDRAM including the hidden bits. **`foir-kfuzz -S` fuzzes the specialised
