@@ -26,11 +26,14 @@
 #include "vi.h"
 #include "gl_out.h"
 #include "capture.h"
+#include "foir_suxty.h"
+#include <pthread.h>
 
 #define PLUGIN_API_VERSION 0x020500
 
 static ptr_ConfigOpenSection ConfigOpenSection;
 static ptr_ConfigSaveSection ConfigSaveSection;
+static ptr_ConfigSetParameter ConfigSetParameter;
 static ptr_ConfigSetDefaultInt ConfigSetDefaultInt;
 static ptr_ConfigSetDefaultBool ConfigSetDefaultBool;
 static ptr_ConfigSetDefaultString ConfigSetDefaultString;
@@ -41,6 +44,7 @@ static ptr_PluginGetVersion CoreGetVersion;
 
 static void *l_core;
 static bool l_initialized, l_rom_open, l_warned_hle;
+static pthread_t l_emu_thread;                /* the thread that opened the ROM = the one running ProcessRDPList/UpdateScreen */
 static GFX_INFO l_gfx;
 static void (*l_render_cb)(int);
 static m64p_handle l_cfg_general, l_cfg_foir;
@@ -121,6 +125,7 @@ EXPORT m64p_error CALL PluginStartup(m64p_dynlib_handle core, void *context, voi
 #define SYM(var, type, name) var = (type)dlsym(core, name)
     SYM(ConfigOpenSection, ptr_ConfigOpenSection, "ConfigOpenSection");
     SYM(ConfigSaveSection, ptr_ConfigSaveSection, "ConfigSaveSection");
+    SYM(ConfigSetParameter, ptr_ConfigSetParameter, "ConfigSetParameter");
     SYM(ConfigSetDefaultInt, ptr_ConfigSetDefaultInt, "ConfigSetDefaultInt");
     SYM(ConfigSetDefaultBool, ptr_ConfigSetDefaultBool, "ConfigSetDefaultBool");
     SYM(ConfigSetDefaultString, ptr_ConfigSetDefaultString, "ConfigSetDefaultString");
@@ -181,23 +186,32 @@ EXPORT int CALL InitiateGFX(GFX_INFO info)
     return 1;
 }
 
+/* the [Video-Foir] section -> c */
+static void read_foir_section(struct foir_config *c)
+{
+    c->fast_combiner = ConfigGetParamBool(l_cfg_foir, "FastCombiner") != 0;
+    c->relaxed_precision = ConfigGetParamBool(l_cfg_foir, "RelaxedPrecision") != 0;
+    c->interlace_hack = ConfigGetParamBool(l_cfg_foir, "InterlaceHack") != 0;
+    c->threads = ConfigGetParamInt(l_cfg_foir, "Threads");
+    c->specialize = ConfigGetParamBool(l_cfg_foir, "Specialize") != 0;
+    c->neon = ConfigGetParamBool(l_cfg_foir, "NEON") != 0;
+    c->vsync = ConfigGetParamBool(l_cfg_foir, "VSync") != 0;
+    c->filter = ConfigGetParamBool(l_cfg_foir, "Filter") != 0;
+    c->widescreen = ConfigGetParamBool(l_cfg_foir, "Widescreen") != 0;
+    const char *fs = ConfigGetParamString(l_cfg_foir, "FrameSkip");
+    if (fs && !strcmp(fs, "auto")) c->frame_skip = FOIR_FRAMESKIP_AUTO;
+    else c->frame_skip = fs ? atoi(fs) : 0;
+}
+
+static void suxty_apply_staged(struct foir_config *c);
+
 static void load_config(void)
 {
     l_fullscreen = ConfigGetParamBool(l_cfg_general, "Fullscreen") != 0;
     l_win_w = ConfigGetParamInt(l_cfg_general, "ScreenWidth");
     l_win_h = ConfigGetParamInt(l_cfg_general, "ScreenHeight");
-    l_cfg.fast_combiner = ConfigGetParamBool(l_cfg_foir, "FastCombiner") != 0;
-    l_cfg.relaxed_precision = ConfigGetParamBool(l_cfg_foir, "RelaxedPrecision") != 0;
-    l_cfg.interlace_hack = ConfigGetParamBool(l_cfg_foir, "InterlaceHack") != 0;
-    l_cfg.threads = ConfigGetParamInt(l_cfg_foir, "Threads");
-    l_cfg.specialize = ConfigGetParamBool(l_cfg_foir, "Specialize") != 0;
-    l_cfg.neon = ConfigGetParamBool(l_cfg_foir, "NEON") != 0;
-    l_cfg.vsync = ConfigGetParamBool(l_cfg_foir, "VSync") != 0;
-    l_cfg.filter = ConfigGetParamBool(l_cfg_foir, "Filter") != 0;
-    l_cfg.widescreen = ConfigGetParamBool(l_cfg_foir, "Widescreen") != 0;
-    const char *fs = ConfigGetParamString(l_cfg_foir, "FrameSkip");
-    if (fs && !strcmp(fs, "auto")) l_cfg.frame_skip = FOIR_FRAMESKIP_AUTO;
-    else l_cfg.frame_skip = fs ? atoi(fs) : 0;
+    read_foir_section(&l_cfg);
+    suxty_apply_staged(&l_cfg);          /* values the suxty menu set for this launch (no-op unless it did) */
     /* environment overrides for testing and benchmarking */
     const char *ne = getenv("FOIR_NEON");
     if (ne && *ne) l_cfg.neon = atoi(ne) != 0;
@@ -211,6 +225,7 @@ static void load_config(void)
 EXPORT int CALL RomOpen(void)
 {
     if (!l_initialized) return 0;
+    l_emu_thread = pthread_self();
     load_config();
 
     uint32_t rdram_size = 0x800000;
@@ -390,3 +405,151 @@ EXPORT void CALL ReadScreen2(void *dest, int *width, int *height, int front)
 EXPORT void CALL FBRead(unsigned int addr) { (void)addr; if (l_rom_open) rdp_sync(&l_rdp); }
 EXPORT void CALL FBWrite(unsigned int addr, unsigned int size) { (void)addr; (void)size; if (l_rom_open) rdp_sync(&l_rdp); }
 EXPORT void CALL FBGetFrameBufferInfo(void *p) { (void)p; }
+
+/* ---- suxty interface (foir_suxty.h) ------------------------------------------------------------------------------------ */
+
+static const char *const l_lbl_frameskip[] = { "Off", "Every 2nd", "2 of 3", "3 of 4", "Auto" };
+static const char *const l_lbl_threads[] = { "None", "Auto", "1", "2", "3", "4", "5", "6", "7" };
+
+/* Option ids are the ABI: append only.  enum values: FrameSkip index 0..3 = skip level 0..3, 4 = auto; Threads index =
+ * Threads + 1 (so -1 "None" = render on the emulation thread). */
+enum { OPT_WIDESCREEN, OPT_FILTER, OPT_INTERLACE, OPT_FRAMESKIP, OPT_VSYNC, OPT_THREADS, OPT_NEON, OPT_SPECIALIZE,
+       OPT_FASTCOMB, OPT_RELAXED, OPT_COUNT };
+
+static const struct foir_suxty_option l_opts[OPT_COUNT] = {
+    [OPT_WIDESCREEN] = { "Widescreen", "Widescreen", "Stretch to the whole screen instead of 4:3", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 0 },
+    [OPT_FILTER]     = { "Filter", "Smoothing", "Bilinear filtering when scaling the image", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 0 },
+    [OPT_INTERLACE]  = { "InterlaceHack", "Interlace hack", "Show one field line-doubled instead of weaving fields", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 1 },
+    [OPT_FRAMESKIP]  = { "FrameSkip", "Frame skip", "Skip rendering to hold full speed (Auto adapts)", FOIR_OPT_ENUM, FOIR_OPTF_LIVE, 0, 4, 1, l_lbl_frameskip, 0 },
+    [OPT_VSYNC]      = { "VSync", "VSync", "Wait for vertical sync when presenting", FOIR_OPT_BOOL, 0, 0, 1, 1, NULL, 1 },
+    [OPT_THREADS]    = { "Threads", "Worker threads", "RDP worker threads (None = render on the emulation thread)", FOIR_OPT_ENUM, 0, 0, 8, 1, l_lbl_threads, 1 },
+    [OPT_NEON]       = { "NEON", "NEON kernels", "Off = scalar reference kernels (slow)", FOIR_OPT_BOOL, 0, 0, 1, 1, NULL, 1 },
+    [OPT_SPECIALIZE] = { "Specialize", "Specialised kernels", "Per-state precompiled pixel kernels", FOIR_OPT_BOOL, 0, 0, 1, 1, NULL, 1 },
+    [OPT_FASTCOMB]   = { "FastCombiner", "Fast combiner", "Fast paths for common combiner/blender modes", FOIR_OPT_BOOL, 0, 0, 1, 1, NULL, 1 },
+    [OPT_RELAXED]    = { "RelaxedPrecision", "Relaxed precision", "Lower-precision Z and texture math", FOIR_OPT_BOOL, 0, 0, 1, 1, NULL, 1 },
+};
+
+/* values set() was given; applied over [Video-Foir] by load_config() */
+static bool l_staged_set[OPT_COUNT];
+static int  l_staged[OPT_COUNT];
+
+static int opt_load(const struct foir_config *c, unsigned i)
+{
+    switch (i) {
+    case OPT_WIDESCREEN: return c->widescreen;
+    case OPT_FILTER:     return c->filter;
+    case OPT_INTERLACE:  return c->interlace_hack;
+    case OPT_FRAMESKIP:  return c->frame_skip == FOIR_FRAMESKIP_AUTO ? 4 : (c->frame_skip < 0 ? 0 : c->frame_skip > 3 ? 3 : c->frame_skip);
+    case OPT_VSYNC:      return c->vsync;
+    case OPT_THREADS:    return c->threads < -1 ? 0 : c->threads > 7 ? 8 : c->threads + 1;
+    case OPT_NEON:       return c->neon;
+    case OPT_SPECIALIZE: return c->specialize;
+    case OPT_FASTCOMB:   return c->fast_combiner;
+    case OPT_RELAXED:    return c->relaxed_precision;
+    }
+    return 0;
+}
+
+static void opt_store(struct foir_config *c, unsigned i, int v)
+{
+    switch (i) {
+    case OPT_WIDESCREEN: c->widescreen = v != 0; break;
+    case OPT_FILTER:     c->filter = v != 0; break;
+    case OPT_INTERLACE:  c->interlace_hack = v != 0; break;
+    case OPT_FRAMESKIP:  c->frame_skip = v == 4 ? FOIR_FRAMESKIP_AUTO : v; break;
+    case OPT_VSYNC:      c->vsync = v != 0; break;
+    case OPT_THREADS:    c->threads = v - 1; break;
+    case OPT_NEON:       c->neon = v != 0; break;
+    case OPT_SPECIALIZE: c->specialize = v != 0; break;
+    case OPT_FASTCOMB:   c->fast_combiner = v != 0; break;
+    case OPT_RELAXED:    c->relaxed_precision = v != 0; break;
+    }
+}
+
+static void suxty_apply_staged(struct foir_config *c)
+{
+    for (unsigned i = 0; i < OPT_COUNT; i++)
+        if (l_staged_set[i]) opt_store(c, i, l_staged[i]);
+}
+
+static bool suxty_thread_ok(void)
+{
+    return !l_rom_open || pthread_equal(pthread_self(), l_emu_thread);
+}
+
+static int suxty_get(unsigned i, int *value)
+{
+    if (i >= OPT_COUNT || !value) return FOIR_SUXTY_E_INDEX;
+    if (!l_initialized) return FOIR_SUXTY_E_STATE;
+    if (!suxty_thread_ok()) return FOIR_SUXTY_E_THREAD;
+    if (l_rom_open) { *value = opt_load(&l_cfg, i); return 0; }
+    if (l_staged_set[i]) { *value = l_staged[i]; return 0; }
+    struct foir_config c = l_cfg;
+    read_foir_section(&c);
+    *value = opt_load(&c, i);
+    return 0;
+}
+
+static int suxty_set(unsigned i, int value)
+{
+    if (i >= OPT_COUNT) return FOIR_SUXTY_E_INDEX;
+    if (!l_initialized) return FOIR_SUXTY_E_STATE;
+    if (value < l_opts[i].min || value > l_opts[i].max) return FOIR_SUXTY_E_RANGE;
+    if (!suxty_thread_ok()) return FOIR_SUXTY_E_THREAD;
+    l_staged_set[i] = true;
+    l_staged[i] = value;
+    if (!l_rom_open) return FOIR_SUXTY_APPLIED;       /* RomOpen reads it */
+    if (!(l_opts[i].flags & FOIR_OPTF_LIVE)) return FOIR_SUXTY_NEXT_LAUNCH;
+    /* Live options.  The caller is on the emulation thread between frames (inside the buffer swap at the end of
+     * UpdateScreen): rdp_sync() has drained the RDP workers, nothing runs concurrently, and the workers' private
+     * config copies are not used by any of these. */
+    opt_store(&l_cfg, i, value);
+    switch (i) {
+    case OPT_WIDESCREEN: gl_out_set_widescreen(value != 0); break;        /* read by gl_out_present() every frame */
+    case OPT_FILTER:     gl_out_set_filter(value != 0); break;            /* likewise */
+    case OPT_INTERLACE:  l_rdp.cfg.interlace_hack = value != 0; break;   /* read by vi_render on this thread only */
+    case OPT_FRAMESKIP:                                                    /* read by on_rdp_frame_end on this thread */
+        l_skip_level = 0; l_win_frames = 0; l_rdp.skip_pixels = false; break;
+    }
+    return FOIR_SUXTY_APPLIED;
+}
+
+static int suxty_save_default(unsigned i, int value)
+{
+    if (i >= OPT_COUNT) return FOIR_SUXTY_E_INDEX;
+    if (!l_initialized || !ConfigSetParameter || !ConfigSaveSection || !l_cfg_foir) return FOIR_SUXTY_E_STATE;
+    if (value < l_opts[i].min || value > l_opts[i].max) return FOIR_SUXTY_E_RANGE;
+    struct foir_config c;
+    memset(&c, 0, sizeof c);
+    opt_store(&c, i, value);
+    const char *key = l_opts[i].key;
+    int iv = 0;
+    m64p_error e;
+    switch (i) {
+    case OPT_FRAMESKIP: {
+        char buf[8];
+        if (c.frame_skip == FOIR_FRAMESKIP_AUTO) snprintf(buf, sizeof buf, "auto"); else snprintf(buf, sizeof buf, "%d", c.frame_skip);
+        e = ConfigSetParameter(l_cfg_foir, key, M64TYPE_STRING, buf);
+        break; }
+    case OPT_THREADS:
+        iv = c.threads;
+        e = ConfigSetParameter(l_cfg_foir, key, M64TYPE_INT, &iv);
+        break;
+    default:
+        iv = value != 0;
+        e = ConfigSetParameter(l_cfg_foir, key, M64TYPE_BOOL, &iv);
+        break;
+    }
+    if (e != M64ERR_SUCCESS) return FOIR_SUXTY_E_CONFIG;
+    return ConfigSaveSection("Video-Foir") == M64ERR_SUCCESS ? 0 : FOIR_SUXTY_E_CONFIG;
+}
+
+static const struct foir_suxty_interface l_suxty_if = {
+    FOIR_SUXTY_ABI, sizeof(struct foir_suxty_interface), FOIR_VERSION, OPT_COUNT, l_opts,
+    suxty_get, suxty_set, suxty_save_default
+};
+
+EXPORT const struct foir_suxty_interface *FoirSuxtyGetInterface(void)
+{
+    return &l_suxty_if;
+}

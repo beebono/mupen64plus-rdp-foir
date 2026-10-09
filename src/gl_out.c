@@ -205,6 +205,8 @@ void gl_out_shutdown(void)
 }
 
 bool gl_out_active(void) { return g.active; }
+void gl_out_set_filter(bool on) { g.filter = on; }
+void gl_out_set_widescreen(bool on) { g.widescreen = on; }
 
 void gl_out_resize(int w, int h)
 {

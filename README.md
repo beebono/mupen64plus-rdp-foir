@@ -451,6 +451,44 @@ zcmp, blend, store, fill, copy; a stage that is not NEON is not specialised eith
 [below](#texture-and-z-compare-the-second-tier-any-format)), `FOIR_NEON_VERIFY=1` (run every NEON stage, the specialised variants included, next to the scalar one and report differences;
 combine it with `FOIR_KNOBS=exact`, the scalar kernels have no RelaxedPrecision), `FOIR_MT_STATS=1`, `FOIR_LOGFILE=path`.
 
+### suxty interface
+
+foir exports one extra function, `FoirSuxtyGetInterface()` (declared in `src/foir_suxty.h`, listed in `src/foir_api_export.ver`), so that the in-game
+menu of [mupen64plus-input-suxty](../mupen64plus-ui-suxty) can list and change foir's options. It returns a pointer to a static, `const`,
+versioned table (`abi`, `size`, option count, option descriptors, `get`, `set`, `save_default`). It is one-way: foir never calls suxty, nothing in
+the plugin API changes, and a foir that nobody asks for behaves exactly as before (the only cost is one thread id kept at `RomOpen`). suxty finds the symbol
+by walking the loaded objects (the front-end loads plugins `RTLD_LOCAL`, under whatever file name the user chose) and checks `abi`.
+
+| id | key (`[Video-Foir]`) | type | applies |
+|---|---|---|---|
+| 0 | `Widescreen` | bool | **at once** |
+| 1 | `Filter` | bool | **at once** |
+| 2 | `InterlaceHack` | bool | **at once** |
+| 3 | `FrameSkip` | enum: Off / Every 2nd / 2 of 3 / 3 of 4 / Auto | **at once** |
+| 4 | `VSync` | bool | next launch |
+| 5 | `Threads` | enum: None, Auto, 1..7 (index = `Threads` + 1) | next launch |
+| 6 | `NEON` | bool | next launch |
+| 7 | `Specialize` | bool | next launch |
+| 8 | `FastCombiner` | bool | next launch |
+| 9 | `RelaxedPrecision` | bool | next launch |
+
+*Why these are live.* `Widescreen` and `Filter` are read by `gl_out_present()` on every frame. `InterlaceHack` is read by `vi_render()` only (the
+emulation thread). `FrameSkip` is read by the SYNC_FULL hook, which also runs on the emulation thread. None of them is in the worker threads' private
+copy of the config. *Why the others are not.* `Threads`, `NEON`, `Specialize` and `FastCombiner` choose the kernel tables and the worker pool in
+`rdp_init()` / `rdp_start_workers()`; `RelaxedPrecision` is part of the specialisation key and is copied into every worker (and overwritten per variant
+there); `VSync` is a context attribute that is applied when the window is created. Changing them mid-game would mean rebuilding the pipeline.
+
+*Thread safety.* `get()` / `set()` must be called on the emulation thread, not from inside a foir call. suxty's menu runs inside the buffer swap, which
+`UpdateScreen()` issues last, after `rdp_sync()` has drained the workers and after the frame was uploaded: nothing else touches the live options
+while the menu is open, and the next `ProcessRDPList()` starts after the menu returns. Once the ROM is open a call from another thread is refused
+(`FOIR_SUXTY_E_THREAD`).
+
+*What `set()` does.* It never writes `mupen64plus.cfg`. Before `RomOpen` it overrides what `load_config()` read from `[Video-Foir]` for the coming launch
+(suxty hands over its stored per-game values from `InitiateControllers`, which runs before foir opens the ROM; this is how the "next launch" options get
+applied without a restart). After `RomOpen` a live option takes effect and a next-launch option is only remembered (`FOIR_SUXTY_NEXT_LAUNCH`).
+Environment overrides (`FOIR_NEON`, `FOIR_KNOBS=exact`) still win. `save_default()` writes one value into `[Video-Foir]` and saves that section; suxty only calls it
+when the user picks "Save as foir default".
+
 ---
 
 ## Measured results
@@ -1140,7 +1178,8 @@ performance-neutral (foir-replay 1-2.5% faster single-threaded, 2-5% slower with
 ## Source layout
 
 ```
-src/plugin.c          Mupen64Plus exports, [Video-Foir] config, frame skipping, UpdateScreen/ReadScreen2
+src/plugin.c          Mupen64Plus exports, [Video-Foir] config, frame skipping, UpdateScreen/ReadScreen2, the suxty interface
+src/foir_suxty.h      the suxty interface table (ABI 1), shared with mupen64plus-input-suxty
 src/parser.c          DP command list reader, command dispatch, state-setting commands, derived pipeline flags
 src/setup.c           primitive setup: triangle / texrect / fillrect -> edge walker -> span records
 src/raster.c          span -> pixel-batch builder (NEON: fixed-size ramps, edge-zone coverage; portable reference builder), worker row ownership
