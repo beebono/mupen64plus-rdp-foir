@@ -1,0 +1,392 @@
+/*
+ * mupen64plus-rdp-foir - plugin.c
+ * Mupen64Plus video-plugin entry points. foir is an LLE software RDP: the real
+ * work happens in ProcessRDPList(); UpdateScreen() scans out the framebuffer.
+ *
+ * Copyright (C) 2026 foir contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+#define _GNU_SOURCE
+#define M64P_PLUGIN_PROTOTYPES 1
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <dlfcn.h>
+#include <time.h>
+#include <unistd.h>
+#include <sys/resource.h>
+
+#include "m64p_types.h"
+#include "m64p_common.h"
+#include "m64p_config.h"
+#include "m64p_plugin.h"
+
+#include "rdp.h"
+#include "spec.h"
+#include "vi.h"
+#include "gl_out.h"
+#include "capture.h"
+
+#define PLUGIN_API_VERSION 0x020500
+
+static ptr_ConfigOpenSection ConfigOpenSection;
+static ptr_ConfigSaveSection ConfigSaveSection;
+static ptr_ConfigSetDefaultInt ConfigSetDefaultInt;
+static ptr_ConfigSetDefaultBool ConfigSetDefaultBool;
+static ptr_ConfigSetDefaultString ConfigSetDefaultString;
+static ptr_ConfigGetParamInt ConfigGetParamInt;
+static ptr_ConfigGetParamBool ConfigGetParamBool;
+static ptr_ConfigGetParamString ConfigGetParamString;
+static ptr_PluginGetVersion CoreGetVersion;
+
+static void *l_core;
+static bool l_initialized, l_rom_open, l_warned_hle;
+static GFX_INFO l_gfx;
+static void (*l_render_cb)(int);
+static m64p_handle l_cfg_general, l_cfg_foir;
+static struct foir_config l_cfg;
+static struct rdp l_rdp;
+static struct vi_frame l_frame;
+static int l_win_w = 640, l_win_h = 480;
+static bool l_fullscreen;
+static double l_rdp_ms, l_vi_ms, l_sync_ms, l_last_log_ms, l_present_ms, l_syncfull_base;
+/* frame skipping */
+static unsigned l_rdp_frames, l_skipped_frames;
+static int l_skip_level;                 /* auto mode: 0 none, 1 skip every other frame, 2 render one in three */
+static double l_win_start_ms, l_last_us_ms;
+static unsigned l_win_frames;
+static unsigned l_frames, l_lists;
+static uint64_t l_cmds_base;
+static uint32_t l_prims_base, l_pix_base;
+static uint64_t l_cov_base[COV_N], l_covtex_base;
+static double l_cpu_all_base, l_cpu_emu_base;      /* CPU time (user + system, ms) of the process / of the emulation thread */
+
+static double cpu_ms(int who)
+{
+    struct rusage ru;
+    if (getrusage(who, &ru) != 0) return 0;
+    return (double)(ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) * 1e3 + (double)(ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1e3;
+}
+
+static double now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+static void (*l_debug_cb)(void *, int, const char *);
+static void *l_debug_ctx;
+
+/* called by the RDP at every SYNC_FULL: decide whether the next frame is rendered */
+static void on_rdp_frame_end(void *ctx)
+{
+    (void)ctx;
+    int fs = l_cfg.frame_skip;
+    bool skip = false;
+    l_rdp_frames++;
+    if (fs > 0) skip = (l_rdp_frames % (unsigned)(fs + 1)) != 0;
+    else if (fs == FOIR_FRAMESKIP_AUTO) {
+        if (l_skip_level == 1) skip = (l_rdp_frames & 1) != 0;
+        else if (l_skip_level == 2) skip = (l_rdp_frames % 3) != 0;
+    }
+    if (skip) l_skipped_frames++;
+    l_rdp.skip_pixels = skip;
+}
+
+static void plugin_log(void *ctx, int level, const char *msg)
+{
+    (void)ctx;
+    if (l_debug_cb) l_debug_cb(l_debug_ctx, level, msg);
+}
+
+static void read_vi(struct vi_regs *v)
+{
+    v->status = *l_gfx.VI_STATUS_REG;
+    v->origin = *l_gfx.VI_ORIGIN_REG;
+    v->width = *l_gfx.VI_WIDTH_REG;
+    v->h_start = *l_gfx.VI_H_START_REG;
+    v->v_start = *l_gfx.VI_V_START_REG;
+    v->x_scale = *l_gfx.VI_X_SCALE_REG;
+    v->y_scale = *l_gfx.VI_Y_SCALE_REG;
+}
+
+EXPORT m64p_error CALL PluginStartup(m64p_dynlib_handle core, void *context, void (*debug_cb)(void *, int, const char *))
+{
+    if (l_initialized) return M64ERR_ALREADY_INIT;
+    l_debug_cb = debug_cb;
+    l_debug_ctx = context;
+    foir_log_set_callback(plugin_log, NULL);
+    l_core = core;
+
+#define SYM(var, type, name) var = (type)dlsym(core, name)
+    SYM(ConfigOpenSection, ptr_ConfigOpenSection, "ConfigOpenSection");
+    SYM(ConfigSaveSection, ptr_ConfigSaveSection, "ConfigSaveSection");
+    SYM(ConfigSetDefaultInt, ptr_ConfigSetDefaultInt, "ConfigSetDefaultInt");
+    SYM(ConfigSetDefaultBool, ptr_ConfigSetDefaultBool, "ConfigSetDefaultBool");
+    SYM(ConfigSetDefaultString, ptr_ConfigSetDefaultString, "ConfigSetDefaultString");
+    SYM(ConfigGetParamInt, ptr_ConfigGetParamInt, "ConfigGetParamInt");
+    SYM(ConfigGetParamBool, ptr_ConfigGetParamBool, "ConfigGetParamBool");
+    SYM(ConfigGetParamString, ptr_ConfigGetParamString, "ConfigGetParamString");
+    SYM(CoreGetVersion, ptr_PluginGetVersion, "PluginGetVersion");
+#undef SYM
+    if (!ConfigOpenSection || !ConfigSetDefaultInt || !ConfigGetParamInt) return M64ERR_INCOMPATIBLE;
+
+    foir_config_defaults(&l_cfg);
+
+    ConfigOpenSection("Video-General", &l_cfg_general);
+    ConfigSetDefaultBool(l_cfg_general, "Fullscreen", 0, "Use fullscreen mode if True, or windowed mode if False");
+    ConfigSetDefaultInt(l_cfg_general, "ScreenWidth", 640, "Width of output window or fullscreen width");
+    ConfigSetDefaultInt(l_cfg_general, "ScreenHeight", 480, "Height of output window or fullscreen height");
+
+    ConfigOpenSection("Video-Foir", &l_cfg_foir);
+    ConfigSetDefaultBool(l_cfg_foir, "FastCombiner", l_cfg.fast_combiner, "Fast paths for common combiner/blender modes (the NEON kernels always take them)");
+    ConfigSetDefaultBool(l_cfg_foir, "RelaxedPrecision", l_cfg.relaxed_precision, "Lower-precision Z, perspective and texture-coordinate math (no effect yet)");
+    ConfigSetDefaultString(l_cfg_foir, "FrameSkip", "0", "0 = off, N = fixed frame skip, auto = skip rendering to hold full speed");
+    ConfigSetDefaultBool(l_cfg_foir, "InterlaceHack", l_cfg.interlace_hack, "Render one field and line-double instead of full interlace logic");
+    ConfigSetDefaultInt(l_cfg_foir, "Threads", l_cfg.threads, "Number of rendering worker threads: 0 = auto (cores - 1), -1 = render on the emulation thread");
+    ConfigSetDefaultBool(l_cfg_foir, "Specialize", l_cfg.specialize, "Use the precompiled per-state pixel kernels; False = generic NEON kernels only (a stale JIT= entry in the config file is ignored)");
+    ConfigSetDefaultBool(l_cfg_foir, "NEON", l_cfg.neon, "Use the NEON kernels when built in; False = scalar reference kernels");
+    ConfigSetDefaultBool(l_cfg_foir, "VSync", l_cfg.vsync, "Wait for vertical sync when presenting");
+    ConfigSetDefaultBool(l_cfg_foir, "Filter", l_cfg.filter, "Use bilinear filtering when scaling the VI image to the window");
+    ConfigSetDefaultBool(l_cfg_foir, "Widescreen", l_cfg.widescreen, "Stretch the image to the whole window instead of keeping 4:3");
+    ConfigSaveSection("Video-General");
+    ConfigSaveSection("Video-Foir");
+
+    l_initialized = true;
+    return M64ERR_SUCCESS;
+}
+
+EXPORT m64p_error CALL PluginShutdown(void)
+{
+    if (!l_initialized) return M64ERR_NOT_INIT;
+    foir_log_set_callback(NULL, NULL);
+    l_debug_cb = NULL;
+    l_initialized = false;
+    return M64ERR_SUCCESS;
+}
+
+EXPORT m64p_error CALL PluginGetVersion(m64p_plugin_type *type, int *version, int *api, const char **name, int *caps)
+{
+    if (type) *type = M64PLUGIN_GFX;
+    if (version) *version = FOIR_VERSION;
+    if (api) *api = PLUGIN_API_VERSION;
+    if (name) *name = FOIR_NAME;
+    if (caps) *caps = 0;
+    return M64ERR_SUCCESS;
+}
+
+EXPORT int CALL InitiateGFX(GFX_INFO info)
+{
+    l_gfx = info;
+    return 1;
+}
+
+static void load_config(void)
+{
+    l_fullscreen = ConfigGetParamBool(l_cfg_general, "Fullscreen") != 0;
+    l_win_w = ConfigGetParamInt(l_cfg_general, "ScreenWidth");
+    l_win_h = ConfigGetParamInt(l_cfg_general, "ScreenHeight");
+    l_cfg.fast_combiner = ConfigGetParamBool(l_cfg_foir, "FastCombiner") != 0;
+    l_cfg.relaxed_precision = ConfigGetParamBool(l_cfg_foir, "RelaxedPrecision") != 0;
+    l_cfg.interlace_hack = ConfigGetParamBool(l_cfg_foir, "InterlaceHack") != 0;
+    l_cfg.threads = ConfigGetParamInt(l_cfg_foir, "Threads");
+    l_cfg.specialize = ConfigGetParamBool(l_cfg_foir, "Specialize") != 0;
+    l_cfg.neon = ConfigGetParamBool(l_cfg_foir, "NEON") != 0;
+    l_cfg.vsync = ConfigGetParamBool(l_cfg_foir, "VSync") != 0;
+    l_cfg.filter = ConfigGetParamBool(l_cfg_foir, "Filter") != 0;
+    l_cfg.widescreen = ConfigGetParamBool(l_cfg_foir, "Widescreen") != 0;
+    const char *fs = ConfigGetParamString(l_cfg_foir, "FrameSkip");
+    if (fs && !strcmp(fs, "auto")) l_cfg.frame_skip = FOIR_FRAMESKIP_AUTO;
+    else l_cfg.frame_skip = fs ? atoi(fs) : 0;
+    /* environment overrides for testing and benchmarking */
+    const char *ne = getenv("FOIR_NEON");
+    if (ne && *ne) l_cfg.neon = atoi(ne) != 0;
+    /* FOIR_KNOBS=exact (debug / testing): the accuracy-preserving setting of every speed knob */
+    const char *ke = getenv("FOIR_KNOBS");
+    if (ke && !strcmp(ke, "exact")) {
+        l_cfg.relaxed_precision = false; l_cfg.frame_skip = 0; l_cfg.interlace_hack = false;
+    }
+}
+
+EXPORT int CALL RomOpen(void)
+{
+    if (!l_initialized) return 0;
+    load_config();
+
+    uint32_t rdram_size = 0x800000;
+    int core_version = 0;
+    if (CoreGetVersion) CoreGetVersion(NULL, &core_version, NULL, NULL, NULL);
+    if (core_version >= 0x020501 && l_gfx.version >= 2 && l_gfx.RDRAM_SIZE && *l_gfx.RDRAM_SIZE)
+        rdram_size = *l_gfx.RDRAM_SIZE;
+
+    memset(l_cov_base, 0, sizeof(l_cov_base)); l_covtex_base = 0;
+    l_cpu_all_base = cpu_ms(RUSAGE_SELF); l_cpu_emu_base = cpu_ms(RUSAGE_THREAD);
+    rdp_init(&l_rdp, &l_cfg);
+    rdp_attach_memory(&l_rdp, l_gfx.RDRAM, rdram_size);
+    l_rdp.dp_start = l_gfx.DPC_START_REG;
+    l_rdp.dp_end = l_gfx.DPC_END_REG;
+    l_rdp.dp_current = l_gfx.DPC_CURRENT_REG;
+    l_rdp.dp_status = l_gfx.DPC_STATUS_REG;
+    l_rdp.dmem = l_gfx.DMEM;
+    l_rdp.mi_intr = l_gfx.MI_INTR_REG;
+    l_rdp.check_interrupts = l_gfx.CheckInterrupts;
+    capture_init(&l_rdp);
+    l_rdp.frame_end_cb = on_rdp_frame_end;
+    l_rdp.skip_pixels = false;
+    l_rdp_frames = l_skipped_frames = 0;
+    l_skip_level = 0;
+    int nthreads = l_cfg.threads;
+    const char *te = getenv("FOIR_THREADS");
+    if (te && *te) nthreads = atoi(te);
+    if (nthreads == 0) {
+        long nc = sysconf(_SC_NPROCESSORS_ONLN);
+        nthreads = nc > 2 ? (int)nc - 1 : (nc == 2 ? 1 : -1);
+        if (nthreads > 7) nthreads = 7;
+    }
+    bool mt_on = nthreads > 0 && rdp_start_workers(&l_rdp, nthreads);
+    foir_log(FOIR_LOG_INFO, "foir M3: kernels=%s workers=%d rdram=%u KiB, specialised variants %s: texture %d, combine %d, zcmp %d, blend %d, store %d",
+             l_rdp.k->name, mt_on ? nthreads : 0, rdram_size >> 10, l_rdp.spec_ok_mask && l_cfg.specialize ? "on" : "off",
+             foir_spec_tabs[SPEC_TEX].n, foir_spec_tabs[SPEC_COMB].n, foir_spec_tabs[SPEC_ZCMP].n, foir_spec_tabs[SPEC_BLEND].n, foir_spec_tabs[SPEC_STORE].n);
+
+    struct gl_out_params gp = { l_win_w, l_win_h, l_fullscreen, l_cfg.vsync, l_cfg.filter, l_cfg.widescreen };
+    if (!gl_out_init(l_core, &gp)) return 0;
+    l_rom_open = true;
+    foir_log(FOIR_LOG_INFO, "video output ready (%dx%d, %s, vsync %d)", l_win_w, l_win_h, l_fullscreen ? "fullscreen" : "windowed", l_cfg.vsync);
+    return 1;
+}
+
+EXPORT void CALL RomClosed(void)
+{
+    if (!l_rom_open) return;
+    capture_shutdown(&l_rdp);
+    foir_stats_flush();
+    gl_out_shutdown();
+    rdp_destroy(&l_rdp);
+    l_rom_open = false;
+}
+
+EXPORT void CALL ProcessDList(void)
+{
+    if (!l_warned_hle) {
+        foir_log(FOIR_LOG_WARNING, "HLE display lists are not supported; use an LLE RSP (e.g. rsp-cxd4, or rsp-hle with DisplayListToGraphicsPlugin = False and a fallback)");
+        l_warned_hle = true;
+    }
+}
+
+EXPORT void CALL ProcessRDPList(void)
+{
+    if (!l_rom_open) return;
+    double t0 = now_ms();
+    rdp_process_list(&l_rdp);
+    l_rdp_ms += now_ms() - t0;
+    l_lists++;
+}
+
+EXPORT void CALL UpdateScreen(void)
+{
+    if (!l_rom_open) return;
+    struct vi_regs v;
+    read_vi(&v);
+    double ts = now_ms();
+    rdp_sync(&l_rdp);
+    l_sync_ms += now_ms() - ts;
+    capture_frame(&l_rdp, &v);
+    double t0 = now_ms();
+    vi_render_ex(&l_rdp, &v, &l_frame, true);
+    double t1 = now_ms();
+    gl_out_present(l_frame.valid ? l_frame.pixels : NULL, l_frame.raw16, l_frame.width, l_frame.height, l_frame.screen_w, l_frame.screen_h, l_render_cb);
+    double t2 = now_ms();
+    l_vi_ms += t1 - t0;
+    l_present_ms += t2 - t1;
+    /* FrameSkip=auto: compare the achieved frame interval with the VI period every 60 frames */
+    if (l_cfg.frame_skip == FOIR_FRAMESKIP_AUTO) {
+        if (l_win_frames == 0) l_win_start_ms = t0;
+        if (++l_win_frames >= 60) {
+            double per = (t2 - l_win_start_ms) / l_win_frames;
+            if (per > 16.67 * 1.12 && l_skip_level < 2) l_skip_level++;
+            else if (per < 16.67 * 0.92 && l_skip_level > 0) l_skip_level--;
+            l_win_frames = 0;
+        }
+    }
+    (void)l_last_us_ms;
+    capture_screenshot(&l_frame);
+    ++l_frames;
+    if (l_frames <= 3) foir_log(FOIR_LOG_INFO, "UpdateScreen #%u: vi %dx%d valid=%d type=%u origin=%08x", l_frames, l_frame.width, l_frame.height, l_frame.valid, v.status & 3, v.origin);
+    if (l_frames % 120 == 0) {
+        uint32_t pix = rdp_pixels(&l_rdp);
+        double wall = now_ms();
+        double per_frame = l_last_log_ms > 0 ? (wall - l_last_log_ms) / 120 : 0;
+        l_last_log_ms = wall;
+        double sfw = l_rdp.sync_wait_ms - l_syncfull_base;
+        l_syncfull_base = l_rdp.sync_wait_ms;
+        foir_log(FOIR_LOG_INFO, "frame %u: %.2f ms/frame wall, %.2f ms/frame RDP (%.2f parse+setup of which %.2f waiting at SYNC_FULL, %.2f drain; %u lists, %llu cmds, %u prims, %u px), %.2f ms/frame VI (%.2f convert + %.2f present), vi %dx%d type %u, skipped %u/%u level %d",
+                 l_frames, per_frame, (l_rdp_ms + l_sync_ms) / 120, l_rdp_ms / 120, sfw / 120, l_sync_ms / 120, l_lists, (unsigned long long)(l_rdp.frame_cmds - l_cmds_base),
+                 l_rdp.stat_prims - l_prims_base, pix - l_pix_base, (l_vi_ms + l_present_ms) / 120, l_vi_ms / 120, l_present_ms / 120,
+                 l_frame.width, l_frame.height, v.status & 3, l_skipped_frames, l_rdp_frames, l_skip_level);
+        {
+            double all = cpu_ms(RUSAGE_SELF), emu = cpu_ms(RUSAGE_THREAD);
+            foir_log(FOIR_LOG_INFO, "cpu: %.2f ms/frame in the process (%.2f on the emulation thread, %.2f on the other threads)",
+                     (all - l_cpu_all_base) / 120, (emu - l_cpu_emu_base) / 120, (all - l_cpu_all_base - emu + l_cpu_emu_base) / 120);
+            l_cpu_all_base = all; l_cpu_emu_base = emu;
+        }
+        {
+            /* share of the window's pixels that ran through a specialised variant, per stage (the workers are idle here:
+             * UpdateScreen drained them above) */
+            uint64_t cov[COV_N], texall;
+            rdp_coverage(&l_rdp, cov, &texall);
+            double all = (double)(cov[5] - l_cov_base[5]), ta = (double)(texall - l_covtex_base);
+            foir_log(FOIR_LOG_INFO, "specialised pixels: texture %.1f%% (of %.0f%% textured; any-format kernels %.1f%%), combine %.1f%% (shape kernels %.1f%%), zcmp %.1f%%, blend %.1f%%, store %.1f%%",
+                     ta > 0 ? 100.0 * (double)(cov[0] - l_cov_base[0]) / ta : 0.0, all > 0 ? 100.0 * ta / all : 0.0,
+                     ta > 0 ? 100.0 * (double)(cov[7] - l_cov_base[7]) / ta : 0.0,
+                     all > 0 ? 100.0 * (double)(cov[1] - l_cov_base[1]) / all : 0.0, all > 0 ? 100.0 * (double)(cov[6] - l_cov_base[6]) / all : 0.0,
+                     all > 0 ? 100.0 * (double)(cov[2] - l_cov_base[2]) / all : 0.0,
+                     all > 0 ? 100.0 * (double)(cov[3] - l_cov_base[3]) / all : 0.0, all > 0 ? 100.0 * (double)(cov[4] - l_cov_base[4]) / all : 0.0);
+            char vr[400];
+            foir_neon_verify_report(vr, sizeof vr);
+            if (vr[0]) foir_log(FOIR_LOG_INFO, "FOIR_NEON_VERIFY: %s", vr);
+            for (int k = 0; k < COV_N; k++) l_cov_base[k] = cov[k];
+            l_covtex_base = texall;
+            foir_stats_flush();
+        }
+        l_rdp_ms = l_vi_ms = l_sync_ms = l_present_ms = 0; l_lists = 0;
+        l_cmds_base = l_rdp.frame_cmds; l_prims_base = l_rdp.stat_prims; l_pix_base = pix;
+    }
+}
+
+EXPORT void CALL ShowCFB(void) {}
+EXPORT void CALL ViStatusChanged(void) {}
+EXPORT void CALL ViWidthChanged(void) {}
+EXPORT void CALL MoveScreen(int x, int y) { (void)x; (void)y; }
+EXPORT void CALL ChangeWindow(void) { gl_out_toggle_fullscreen(); }
+EXPORT void CALL SetRenderingCallback(void (*cb)(int)) { l_render_cb = cb; }
+EXPORT void CALL ResizeVideoOutput(int w, int h) { l_win_w = w; l_win_h = h; gl_out_resize(w, h); }
+
+/* The core expects a bottom-up RGB24 image (see main/screenshot.c) */
+EXPORT void CALL ReadScreen2(void *dest, int *width, int *height, int front)
+{
+    (void)front;
+    struct vi_regs v;
+    static struct vi_frame shot;
+    if (!l_rom_open) { *width = 640; *height = 480; return; }
+    rdp_sync(&l_rdp);
+    read_vi(&v);
+    vi_render(&l_rdp, &v, &shot);
+    int w = shot.valid ? shot.width : 640, h = shot.valid ? shot.height : 480;
+    *width = w;
+    *height = h;
+    if (!dest) return;
+    uint8_t *out = (uint8_t *)dest;
+    for (int y = 0; y < h; y++) {
+        uint8_t *row = out + (size_t)(h - 1 - y) * (size_t)w * 3;
+        for (int x = 0; x < w; x++) {
+            uint32_t p = shot.valid ? shot.pixels[y * w + x] : 0;
+            row[x * 3 + 0] = (uint8_t)(p & 0xff);
+            row[x * 3 + 1] = (uint8_t)((p >> 8) & 0xff);
+            row[x * 3 + 2] = (uint8_t)((p >> 16) & 0xff);
+        }
+    }
+}
+
+EXPORT void CALL FBRead(unsigned int addr) { (void)addr; if (l_rom_open) rdp_sync(&l_rdp); }
+EXPORT void CALL FBWrite(unsigned int addr, unsigned int size) { (void)addr; (void)size; if (l_rom_open) rdp_sync(&l_rdp); }
+EXPORT void CALL FBGetFrameBufferInfo(void *p) { (void)p; }

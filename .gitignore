@@ -1,0 +1,24 @@
+# build outputs (projects/unix)
+/projects/unix/_obj*/
+/projects/unix/_out_*/
+/projects/unix/*.so
+/projects/unix/foir-replay
+/projects/unix/foir-kfuzz
+/projects/unix/ref-angrylion
+*.o
+*.d
+
+# python
+__pycache__/
+*.pyc
+
+# test results and captured game data (regenerate locally; see test-data/README.md)
+/test-output/
+/test-data/*
+!/test-data/README.md
+
+# editors
+.vscode/
+.idea/
+*.swp
+*~

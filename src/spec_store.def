@@ -1,0 +1,9 @@
+/* specialised FB / Z store variants: STORE(fbsz, fbfmt, cvgdest, zupd); see kspec_mem.inc */
+STORE(2, 1, 0, 0)
+STORE(2, 1, 0, 1)
+STORE(2, 1, 1, 0)
+STORE(2, 1, 1, 1)
+STORE(2, 1, 2, 0)
+STORE(2, 1, 2, 1)
+STORE(2, 1, 3, 0)
+STORE(2, 1, 3, 1)
