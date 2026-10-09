@@ -283,7 +283,7 @@ eight lanes (dead lanes cost the whole texture / combiner / blender pipeline, ab
   about 0.7 ms including draw and swap on the RK3566), and scales it to the window.
 * `InterlaceHack`: for interlaced output of frames the game rendered one field at a time (`SET_SCISSOR` field
   bits) only the freshest field is scanned out, line doubled, instead of weaving it with the previous field.
-* A front-end that overrides VidExt, such as [mupen64plus-ui-suxty](../mupen64plus-ui-suxty), can draw its
+* A front-end or plugin that overrides VidExt, such as [mupen64plus-input-suxty](../mupen64plus-input-suxty), can draw its
   overlay on top of that texture.
 
 ### Specialised pixel kernels (M3)
@@ -454,7 +454,7 @@ combine it with `FOIR_KNOBS=exact`, the scalar kernels have no RelaxedPrecision)
 ### suxty interface
 
 foir exports one extra function, `FoirSuxtyGetInterface()` (declared in `src/foir_suxty.h`, listed in `src/foir_api_export.ver`), so that the in-game
-menu of [mupen64plus-input-suxty](../mupen64plus-ui-suxty) can list and change foir's options. It returns a pointer to a static, `const`,
+menu of [mupen64plus-input-suxty](../mupen64plus-input-suxty) can list and change foir's options. It returns a pointer to a static, `const`,
 versioned table (`abi`, `size`, option count, option descriptors, `get`, `set`, `save_default`). It is one-way: foir never calls suxty, nothing in
 the plugin API changes, and a foir that nobody asks for behaves exactly as before (the only cost is one thread id kept at `RomOpen`). suxty finds the symbol
 by walking the loaded objects (the front-end loads plugins `RTLD_LOCAL`, under whatever file name the user chose) and checks `abi`.
