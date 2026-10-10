@@ -13,6 +13,13 @@
 #include "combreg.h"
 #include "spec.h"
 
+/* FOIR_FRAMELOG builds count the texture loads for the per-frame record */
+#ifdef FOIR_FRAMELOG
+#define FL_LOAD(r) ((r)->stat_loads++)
+#else
+#define FL_LOAD(r) ((void)0)
+#endif
+
 /* ---- command lengths (bytes) ------------------------------------------ */
 
 static uint8_t cmd_length_bytes[64];
@@ -314,9 +321,9 @@ void rdp_run_command(struct rdp *r, const uint32_t *a)
         break;
     case CMD_SET_OTHER_MODES: cmd_set_other_modes(r, a); break;
 
-    case CMD_LOAD_TLUT:  tmem_load_tlut(r, a); break;
-    case CMD_LOAD_BLOCK: tmem_load_block(r, a); break;
-    case CMD_LOAD_TILE:  tmem_load_tile(r, a); break;
+    case CMD_LOAD_TLUT:  FL_LOAD(r); tmem_load_tlut(r, a); break;
+    case CMD_LOAD_BLOCK: FL_LOAD(r); tmem_load_block(r, a); break;
+    case CMD_LOAD_TILE:  FL_LOAD(r); tmem_load_tile(r, a); break;
     case CMD_SET_TILE_SIZE: cmd_set_tile_size(r, a); break;
     case CMD_SET_TILE:   cmd_set_tile(r, a); break;
 

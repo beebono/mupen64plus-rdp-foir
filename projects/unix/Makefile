@@ -163,6 +163,7 @@ CORE_SOURCE = \
 PLUGIN_SOURCE = \
 	$(SRCDIR)/plugin.c \
 	$(SRCDIR)/capture.c \
+	$(SRCDIR)/framelog.c \
 	$(SRCDIR)/gl_out.c
 
 CORE_OBJECTS := $(patsubst $(SRCDIR)/%.c, $(OBJDIR)/%.o, $(CORE_SOURCE))

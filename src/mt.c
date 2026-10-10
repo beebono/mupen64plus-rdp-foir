@@ -59,6 +59,9 @@ struct mt_worker {
     pthread_t thr;
     uint32_t state_gen, tmem_gen;
     _Atomic uint64_t done;            /* jobs completed */
+#ifdef FOIR_FRAMELOG
+    _Atomic uint64_t busy_ns;         /* time spent in run_job (updated before `done`) */
+#endif
     char pad[64];
 };
 
@@ -82,6 +85,10 @@ struct rdp_mt {
     pthread_cond_t cond;
     _Atomic int sleepers;
     _Atomic int stop;
+#ifdef FOIR_FRAMELOG
+    _Atomic int prof;                 /* time the jobs and the syncs (off unless the log is open: one load per batch) */
+    uint64_t sync_ns;                 /* ... time the parser spent inside mt_sync */
+#endif
 };
 
 static inline void cpu_relax(void)
@@ -122,6 +129,15 @@ static void run_job(struct mt_worker *wk, const struct mt_job *job)
     raster_render_walk(w, &job->pw, job->start, job->end);
 }
 
+#ifdef FOIR_FRAMELOG
+static inline uint64_t mono_ns(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
+#endif
+
 static void *worker_main(void *arg)
 {
     struct mt_worker *wk = (struct mt_worker *)arg;
@@ -152,6 +168,20 @@ static void *worker_main(void *arg)
                 clock_gettime(CLOCK_MONOTONIC, &t0);
             }
         }
+#ifdef FOIR_FRAMELOG
+        if (next < h && atomic_load_explicit(&mt->prof, memory_order_relaxed)) {
+            uint64_t t = mono_ns(), busy = atomic_load_explicit(&wk->busy_ns, memory_order_relaxed);
+            while (next < h) {
+                run_job(wk, &mt->jobs[next & (MT_JOBS - 1)]);
+                next++;
+                uint64_t t2 = mono_ns();
+                busy += t2 - t; t = t2;
+                atomic_store_explicit(&wk->busy_ns, busy, memory_order_relaxed);
+                atomic_store_explicit(&wk->done, next, memory_order_release);
+            }
+            continue;
+        }
+#endif
         while (next < h) {
             run_job(wk, &mt->jobs[next & (MT_JOBS - 1)]);
             next++;
@@ -234,7 +264,14 @@ void mt_sync(struct rdp *r)
     uint64_t h = atomic_load_explicit(&mt->head, memory_order_relaxed);
     int spins = 0;
     mt->st.full_syncs++;
-    while (min_done(mt) < h) wait_progress(mt, &spins);
+#ifdef FOIR_FRAMELOG
+    if (atomic_load_explicit(&mt->prof, memory_order_relaxed)) {
+        uint64_t t0 = mono_ns();
+        while (min_done(mt) < h) wait_progress(mt, &spins);
+        mt->sync_ns += mono_ns() - t0;
+    } else
+#endif
+        while (min_done(mt) < h) wait_progress(mt, &spins);
     mt->nreg = 0;
 }
 
@@ -266,6 +303,24 @@ void mt_stop(struct rdp *r)
     free(mt);
     r->mt = NULL;
 }
+
+#ifdef FOIR_FRAMELOG
+void mt_prof_enable(struct rdp *r)
+{
+    if (r->mt) atomic_store(&r->mt->prof, 1);
+}
+
+/* cumulative: per-worker busy ns, jobs published, parser time in mt_sync; returns the number of workers */
+int mt_prof_read(struct rdp *r, uint64_t busy[8], uint64_t *jobs, uint64_t *sync_ns)
+{
+    struct rdp_mt *mt = r->mt;
+    if (!mt) return 0;
+    for (int i = 0; i < mt->nw && i < 8; i++) busy[i] = atomic_load_explicit(&mt->w[i].busy_ns, memory_order_relaxed);
+    *jobs = atomic_load_explicit(&mt->head, memory_order_relaxed);
+    *sync_ns = mt->sync_ns;
+    return mt->nw < 8 ? mt->nw : 8;
+}
+#endif
 
 uint32_t mt_pixels(struct rdp *r)
 {

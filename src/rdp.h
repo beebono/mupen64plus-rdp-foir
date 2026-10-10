@@ -372,6 +372,9 @@ struct rdp {
     void *frame_end_ctx;
     struct px_batch batch;
     uint32_t stat_prims, stat_pixels;
+#ifdef FOIR_FRAMELOG
+    uint32_t stat_loads;           /* LOAD_BLOCK / LOAD_TILE / LOAD_TLUT commands */
+#endif
     uint32_t frame_seed;
     struct rdp_mt *mt;             /* worker pool (NULL when single threaded) */
     int worker_id, nworkers;       /* row ownership when this context is a worker */

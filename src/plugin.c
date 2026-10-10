@@ -27,6 +27,10 @@
 #include "gl_out.h"
 #include "capture.h"
 #include "foir_suxty.h"
+#ifdef FOIR_FRAMELOG
+#include "framelog.h"
+#include "mt.h"
+#endif
 #include <pthread.h>
 
 #define PLUGIN_API_VERSION 0x020500
@@ -64,6 +68,17 @@ static uint64_t l_cmds_base;
 static uint32_t l_prims_base, l_pix_base;
 static uint64_t l_cov_base[COV_N], l_covtex_base;
 static double l_cpu_all_base, l_cpu_emu_base;      /* CPU time (user + system, ms) of the process / of the emulation thread */
+
+#ifdef FOIR_FRAMELOG
+/* FOIR_FRAMELOG (framelog.h): per-frame record, accumulators of the interval since the previous UpdateScreen */
+static bool l_fl_on;
+static double l_fl_cb_ms, l_fl_cbmax_ms, l_fl_syncfull_base;
+static unsigned l_fl_lists, l_fl_loads_base;
+static uint64_t l_fl_cmds_base, l_fl_jobs_base, l_fl_mtsync_base, l_fl_busy_base[8];
+static uint32_t l_fl_prims_base, l_fl_pix_base;
+static uint64_t l_fl_cpu;
+static struct rusage l_fl_ru;                    /* emulation thread's rusage at the previous record */
+#endif
 
 static double cpu_ms(int who)
 {
@@ -246,6 +261,9 @@ EXPORT int CALL RomOpen(void)
     l_rdp.mi_intr = l_gfx.MI_INTR_REG;
     l_rdp.check_interrupts = l_gfx.CheckInterrupts;
     capture_init(&l_rdp);
+#ifdef FOIR_FRAMELOG
+    l_fl_on = framelog_open();
+#endif
     l_rdp.frame_end_cb = on_rdp_frame_end;
     l_rdp.skip_pixels = false;
     l_rdp_frames = l_skipped_frames = 0;
@@ -259,6 +277,17 @@ EXPORT int CALL RomOpen(void)
         if (nthreads > 7) nthreads = 7;
     }
     bool mt_on = nthreads > 0 && rdp_start_workers(&l_rdp, nthreads);
+#ifdef FOIR_FRAMELOG
+    if (l_fl_on) {
+        mt_prof_enable(&l_rdp);
+        getrusage(RUSAGE_THREAD, &l_fl_ru);
+        { struct timespec tc; if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &tc) == 0) l_fl_cpu = (uint64_t)tc.tv_sec * 1000000000ull + (uint64_t)tc.tv_nsec; }
+        uint64_t jobs = 0, sy = 0;
+        mt_prof_read(&l_rdp, l_fl_busy_base, &jobs, &sy);
+        l_fl_jobs_base = jobs; l_fl_mtsync_base = sy;
+        foir_log(FOIR_LOG_INFO, "FOIR_FRAMELOG: per-frame record to %s", getenv("FOIR_FRAMELOG"));
+    }
+#endif
     foir_log(FOIR_LOG_INFO, "foir M3: kernels=%s workers=%d rdram=%u KiB, specialised variants %s: texture %d, combine %d, zcmp %d, blend %d, store %d",
              l_rdp.k->name, mt_on ? nthreads : 0, rdram_size >> 10, l_rdp.spec_ok_mask && l_cfg.specialize ? "on" : "off",
              foir_spec_tabs[SPEC_TEX].n, foir_spec_tabs[SPEC_COMB].n, foir_spec_tabs[SPEC_ZCMP].n, foir_spec_tabs[SPEC_BLEND].n, foir_spec_tabs[SPEC_STORE].n);
@@ -274,6 +303,10 @@ EXPORT void CALL RomClosed(void)
 {
     if (!l_rom_open) return;
     capture_shutdown(&l_rdp);
+#ifdef FOIR_FRAMELOG
+    framelog_close();
+    l_fl_on = false;
+#endif
     foir_stats_flush();
     gl_out_shutdown();
     rdp_destroy(&l_rdp);
@@ -293,9 +326,71 @@ EXPORT void CALL ProcessRDPList(void)
     if (!l_rom_open) return;
     double t0 = now_ms();
     rdp_process_list(&l_rdp);
-    l_rdp_ms += now_ms() - t0;
+    double dt = now_ms() - t0;
+    l_rdp_ms += dt;
     l_lists++;
+#ifdef FOIR_FRAMELOG
+    if (l_fl_on) {
+        l_fl_cb_ms += dt; l_fl_lists++;
+        if (dt > l_fl_cbmax_ms) l_fl_cbmax_ms = dt;
+    }
+#endif
 }
+
+#ifdef FOIR_FRAMELOG
+#define MS_TO_NS(x) ((uint64_t)((x) * 1e6 + 0.5))
+static uint32_t sat32(uint64_t x) { return x > 0xffffffffull ? 0xffffffffu : (uint32_t)x; }
+
+/* FOIR_FRAMELOG: one record per UpdateScreen; ts = entry, ts1 = after the drain, t0 / t1 / t2 = vi render start / end, present end */
+static void fl_record(double ts, double ts1, double t0, double t1, double t2, const struct vi_regs *v)
+{
+    (void)v;
+    struct fl_rec r;
+    memset(&r, 0, sizeof r);
+    uint64_t busy[8] = { 0 }, jobs = 0, sy = 0, bsum = 0, bmax = 0;
+    int nw = mt_prof_read(&l_rdp, busy, &jobs, &sy);
+    for (int i = 0; i < nw; i++) {
+        uint64_t d = busy[i] - l_fl_busy_base[i];
+        l_fl_busy_base[i] = busy[i];
+        bsum += d;
+        if (d > bmax) bmax = d;
+    }
+    uint32_t pix = rdp_pixels(&l_rdp);
+    r.t_enter_ns = MS_TO_NS(ts); r.t_leave_ns = MS_TO_NS(t2);
+    r.frame = l_frames + 1;
+    r.lists = l_fl_lists;
+    r.cb_ns = sat32(MS_TO_NS(l_fl_cb_ms)); r.cb_max_ns = sat32(MS_TO_NS(l_fl_cbmax_ms));
+    r.syncfull_ns = sat32(MS_TO_NS(l_rdp.sync_wait_ms - l_fl_syncfull_base));
+    r.mtsync_ns = sat32(sy - l_fl_mtsync_base);
+    r.drain_ns = sat32(MS_TO_NS(ts1 - ts)); r.vi_ns = sat32(MS_TO_NS(t1 - t0)); r.present_ns = sat32(MS_TO_NS(t2 - t1));
+    r.cmds = (uint32_t)(l_rdp.frame_cmds - l_fl_cmds_base);
+    r.prims = l_rdp.stat_prims - l_fl_prims_base;
+    r.pixels = pix - l_fl_pix_base;
+    r.loads = l_rdp.stat_loads - l_fl_loads_base;
+    r.wk_busy_sum_ns = sat32(bsum); r.wk_busy_max_ns = sat32(bmax);
+    r.jobs = (uint32_t)(jobs - l_fl_jobs_base);
+    r.vi_res = ((uint32_t)l_frame.width << 16) | ((uint32_t)l_frame.height & 0xffff);
+    {
+        /* what the emulation thread did itself: CPU time (user + system), page faults, context switches since the previous record.
+         * Wall time much larger than the CPU time = it was descheduled or blocked (I/O, futex, sleep), not computing. */
+        struct rusage ru;
+        struct timespec tc;
+        if (getrusage(RUSAGE_THREAD, &ru) == 0 && clock_gettime(CLOCK_THREAD_CPUTIME_ID, &tc) == 0) {
+            /* getrusage's times are scheduler-tick granular (10 ms here); CLOCK_THREAD_CPUTIME_ID is exact */
+            uint64_t cpu_now = (uint64_t)tc.tv_sec * 1000000000ull + (uint64_t)tc.tv_nsec;
+            r.thr_cpu_ns = sat32(cpu_now - l_fl_cpu);
+            l_fl_cpu = cpu_now;
+            r.thr_faults = ((uint32_t)(ru.ru_minflt - l_fl_ru.ru_minflt) & 0xffff) | ((uint32_t)(ru.ru_majflt - l_fl_ru.ru_majflt) << 16);
+            r.thr_ctxsw = ((uint32_t)(ru.ru_nvcsw - l_fl_ru.ru_nvcsw) & 0xffff) | ((uint32_t)(ru.ru_nivcsw - l_fl_ru.ru_nivcsw) << 16);
+            l_fl_ru = ru;
+        }
+    }
+    framelog_put(&r);
+    l_fl_cb_ms = l_fl_cbmax_ms = 0; l_fl_lists = 0;
+    l_fl_syncfull_base = l_rdp.sync_wait_ms; l_fl_mtsync_base = sy; l_fl_jobs_base = jobs;
+    l_fl_cmds_base = l_rdp.frame_cmds; l_fl_prims_base = l_rdp.stat_prims; l_fl_pix_base = pix; l_fl_loads_base = l_rdp.stat_loads;
+}
+#endif
 
 EXPORT void CALL UpdateScreen(void)
 {
@@ -304,7 +399,8 @@ EXPORT void CALL UpdateScreen(void)
     read_vi(&v);
     double ts = now_ms();
     rdp_sync(&l_rdp);
-    l_sync_ms += now_ms() - ts;
+    double ts1 = now_ms();
+    l_sync_ms += ts1 - ts;
     capture_frame(&l_rdp, &v);
     double t0 = now_ms();
     vi_render_ex(&l_rdp, &v, &l_frame, true);
@@ -313,6 +409,9 @@ EXPORT void CALL UpdateScreen(void)
     double t2 = now_ms();
     l_vi_ms += t1 - t0;
     l_present_ms += t2 - t1;
+#ifdef FOIR_FRAMELOG
+    if (l_fl_on) fl_record(ts, ts1, t0, t1, t2, &v);
+#endif
     /* FrameSkip=auto: compare the achieved frame interval with the VI period every 60 frames */
     if (l_cfg.frame_skip == FOIR_FRAMESKIP_AUTO) {
         if (l_win_frames == 0) l_win_start_ms = t0;

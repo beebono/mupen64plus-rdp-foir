@@ -1463,6 +1463,7 @@ src/walk.h            the edge walker for one row from the walker record (walk_r
 src/raster.c          row loop (walk_row per owned row) and span -> pixel-batch builder (NEON: fixed-size ramps, edge-zone coverage; portable reference builder), worker row ownership
 src/mt.c              worker pool: job ring (walker record + constants), state / TMEM snapshots, hazards and barriers
 src/tmem.c            TMEM model, LOAD_TILE/BLOCK/TLUT (word-wise fast path), texel readback
+src/framelog.c        FOIR_FRAMELOG per-frame binary record (-DFOIR_FRAMELOG builds only) (mmap), format in framelog.h; decoder tools/framelog.py
 src/kernels_scalar.c  scalar reference kernels (combiner, Z, blender, FB store, FILL, COPY)
 src/kernels_tex.c     scalar texture kernel (perspective, LOD, filtering, TLUT, YUV)
 src/kernels_neon.c    NEON kernel table, FOIR_NEON_MASK / FOIR_NEON_VERIFY (wrappers for texture, combine, zcmp, blend, store and copy)
@@ -1549,6 +1550,15 @@ FOIR_DUMP=/tmp/smb FOIR_DUMP_FRAME=300 mupen64plus ...        # capture a real f
 `FOIR_LOGFILE=path` additionally writes the plugin's log lines to an unbuffered file; every 120 frames it logs
 wall time per frame, RDP time (parse + setup, of which time waiting at `SYNC_FULL`), VI convert / present time,
 pixels, primitives and skipped frames.
+
+`FOIR_FRAMELOG=path` (a debug build option: compiled in only with `CFLAGS=-DFOIR_FRAMELOG make ...`, as an environment variable like `FOIR_STATS`; then off unless set; `FOIR_FRAMELOG_MAX=n` caps the records, default 36000) writes one fixed-size binary record per
+`UpdateScreen` (= per VI frame) into a shared mmap of the file (no syscall per frame, survives SIGKILL; put it on a tmpfs on the
+handhelds): CLOCK_MONOTONIC enter / leave stamps, the time inside `ProcessRDPList` (total, longest call, of which the `SYNC_FULL` wait for the
+workers, all worker-pool barrier waits), the `UpdateScreen` stages (drain, VI convert, present = buffer swap incl. its vsync wait), commands /
+primitives / pixels / texture loads / worker jobs of the interval, the workers' busy time (sum and busiest, timed per job only while the log is on)
+and the emulation thread's own CPU time, page faults and context switches (a frame whose wall time far exceeds its thread CPU time was blocked or
+preempted, not computing). `tools/framelog.py FILE` prints the frame-time distribution and the ten slowest frames with their breakdown (`--csv`
+for everything). Measured cost on the RG35XX SP (A53, 1512 MHz): see `test-output/a53sweep2/README.txt`.
 
 ## Known gaps
 
