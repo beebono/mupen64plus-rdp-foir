@@ -419,14 +419,14 @@ enum { OPT_WIDESCREEN, OPT_FILTER, OPT_INTERLACE, OPT_FRAMESKIP, OPT_VSYNC, OPT_
 static const struct foir_suxty_option l_opts[OPT_COUNT] = {
     [OPT_WIDESCREEN] = { "Widescreen", "Widescreen", "Stretch to the whole screen instead of 4:3", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 0 },
     [OPT_FILTER]     = { "Filter", "Smoothing", "Bilinear filtering when scaling the image", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 0 },
-    [OPT_INTERLACE]  = { "InterlaceHack", "Interlace hack", "Show one field line-doubled instead of weaving fields", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 1 },
-    [OPT_FRAMESKIP]  = { "FrameSkip", "Frame skip", "Skip rendering to hold full speed (Auto adapts)", FOIR_OPT_ENUM, FOIR_OPTF_LIVE, 0, 4, 1, l_lbl_frameskip, 0 },
+    [OPT_INTERLACE]  = { "InterlaceHack", "Interlace Hack", "Show one field line-doubled instead of weaving fields", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 1 },
+    [OPT_FRAMESKIP]  = { "FrameSkip", "Frame Skip", "Skip rendering to hold full speed (Auto adapts)", FOIR_OPT_ENUM, FOIR_OPTF_LIVE, 0, 4, 1, l_lbl_frameskip, 0 },
     [OPT_VSYNC]      = { "VSync", "VSync", "Wait for vertical sync when presenting", FOIR_OPT_BOOL, 0, 0, 1, 1, NULL, 1 },
-    [OPT_THREADS]    = { "Threads", "Worker threads", "RDP worker threads (None = render on the emulation thread)", FOIR_OPT_ENUM, 0, 0, 8, 1, l_lbl_threads, 1 },
-    [OPT_NEON]       = { "NEON", "NEON kernels", "Off = scalar reference kernels (slow)", FOIR_OPT_BOOL, 0, 0, 1, 1, NULL, 1 },
-    [OPT_SPECIALIZE] = { "Specialize", "Specialised kernels", "Per-state precompiled pixel kernels", FOIR_OPT_BOOL, 0, 0, 1, 1, NULL, 1 },
-    [OPT_FASTCOMB]   = { "FastCombiner", "Fast combiner", "Fast paths for common combiner/blender modes", FOIR_OPT_BOOL, 0, 0, 1, 1, NULL, 1 },
-    [OPT_RELAXED]    = { "RelaxedPrecision", "Relaxed precision", "Lower-precision Z and texture math", FOIR_OPT_BOOL, 0, 0, 1, 1, NULL, 1 },
+    [OPT_THREADS]    = { "Threads", "Worker Threads", "RDP worker threads (None = render on the emulation thread)", FOIR_OPT_ENUM, 0, 0, 8, 1, l_lbl_threads, 1 },
+    [OPT_NEON]       = { "NEON", "NEON Kernels", "Off = scalar reference kernels (slow)", FOIR_OPT_BOOL, 0, 0, 1, 1, NULL, 1 },
+    [OPT_SPECIALIZE] = { "Specialize", "Specialised Kernels", "Per-state precompiled pixel kernels", FOIR_OPT_BOOL, 0, 0, 1, 1, NULL, 1 },
+    [OPT_FASTCOMB]   = { "FastCombiner", "Fast Combiner", "Fast paths for common combiner/blender modes", FOIR_OPT_BOOL, 0, 0, 1, 1, NULL, 1 },
+    [OPT_RELAXED]    = { "RelaxedPrecision", "Relaxed Precision", "Lower-precision Z and texture math", FOIR_OPT_BOOL, 0, 0, 1, 1, NULL, 1 },
 };
 
 /* values set() was given; applied over [Video-Foir] by load_config() */
