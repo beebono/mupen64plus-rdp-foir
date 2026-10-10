@@ -138,7 +138,7 @@ load/store helpers) was the next lever, and is what the next paragraph measures.
 
 **Faster parallel-rsp JIT (aarch64)**. The parallel-rsp JIT now emits vector ops, vector loads / stores, the COP2 / most COP0 moves and the block
 dispatch inline instead of calling a C helper per instruction, packs its code regions (the old layout was 6x padding) and copies the SP DMA
-with `memcpy` ([`parallel-rsp/README-m64p.md`](../parallel-rsp/README-m64p.md)). Output is bit-identical to the previous build: for all 23 ROMs, rsp-hle +
+with `memcpy` ([`parallel-rsp/README.md`](../parallel-rsp/README.md)). Output is bit-identical to the previous build: for all 23 ROMs, rsp-hle +
 fallback, `Core[RandomizeInterrupt]=False`, the screenshots at VI frames 300 / 900 / 1500 / 2100 / 2700 (all frames both builds reached) and the stream of
 DMEM+IMEM hashes taken after every `DoRspCycles` call (2 000-5 300 calls per ROM, `tools/prsp/prsp_cmp.sh`) are identical; the LLE audio
 streams of the standalone plugin for the 7 audio games are identical (`tools/prsp/prsp_cmp_audio.sh`, common prefix 3-4.8 MB each). Same windows,
