@@ -314,6 +314,11 @@ struct rdp {
     uint64_t cov_pix[COV_N];       /* [0..4] pixels in a specialised variant per stage, [5] all, [6] combine pixels in a shape kernel, [7] texture pixels in an "any format" variant */
     uint64_t cov_tex_all;
     bool skip_pixels;
+    /* FrameSkip: the colour images drawn lately and whether their last drawing was skipped, so that the VI does not show
+     * a buffer that still holds a frame from before skipping began */
+    uint32_t fb_hist_addr[4];
+    bool fb_hist_skipped[4];
+    int fb_hist_last, fb_hist_next;
     double sync_wait_ms;
     void (*frame_end_cb)(void *ctx);
     void *frame_end_ctx;
@@ -354,6 +359,8 @@ void foir_stats_batch(const struct rdp *r, int npix);
 void foir_stats_flush(void);   /* write the statistics to $FOIR_STATE_STATS_FILE (if set) */
 
 void raster_draw(struct rdp *r, const struct prim_walk *pw, int start, int end);
+void rdp_fb_history_reset(struct rdp *r);
+bool rdp_fb_skipped(const struct rdp *r, uint32_t vi_origin);   /* the scanned-out buffer's last drawing was skipped */
 void raster_render_walk(struct rdp *w, const struct prim_walk *pw, int start, int end);
 void raster_render_job(struct rdp *w, const struct span *rows, int jlo, int start, int end);
 void raster_render_job_ref(struct rdp *w, const struct span *rows, int jlo, int start, int end);

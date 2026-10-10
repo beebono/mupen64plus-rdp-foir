@@ -22,7 +22,9 @@ foir reads its settings from the `[Video-Foir]` section of `mupen64plus.cfg` (wr
 
 **Exact settings** (the output matches the scalar reference, and through it angrylion-rdp-plus): `RelaxedPrecision = False`, `FrameSkip = 0`, `InterlaceHack = False`; all other options are exact in either position. `FOIR_KNOBS=exact` forces these three.
 
-**FrameSkip.** A fixed `N` renders the frames whose count is a multiple of `N+1`. In `auto` mode the achieved frame interval is measured over windows of 60 presented frames: above 112 % of the VI period (16.67 ms) the skip level goes up, below 92 % it goes down; level 1 renders every second frame, level 2 one frame in three. It is a simple controller and does not know about render-to-texture frames. The suxty menu offers Off / Every 2nd / 2 of 3 / 3 of 4 / Auto (levels 0-3 and `auto`; the names count skipped frames).
+**FrameSkip.** A fixed `N` renders the frames whose count is a multiple of `N+1`. In `auto` mode the achieved frame interval is measured over windows of 60 presented frames: above 112 % of the VI period (16.67 ms) the skip level goes up, below 92 % it goes down; level 1 renders every second frame, level 2 one frame in three. It is a simple controller and does not know about render-to-texture frames. Games rotate two or three framebuffers, and a
+fixed skip can leave one of them undrawn for as long as skipping lasts: when the VI scans out a colour image whose last drawing was
+skipped, foir neither converts nor presents it, so the screen keeps the last rendered frame instead of flashing an old one (`held` in the log). The suxty menu offers Off / Every 2nd / 2 of 3 / 3 of 4 / Auto (levels 0-3 and `auto`; the names count skipped frames).
 
 Removed options: a `JIT` entry that an older config file may still contain is ignored (the compile-at-run-time pipeline it was reserved for was dropped in favour of the static variants); a `SkipCoverage` knob existed for a while and was removed because it produced seams along polygon edges.
 
@@ -59,7 +61,7 @@ Compile-time options that change the build rather than a run: `-DFOIR_BATCH=n` (
 
 ## Log output
 
-Every 120 frames the plugin logs the wall time per frame, the RDP time (parse + setup, of which the wait at `SYNC_FULL`), VI convert and present time, pixels, primitives, skipped frames, process and emulation-thread CPU per frame, and the share of pixels that ran in specialised variants per stage (`specialised pixels: ...`). At start it logs the kernel set, the worker count and the number of variants per stage.
+Every 120 frames the plugin logs the wall time per frame, the RDP time (parse + setup, of which the wait at `SYNC_FULL`), VI convert and present time, pixels, primitives, skipped frames, frames held back because they showed a skipped buffer, process and emulation-thread CPU per frame, and the share of pixels that ran in specialised variants per stage (`specialised pixels: ...`). At start it logs the kernel set, the worker count and the number of variants per stage.
 
 ## suxty interface
 

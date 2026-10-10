@@ -56,7 +56,7 @@ static struct vi_frame l_frame;
 static int l_win_w = 640, l_win_h = 480;
 static bool l_fullscreen;
 static double l_rdp_ms, l_vi_ms, l_sync_ms, l_last_log_ms, l_present_ms, l_syncfull_base;
-static unsigned l_rdp_frames, l_skipped_frames;
+static unsigned l_rdp_frames, l_skipped_frames, l_stale_frames;
 static int l_skip_level;                 /* 0 none, 1 skip every other frame, 2 render one in three */
 static double l_win_start_ms, l_last_us_ms;
 static unsigned l_win_frames;
@@ -262,7 +262,8 @@ EXPORT int CALL RomOpen(void)
 #endif
     l_rdp.frame_end_cb = on_rdp_frame_end;
     l_rdp.skip_pixels = false;
-    l_rdp_frames = l_skipped_frames = 0;
+    rdp_fb_history_reset(&l_rdp);
+    l_rdp_frames = l_skipped_frames = l_stale_frames = 0;
     l_skip_level = 0;
     int nthreads = l_cfg.threads;
     const char *te = getenv("FOIR_THREADS");
@@ -398,9 +399,12 @@ EXPORT void CALL UpdateScreen(void)
     l_sync_ms += ts1 - ts;
     capture_frame(&l_rdp, &v);
     double t0 = now_ms();
-    vi_render_ex(&l_rdp, &v, &l_frame, true);
+    /* keep the last good frame on screen rather than a buffer FrameSkip left holding an older one */
+    bool stale = rdp_fb_skipped(&l_rdp, v.origin);
+    l_stale_frames += stale;
+    if (!stale) vi_render_ex(&l_rdp, &v, &l_frame, true);
     double t1 = now_ms();
-    gl_out_present(l_frame.valid ? l_frame.pixels : NULL, l_frame.raw16, l_frame.width, l_frame.height, l_frame.screen_w, l_frame.screen_h, l_render_cb);
+    if (!stale) gl_out_present(l_frame.valid ? l_frame.pixels : NULL, l_frame.raw16, l_frame.width, l_frame.height, l_frame.screen_w, l_frame.screen_h, l_render_cb);
     double t2 = now_ms();
     l_vi_ms += t1 - t0;
     l_present_ms += t2 - t1;
@@ -427,10 +431,10 @@ EXPORT void CALL UpdateScreen(void)
         l_last_log_ms = wall;
         double sfw = l_rdp.sync_wait_ms - l_syncfull_base;
         l_syncfull_base = l_rdp.sync_wait_ms;
-        foir_log(FOIR_LOG_INFO, "frame %u: %.2f ms/frame wall, %.2f ms/frame RDP (%.2f parse+setup of which %.2f waiting at SYNC_FULL, %.2f drain; %u lists, %llu cmds, %u prims, %u px), %.2f ms/frame VI (%.2f convert + %.2f present), vi %dx%d type %u, skipped %u/%u level %d",
+        foir_log(FOIR_LOG_INFO, "frame %u: %.2f ms/frame wall, %.2f ms/frame RDP (%.2f parse+setup of which %.2f waiting at SYNC_FULL, %.2f drain; %u lists, %llu cmds, %u prims, %u px), %.2f ms/frame VI (%.2f convert + %.2f present), vi %dx%d type %u, skipped %u/%u level %d, held %u",
                  l_frames, per_frame, (l_rdp_ms + l_sync_ms) / 120, l_rdp_ms / 120, sfw / 120, l_sync_ms / 120, l_lists, (unsigned long long)(l_rdp.frame_cmds - l_cmds_base),
                  l_rdp.stat_prims - l_prims_base, pix - l_pix_base, (l_vi_ms + l_present_ms) / 120, l_vi_ms / 120, l_present_ms / 120,
-                 l_frame.width, l_frame.height, v.status & 3, l_skipped_frames, l_rdp_frames, l_skip_level);
+                 l_frame.width, l_frame.height, v.status & 3, l_skipped_frames, l_rdp_frames, l_skip_level, l_stale_frames);
         {
             double all = cpu_ms(RUSAGE_SELF), emu = cpu_ms(RUSAGE_THREAD);
             foir_log(FOIR_LOG_INFO, "cpu: %.2f ms/frame in the process (%.2f on the emulation thread, %.2f on the other threads)",

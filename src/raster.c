@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include "rdp.h"
+#include <string.h>
 #include "mt.h"
 #include "spec.h"
 #include "walk.h"
@@ -602,8 +603,41 @@ void raster_render_job_ref(struct rdp *r, const struct span *rows, int jlo, int 
     render_job(r, rows, jlo, NULL, start, end, 1);
 }
 
+void rdp_fb_history_reset(struct rdp *r)
+{
+    memset(r->fb_hist_addr, 0xff, sizeof r->fb_hist_addr);
+    memset(r->fb_hist_skipped, 0, sizeof r->fb_hist_skipped);
+    r->fb_hist_last = r->fb_hist_next = 0;
+}
+
+static void fb_history_note(struct rdp *r)
+{
+    int i = r->fb_hist_last;
+    if (r->fb_hist_addr[i] != r->fb_address) {
+        for (i = 0; i < 4 && r->fb_hist_addr[i] != r->fb_address; i++) ;
+        if (i == 4) {
+            i = r->fb_hist_next;
+            r->fb_hist_next = (i + 1) & 3;
+            r->fb_hist_addr[i] = r->fb_address;
+        }
+        r->fb_hist_last = i;
+    }
+    r->fb_hist_skipped[i] = r->skip_pixels;
+}
+
+bool rdp_fb_skipped(const struct rdp *r, uint32_t vi_origin)
+{
+    /* the VI origin may start a few lines into the buffer: take the nearest colour image at or below it */
+    uint32_t o = vi_origin & 0xffffff, best = 0x10000;
+    int bi = -1;
+    for (int i = 0; i < 4; i++)
+        if (r->fb_hist_addr[i] <= o && o - r->fb_hist_addr[i] < best) { best = o - r->fb_hist_addr[i]; bi = i; }
+    return bi >= 0 && r->fb_hist_skipped[bi];
+}
+
 void raster_draw(struct rdp *r, const struct prim_walk *pw, int start, int end)
 {
+    fb_history_note(r);
     if (r->cfg.debug_nopixels || r->skip_pixels) return;
     prim_prepare(r);
     if (r->mt) {
