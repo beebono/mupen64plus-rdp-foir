@@ -10,14 +10,25 @@
  */
 #include "spec.h"
 
+#ifdef FOIR_STATS
+#define FOIR_LSTFB() LST_ADD(lst_lodfb, 1)
+#else
+#define FOIR_LSTFB() ((void)0)
+#endif
 /* the generic kernel, as an out-of-line call (the variants are flattened: it must not be inlined into every one of them) */
-static __attribute__((noinline)) void tex_generic(struct rdp *r, struct px_batch *b) { neon_texture(r, b); }
+static __attribute__((noinline)) void tex_generic(struct rdp *r, struct px_batch *b)
+{
+#ifdef FOIR_STATS
+    LST_ADD(lst_generic, 1);
+#endif
+    neon_texture(r, b);
+}
 
-/* every tile the LOD can select (the primitive's tile + 0 .. max_level + 2) has this texel format and size */
+/* every tile the LOD can select (the primitive's tile + 0 .. lod_chain_last) has this texel format and size */
 FOIR_INLINE bool lod_chain_matches(const struct rdp *r, int fmt, int siz)
 {
     const int tn = r->pc.tilenum;
-    for (int k = 0; k <= r->pc.max_level + 2 && k < 8; k++) {
+    for (int k = 0; k <= lod_chain_last(r) && k < 8; k++) {
         const struct tile *t = &r->tile[(tn + k) & 7];
         if (t->format != fmt || t->size != siz) return false;
     }
@@ -28,7 +39,7 @@ FOIR_INLINE bool lod_chain_matches(const struct rdp *r, int fmt, int siz)
 FOIR_INLINE bool lod_chain_nonyuv(const struct rdp *r)
 {
     const int tn = r->pc.tilenum;
-    for (int k = 0; k <= r->pc.max_level + 2 && k < 8; k++)
+    for (int k = 0; k <= lod_chain_last(r) && k < 8; k++)
         if (r->tile[(tn + k) & 7].format == FORMAT_YUV) return false;
     return true;
 }
@@ -39,7 +50,7 @@ FOIR_INLINE bool lod_chain_nonyuv(const struct rdp *r)
  *
  * TEXA / TEXAL: "any format" variants (spec.h): the structure of the texture unit is compiled in, the format and size of the
  * tiles, the TLUT type and MID_TEXEL are read from the state. The LOD variants take the format of every tile the LOD selects
- * from that tile itself (tex_cycle_tiles), which only YUV texels would break: the variant hands such a state to the generic
+ * from that tile itself (tex_cycle_tiles / tex_cycle_multi), which only YUV texels would break: the variant hands such a state to the generic
  * kernel (which hands it to the scalar one). */
 #define TEX(two, t0, t1, nx, fmt0, siz0, fmt1, siz1, smp, mid, tlut, tlt, persp, bl0, bl1) \
     TEX_NAMED(tex_##two##t0##t1##nx##_##fmt0##siz0##fmt1##siz1##_##smp##mid##tlut##tlt##persp##bl0##bl1, \
@@ -59,7 +70,7 @@ FOIR_INLINE bool lod_chain_nonyuv(const struct rdp *r)
     { \
         static const struct tspec S = { two, t0, t1, nx, 1, lodt, lodt, persp, \
                                         { siz0, fmt0, tlut, tlt, smp, mid, bl0 }, { siz1, fmt1, tlut, tlt, smp, mid, bl1 }, 0 }; \
-        if ((lodt) && !lod_chain_matches(r, fmt0, siz0)) { tex_generic(r, b); return; } \
+        if ((lodt) && !lod_chain_matches(r, fmt0, siz0)) { FOIR_LSTFB(); tex_generic(r, b); return; } \
         texture_body(r, b, &S); \
     }
 #define TEXA(two, t0, t1, nx, smp, tlut, persp, bl0, bl1) \

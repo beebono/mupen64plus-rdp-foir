@@ -107,6 +107,7 @@ def rgba16(rng):
 def rnd_modes(rng, cycle):
     k = dict(cycle=cycle, persp=rng.randrange(2), bilerp_sample=rng.randrange(2), bi0=0 if rng.randrange(10) == 0 else 1,
              bi1=0 if rng.randrange(10) == 0 else 1, sharpen=rng.randrange(6) == 0,
+             lod=rng.randrange(3) == 0, detail=rng.randrange(6) == 0,       # TEX_LOD_EN / detail: tiles 0 .. 3 form a mip chain (make_scene)
              mid_texel=rng.randrange(4) == 0,
              rgb_dither=rng.choice([0, 1, 2, 3, 3]), alpha_dither=rng.choice([0, 1, 2, 3, 3]),
              aa=rng.randrange(2), z_compare=rng.randrange(2), z_update=rng.randrange(2), zmode=rng.randrange(4),
@@ -135,7 +136,7 @@ def rnd_combine(rng, cycle=None):
                        f(8), f(8), f(16), f(8), f(8), f(8), f(8), f(8))
 
 
-def rnd_tri(rng, w, h, textured, z):
+def rnd_tri(rng, w, h, textured, z, level=0):
     pts = [(rng.uniform(-10, w + 10), rng.uniform(-10, h + 10)) for _ in range(3)]
     shade = [tuple(rng.randrange(256) for _ in range(4)) for _ in range(3)]
     tex = None
@@ -143,7 +144,7 @@ def rnd_tri(rng, w, h, textured, z):
         tex = [(rng.uniform(-8, 40), rng.uniform(-8, 40), rng.uniform(0.2, 1.0)) for _ in range(3)]
     zs = [rng.randrange(1000, 60000) for _ in range(3)] if z else None
     try:
-        return triangle(pts, shade=shade, tex=tex, zs=zs)
+        return triangle(pts, shade=shade, tex=tex, zs=zs, level=level)
     except Exception:
         return None
 
@@ -164,6 +165,11 @@ def make_scene(rng):
           fill_rect(0, 0, W - 1, H - 1), sync_pipe(), set_color_image(0, size, W, BUF[0]))
     s.add(set_texture_image(0, 2, 32, TEX), set_tile(0, 2, 0, 0, 7), load_block(7, 0, 0, 1023, 0), sync_pipe(),
           set_tile(0, 2, 8, 0, 0, maskt=rng.choice([0, 5]), masks=rng.choice([0, 5])), set_tile_size(0, 0, 0, 31, 31))
+    # tiles 1 .. 3: the next mip levels (16, 8, 4 texels square; the same random texels, loaded linearly)
+    for lvl, (wd, tm) in enumerate([(16, 256), (8, 320), (4, 336)], 1):
+        s.add(set_texture_image(0, 2, 32, TEX), set_tile(0, 2, 0, tm, 7), load_block(7, 0, 0, wd * wd - 1, 0), sync_pipe(),
+              set_tile(0, 2, max(1, wd // 4), tm, lvl, maskt=rng.choice([0, wd.bit_length() - 1]), masks=rng.choice([0, wd.bit_length() - 1]),
+                       ms=rng.randrange(2), mt=rng.randrange(2), cs=rng.randrange(4) == 0), set_tile_size(lvl, 0, 0, wd - 1, wd - 1))
     cur = 0
     curW = W
     for step in range(rng.randrange(12, 40)):
@@ -174,7 +180,7 @@ def make_scene(rng):
             s.add(rnd_combine(rng, cyc), set_prim_color(rng.randrange(1 << 32)), set_env_color(rng.randrange(1 << 32)),
                   set_other_modes(**rnd_modes(rng, cyc)))
             for _ in range(rng.randrange(1, 4)):
-                t = rnd_tri(rng, curW, H, textured, rng.randrange(2))
+                t = rnd_tri(rng, curW, H, textured, rng.randrange(2), level=rng.randrange(4))
                 if t:
                     s.add(t)
         elif op == 5:  # fill

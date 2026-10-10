@@ -18,6 +18,46 @@
 #include "spec.h"
 #ifdef FOIR_STATS
 #include <stdio.h>
+#include <stdlib.h>
+/* statistics of the LOD / texture path (-DFOIR_STATS; printed at exit): batches / pixels / groups per mode, number of distinct tiles per group */
+static uint64_t lst_batches[4096], lst_pixels[4096], lst_groups[4096];
+static uint64_t lst_dist[3][9], lst_distu[9], lst_fmt[8][4], lst_generic, lst_lodfb, lst_same12, lst_xhalves, lst_xslow;
+#define LST_ADD(x, n) __atomic_fetch_add(&(x), (n), __ATOMIC_RELAXED)
+static void lst_dump(void)
+{
+    uint64_t tb = 0, tp = 0;
+    for (int i = 0; i < 4096; i++) { tb += lst_batches[i]; tp += lst_pixels[i]; }
+    fprintf(stderr, "LODSTAT texture batches %llu pixels %llu; generic kernel (neon_texture entries from tex_generic) %llu, of which chain mismatch %llu\n",
+            (unsigned long long)tb, (unsigned long long)tp, (unsigned long long)lst_generic, (unsigned long long)lst_lodfb);
+    for (int i = 0; i < 4096; i++) {
+        if (!lst_batches[i]) continue;
+        fprintf(stderr, "LODSTAT mode two=%d persp=%d smp=%d tlut=%d lodt=%d dolod=%d detail=%d sharpen=%d any=%d nx=%d t1=%d : batches %llu pixels %llu groups %llu\n",
+                i & 1, (i >> 1) & 1, (i >> 2) & 1, (i >> 3) & 1, (i >> 4) & 1, (i >> 5) & 1, (i >> 6) & 1, (i >> 7) & 1, (i >> 8) & 1, (i >> 9) & 1, (i >> 10) & 1,
+                (unsigned long long)lst_batches[i], (unsigned long long)lst_pixels[i], (unsigned long long)lst_groups[i]);
+    }
+    static const char *kn[] = { "t1 (cycle 0 tiles)", "t2 (cycle 1 tiles)", "nx (next pixel tiles)" };
+    for (int k = 0; k < 3; k++) {
+        fprintf(stderr, "LODSTAT distinct %s per group:", kn[k]);
+        for (int j = 1; j < 9; j++) fprintf(stderr, " %d:%llu", j, (unsigned long long)lst_dist[k][j]);
+        fprintf(stderr, "\n");
+    }
+    fprintf(stderr, "LODSTAT distinct tiles of t1 U t2 per group:");
+    for (int j = 1; j < 9; j++) fprintf(stderr, " %d:%llu", j, (unsigned long long)lst_distu[j]);
+    fprintf(stderr, "\nLODSTAT persp x-neighbour halves (4 lanes) %llu, of which not all lanes had the neighbour in the adjacent lane (divided again) %llu\n", (unsigned long long)lst_xhalves, (unsigned long long)lst_xslow);
+    fprintf(stderr, "LODSTAT groups with t1 == t2 in every lane: %llu\n", (unsigned long long)lst_same12);
+    for (int f = 0; f < 8; f++)
+        for (int z = 0; z < 4; z++)
+            if (lst_fmt[f][z]) fprintf(stderr, "LODSTAT lod batches tile0 format %d size %d: %llu\n", f, z, (unsigned long long)lst_fmt[f][z]);
+}
+static __attribute__((constructor)) void lst_init(void) { atexit(lst_dump); }
+static unsigned lst_distinct(uint8x8_t v)
+{
+    uint8_t a[8] ALIGN16;
+    vst1_u8(a, v);
+    unsigned m = 0;
+    for (int i = 0; i < 8; i++) m |= 1u << (a[i] & 7);
+    return m;
+}
 #endif
 
 #define S32(x) vdupq_n_s32(x)
@@ -26,15 +66,17 @@ FOIR_INLINE int32x4_t sign16(int32x4_t x) { return vshrq_n_s32(vshlq_n_s32(x, 16
 
 /* ---- perspective divide + clamp17 ------------------------------------------------------- */
 
-FOIR_INLINE void tc_divide4(int persp, int32x4_t ss, int32x4_t st, int32x4_t sw,
-                            int32x4_t *sss, int32x4_t *sst)
+FOIR_INLINE void tc_divide4(int persp, int32x4_t s, int32x4_t t, int32x4_t w, int32x4_t *sss, int32x4_t *sst)
 {
+    /* s, t, w are the raw 16.16 interpolants of four pixels; the divide works on their integer parts (the arithmetic shift leaves
+     * the sign extended 16 bit values the scalar tc_divide() starts from) */
+    int32x4_t ss = vshrq_n_s32(s, 16), st = vshrq_n_s32(t, 16), sw = vshrq_n_s32(w, 16);
     if (!persp) {
-        *sss = vandq_s32(sign16(ss), S32(0x1ffff));
-        *sst = vandq_s32(sign16(st), S32(0x1ffff));
+        *sss = vandq_s32(ss, S32(0x1ffff));
+        *sst = vandq_s32(st, S32(0x1ffff));
         return;
     }
-    uint32x4_t wcarry = vcleq_s32(sign16(sw), S32(0));
+    uint32x4_t wcarry = vcleq_s32(sw, S32(0));
     int32_t idx[4] ALIGN16, tab[4] ALIGN16;
     vst1q_s32(idx, vandq_s32(sw, S32(0x7fff)));
     tab[0] = k_tcdiv[idx[0]]; tab[1] = k_tcdiv[idx[1]]; tab[2] = k_tcdiv[idx[2]]; tab[3] = k_tcdiv[idx[3]];
@@ -42,16 +84,17 @@ FOIR_INLINE void tc_divide4(int persp, int32x4_t ss, int32x4_t st, int32x4_t sw,
     int32x4_t shift = vandq_s32(tv, S32(0xf));
     int32x4_t rcp = vshrq_n_s32(tv, 4);
 
-    int32x4_t sprod = vmulq_s32(sign16(ss), rcp), tprod = vmulq_s32(sign16(st), rcp);
-    int32x4_t tempmask = vandq_s32(vnegq_s32(vshlq_s32(S32(1 << 29), vnegq_s32(shift))), S32((1 << 30) - 1));
-    int32x4_t oob_s = vandq_s32(sprod, tempmask), oob_t = vandq_s32(tprod, tempmask);
+    int32x4_t sprod = vmulq_s32(ss, rcp), tprod = vmulq_s32(st, rcp);
+    /* out of bounds: bits 29 .. 29 - shift of the product (the scalar code's tempmask) are not all equal. Shifted to the top and
+     * sign extended back down they form 0 or -1 exactly when they are. */
+    int32x4_t down = vsubq_s32(shift, S32(31));
+    uint32x4_t cs = vcgtq_u32(vreinterpretq_u32_s32(vaddq_s32(vshlq_s32(vshlq_n_s32(sprod, 2), down), S32(1))), vdupq_n_u32(1));
+    uint32x4_t ct = vcgtq_u32(vreinterpretq_u32_s32(vaddq_s32(vshlq_s32(vshlq_n_s32(tprod, 2), down), S32(1))), vdupq_n_u32(1));
     int32x4_t cnt = vsubq_s32(shift, S32(13));           /* right shift by 13 - shift (left by 1 when shift == 14) */
     int32x4_t temps = vshlq_s32(sprod, cnt), tempt = vshlq_s32(tprod, cnt);
     uint32x4_t is_e = vceqq_s32(shift, S32(0xe));
     int32x4_t chk_s = vbslq_s32(is_e, sprod, temps), chk_t = vbslq_s32(is_e, tprod, tempt);
 
-    uint32x4_t cs = vandq_u32(vmvnq_u32(vceqq_s32(oob_s, tempmask)), vmvnq_u32(vceqq_s32(oob_s, S32(0))));
-    uint32x4_t ct = vandq_u32(vmvnq_u32(vceqq_s32(oob_t, tempmask)), vmvnq_u32(vceqq_s32(oob_t, S32(0))));
     int32x4_t ous = vbslq_s32(vtstq_s32(chk_s, S32(1 << 29)), S32(1 << 17), S32(2 << 17));
     int32x4_t out = vbslq_s32(vtstq_s32(chk_t, S32(1 << 29)), S32(1 << 17), S32(2 << 17));
     ous = vandq_s32(ous, vreinterpretq_s32_u32(cs));
@@ -505,110 +548,166 @@ static void tex_cycle(const struct rdp *r, const struct tctx *cx, const struct t
 
 /* ---- level of detail ------------------------------------------------------------------------------------ */
 
-FOIR_INLINE int32x4_t sign17(int32x4_t x) { return vshrq_n_s32(vshlq_n_s32(x, 15), 15); }
-
-/* |next - cur| in the RDP's 17-bit sign/magnitude flavour, then the larger of s and t and of the previous value */
-FOIR_INLINE int32x4_t lod_delta(int32x4_t scur, int32x4_t snext, int32x4_t tcur, int32x4_t tnext, int32x4_t previous)
-{
-    int32x4_t ds = vsubq_s32(sign17(snext), sign17(scur)), dt = vsubq_s32(sign17(tnext), sign17(tcur));
-    ds = vbslq_s32(vtstq_s32(ds, S32(0x20000)), vandq_s32(vmvnq_s32(ds), S32(0x1ffff)), ds);
-    dt = vbslq_s32(vtstq_s32(dt, S32(0x20000)), vandq_s32(vmvnq_s32(dt), S32(0x1ffff)), dt);
-    return vmaxq_s32(vmaxq_s32(ds, dt), previous);
-}
-
-/* lod_4x17_to_15: keep 15 bits and flag overflow of the three bits above with bit 14 */
-FOIR_INLINE int32x4_t lod_fold(int32x4_t d)
-{
-    return vorrq_s32(vandq_s32(d, S32(0x7fff)), vbslq_s32(vtstq_s32(d, S32(0x1c000)), S32(0x4000), S32(0)));
-}
-
-struct lodres {
-    int16x8_t lf;           /* LOD fraction (0..0x1ff) */
-    uint8x8_t t1, t2;       /* tiles of the first / second texture cycle */
+/* The RDP derives the level of detail of a pixel from three divided coordinate pairs: its own, that of the next pixel in the
+ * iteration direction (s + dsinc ...) and that of the pixel one row down (s + dsdy ...). lod_pass() computes it for all the
+ * lanes of a batch in two phases:
+ *   1. the divided coordinates of every lane (stored: the texture cycles need them too);
+ *   2. per group of eight lanes: the "next pixel" divide is taken from the neighbouring lane when that lane really holds the
+ *      coordinates s + dsinc, t + dtinc, w + dwinc (the divide is a function of its inputs, so this is exact whatever the
+ *      batch looks like; only lanes at a scanline run boundary or the batch ends have to divide), the "row below" divide is
+ *      computed, the largest of the four |difference| of the 17-bit sign/magnitude coordinates is folded to a LOD and the level
+ *      selection runs on eight 16-bit lanes. */
+#define LOD_PAD 8
+struct lodbuf {
+    ALIGN16 int32_t ls_[FOIR_LANES + 2 * LOD_PAD], lt_[FOIR_LANES + 2 * LOD_PAD], lw_[FOIR_LANES + 2 * LOD_PAD];   /* s, t, w (+ the shift) */
+    ALIGN16 int32_t rs_[FOIR_LANES + 2 * LOD_PAD], rt_[FOIR_LANES + 2 * LOD_PAD];                                  /* divided s, t of the pixel */
+    ALIGN16 uint8_t t1[FOIR_LANES], t2[FOIR_LANES];     /* tiles of the first / second cycle (TEX_LOD_EN) */
 };
+#define LB(a) ((a) + LOD_PAD)
 
-/* Port of lod_select() for eight pixels. s,t,w are the raw interpolants; is/it the divided coordinates of the
- * pixel itself (before the 16-bit clamp, with the over/underflow flags). */
-static __attribute__((noinline)) void lod_group(const struct rdp *r, const int32x4_t s[2], const int32x4_t t[2], const int32x4_t w[2],
-                      const int32x4_t is[2], const int32x4_t it[2], struct lodres *res)
+FOIR_INLINE void lod_pass_impl(const struct rdp *r, const int32_t *s, const int32_t *t, const int32_t *w, const int32_t add[3], int ng, int16_t *lfo,
+                               struct lodbuf *lb, const int persp, const int tiles)
 {
     const struct prim_ctx *pc = &r->pc;
     const struct other_modes *om = &r->om;
-    const int32_t min_level = r->min_level, max_level = pc->max_level;
-    int16x4_t lf16[2];
-    int32x4_t tl1[2], tl2[2];
+    int32_t *ls = LB(lb->ls_), *lt = LB(lb->lt_), *lw = LB(lb->lw_), *rs = LB(lb->rs_), *rt = LB(lb->rt_);
+    const int n = ng * 8;
+    const int32x4_t add_s = S32(add[0]), add_t = S32(add[1]), add_w = S32(add[2]);
 
-    for (int h = 0; h < 2; h++) {
-        int32x4_t ns, nt, nys, nyt;
-        tc_divide4(om->persp_tex_en, vshrq_n_s32(vaddq_s32(s[h], S32(pc->dsinc)), 16), vshrq_n_s32(vaddq_s32(t[h], S32(pc->dtinc)), 16),
-                   vshrq_n_s32(vaddq_s32(w[h], S32(pc->dwinc)), 16), &ns, &nt);
-        tc_divide4(om->persp_tex_en, vshrq_n_s32(vaddq_s32(s[h], S32(pc->dsdy)), 16), vshrq_n_s32(vaddq_s32(t[h], S32(pc->dtdy)), 16),
-                   vshrq_n_s32(vaddq_s32(w[h], S32(pc->dwdy)), 16), &nys, &nyt);
-        int32x4_t flags = vorrq_s32(vorrq_s32(vorrq_s32(is[h], it[h]), vorrq_s32(ns, nt)), vorrq_s32(nys, nyt));
-        /* lodclamp = any of the six values has bit 17 or 18 set */
-        uint32x4_t clampm = vtstq_s32(flags, S32(0x60000));
-        int32x4_t d1 = lod_delta(is[h], ns, it[h], nt, S32(0));
-        int32x4_t lod1 = lod_fold(d1);
-        int32x4_t d2 = lod_delta(is[h], nys, it[h], nyt, lod1);
-        int32x4_t lod = lod_fold(d2);
-        lod = vbicq_s32(lod, vreinterpretq_s32_u32(clampm));      /* lodclamp -> lod = 0 */
+    /* phase 1 */
+    for (int i = 0; i < n; i += 4) {
+        int32x4_t sv = vaddq_s32(vld1q_s32(s + i), add_s), tv = vaddq_s32(vld1q_s32(t + i), add_t), wv = vaddq_s32(vld1q_s32(w + i), add_w);
+        vst1q_s32(ls + i, sv); vst1q_s32(lt + i, tv); vst1q_s32(lw + i, wv);
+        int32x4_t a, b;
+        tc_divide4(persp, sv, tv, wv, &a, &b);
+        vst1q_s32(rs + i, a); vst1q_s32(rt + i, b);
+    }
+    /* the lane before the first / after the last one must never look like a neighbour */
+    ls[-1] = ls[0] + pc->dsinc + 1; ls[n] = ls[n - 1] + pc->dsinc + 1;
+    lt[-1] = lw[-1] = lt[n] = lw[n] = 0;
+    for (int k = 1; k <= 4; k++) { rs[-k] = 0; rt[-k] = 0; rs[n + k - 1] = 0; rt[n + k - 1] = 0; }
+    const int dir = pc->flip ? 1 : -1;
+
+    const int32x4_t dsi = S32(pc->dsinc), dti = S32(pc->dtinc), dwi = S32(pc->dwinc);
+    const int32x4_t dsy = S32(pc->dsdy), dty = S32(pc->dtdy), dwy = S32(pc->dwdy);
+    const int32_t min_level = r->min_level, max_level = pc->max_level;
+    const int sharpen = om->sharpen_tex_en, detail = om->detail_tex_en;
+    const int plain = !sharpen && !detail;
+    const uint16x8_t k4000 = vdupq_n_u16(0x4000), kff = vdupq_n_u16(0xff);
+
+    for (int g = 0; g < ng; g++) {
+        const int o = g * 8;
+        uint32x4_t dm[2], cl[2];
+        for (int h = 0; h < 2; h++) {
+            const int i = o + 4 * h;
+            int32x4_t is = vld1q_s32(rs + i), it = vld1q_s32(rt + i);
+            int32x4_t sv = vld1q_s32(ls + i), tv = vld1q_s32(lt + i), wv = vld1q_s32(lw + i);
+            int32x4_t ns, nt, nys, nyt;
+            if (persp) {
+                uint32x4_t ok = vandq_u32(vandq_u32(vceqq_s32(vld1q_s32(ls + i + dir), vaddq_s32(sv, dsi)),
+                                                    vceqq_s32(vld1q_s32(lt + i + dir), vaddq_s32(tv, dti))),
+                                          vceqq_s32(vld1q_s32(lw + i + dir), vaddq_s32(wv, dwi)));
+                ns = vld1q_s32(rs + i + dir); nt = vld1q_s32(rt + i + dir);
+#ifdef FOIR_STATS
+                __atomic_fetch_add(&lst_xhalves, 1, __ATOMIC_RELAXED);
+#endif
+                if (vminvq_u32(ok) == 0) {
+#ifdef FOIR_STATS
+                    __atomic_fetch_add(&lst_xslow, 1, __ATOMIC_RELAXED);
+#endif
+                    int32x4_t xs, xt;
+                    tc_divide4(1, vaddq_s32(sv, dsi), vaddq_s32(tv, dti), vaddq_s32(wv, dwi), &xs, &xt);
+                    ns = vbslq_s32(ok, ns, xs); nt = vbslq_s32(ok, nt, xt);
+                }
+            } else {
+                tc_divide4(0, vaddq_s32(sv, dsi), vaddq_s32(tv, dti), vaddq_s32(wv, dwi), &ns, &nt);
+            }
+            tc_divide4(persp, vaddq_s32(sv, dsy), vaddq_s32(tv, dty), vaddq_s32(wv, dwy), &nys, &nyt);
+            /* lodclamp = any of the six values has bit 17 or 18 set */
+            cl[h] = vtstq_s32(vorrq_s32(vorrq_s32(vorrq_s32(is, it), vorrq_s32(ns, nt)), vorrq_s32(nys, nyt)), S32(0x60000));
+            /* |next - cur| of the 17-bit sign/magnitude coordinates, exactly: (sign17(n) << 15 halving-minus sign17(c) << 15) is the
+             * 18-bit difference << 14; a negative difference d is replaced by ~d (the RDP's flip), i.e. v ^ (v >> 31) here, which
+             * only fills the low 14 bits and so keeps the order of the values. */
+            int32x4_t cs = vshlq_n_s32(is, 15), ct = vshlq_n_s32(it, 15);
+            int32x4_t xs = vhsubq_s32(vshlq_n_s32(ns, 15), cs), xt = vhsubq_s32(vshlq_n_s32(nt, 15), ct);
+            int32x4_t ys = vhsubq_s32(vshlq_n_s32(nys, 15), cs), yt = vhsubq_s32(vshlq_n_s32(nyt, 15), ct);
+            xs = veorq_s32(xs, vshrq_n_s32(xs, 31)); xt = veorq_s32(xt, vshrq_n_s32(xt, 31));
+            ys = veorq_s32(ys, vshrq_n_s32(ys, 31)); yt = veorq_s32(yt, vshrq_n_s32(yt, 31));
+            dm[h] = vreinterpretq_u32_s32(vmaxq_s32(vmaxq_s32(xs, xt), vmaxq_s32(ys, yt)));
+        }
+        /* The folded LOD of the RDP is the largest of the four differences when that is below 0x4000, else it has bit 14 set (which
+         * every later use treats as "overflow": magnification off, distant, fraction 0xff). A saturated 16-bit value keeps exactly that. */
+        uint16x8_t lod = vminq_u16(vcombine_u16(vqshrn_n_u32(dm[0], 14), vqshrn_n_u32(dm[1], 14)), k4000);
+        uint16x8_t clamp = vcombine_u16(vmovn_u32(cl[0]), vmovn_u32(cl[1]));
 
         /* lodfrac_lodtile */
-        uint32x4_t c1 = vorrq_u32(vtstq_s32(lod, S32(0x4000)), clampm);
-        uint32x4_t c2 = vandq_u32(vmvnq_u32(c1), vcltq_s32(lod, S32(min_level)));
-        uint32x4_t c3 = vandq_u32(vandq_u32(vmvnq_u32(c1), vmvnq_u32(c2)), vcltq_s32(lod, S32(32)));
-        uint32x4_t c4 = vmvnq_u32(vorrq_u32(vorrq_u32(c1, c2), c3));
-        int32x4_t lead = vreinterpretq_s32_u32(vclzq_u32(vreinterpretq_u32_s32(vandq_s32(vshrq_n_s32(lod, 5), S32(0xff)))));
-        int32x4_t ltil4 = vmaxq_s32(vsubq_s32(S32(31), lead), S32(0));
-        ltil4 = vbicq_s32(ltil4, vreinterpretq_s32_u32(vmvnq_u32(c4)));          /* only the minification case */
-        uint32x4_t mag = vorrq_u32(c2, c3);
-        uint32x4_t dis;
+        uint16x8_t c1 = vorrq_u16(vceqq_u16(lod, k4000), clamp);
+        uint16x8_t c2 = vbicq_u16(vcltq_u16(lod, vdupq_n_u16((uint16_t)min_level)), c1);
+        uint16x8_t c3 = vbicq_u16(vbicq_u16(vcltq_u16(lod, vdupq_n_u16(32)), c1), c2);
+        uint16x8_t c4 = vmvnq_u16(vorrq_u16(vorrq_u16(c1, c2), c3));
+        uint16x8_t ltil = vqsubq_u16(vdupq_n_u16(15), vclzq_u16(vandq_u16(vshrq_n_u16(lod, 5), kff)));     /* floor(log2(.)), 0 for 0 */
+        ltil = vandq_u16(ltil, c4);                                                                        /* only the minification case */
+        uint16x8_t mag = vorrq_u16(c2, c3);
+        uint16x8_t dis;
         if (max_level) {
-            dis = vorrq_u32(vtstq_s32(lod, S32(0x6000)), vcgeq_s32(ltil4, S32(max_level)));
-            dis = vbslq_u32(c4, dis, vbslq_u32(c1, vdupq_n_u32(~0u), vdupq_n_u32(0)));
+            dis = vorrq_u16(vtstq_u16(lod, vdupq_n_u16(0x6000)), vcgeq_u16(ltil, vdupq_n_u16((uint16_t)max_level)));
+            dis = vandq_u16(dis, c4);
         } else {
-            dis = vdupq_n_u32(~0u);
+            dis = vdupq_n_u16(0xffff);
         }
-        dis = vbslq_u32(c1, vdupq_n_u32(~0u), dis);
-        int32x4_t lf;
-        const int plain = !om->sharpen_tex_en && !om->detail_tex_en;
-        int32x4_t lf_mid = plain ? vbslq_s32(dis, S32(0xff), S32(0))
-                                 : vorrq_s32(vshlq_n_s32(lod, 3), S32(om->sharpen_tex_en ? 0x100 : 0));
-        int32x4_t lf_min = plain ? vbslq_s32(dis, S32(0xff), S32(0))
-                                 : S32((min_level << 3) | (om->sharpen_tex_en ? 0x100 : 0));
-        int32x4_t lf_far = vandq_s32(vshlq_s32(vshlq_n_s32(lod, 3), vnegq_s32(ltil4)), S32(0xff));
-        if (plain) lf_far = vbslq_s32(dis, S32(0xff), lf_far);
-        lf = vbslq_s32(c1, S32(0xff), vbslq_s32(c2, lf_min, vbslq_s32(c3, lf_mid, lf_far)));
-        lf16[h] = vmovn_s32(lf);
+        dis = vorrq_u16(dis, c1);
+        uint16x8_t lod3 = vshlq_n_u16(lod, 3);
+        uint16x8_t lf_mid, lf_min, lf_far = vandq_u16(vshlq_u16(lod3, vnegq_s16(vreinterpretq_s16_u16(ltil))), kff);
+        if (plain) {
+            uint16x8_t d = vandq_u16(dis, kff);
+            lf_mid = d; lf_min = d; lf_far = vbslq_u16(dis, kff, lf_far);
+        } else {
+            lf_mid = vorrq_u16(lod3, vdupq_n_u16(sharpen ? 0x100 : 0));
+            lf_min = vdupq_n_u16((uint16_t)((min_level << 3) | (sharpen ? 0x100 : 0)));
+        }
+        uint16x8_t lf = vbslq_u16(c1, kff, vbslq_u16(c2, lf_min, vbslq_u16(c3, lf_mid, lf_far)));
+        vst1q_s16(lfo + o, vreinterpretq_s16_u16(lf));
 
-        /* tile selection (only meaningful with TEX_LOD_EN) */
-        int32x4_t ltile = vbslq_s32(dis, S32(max_level), ltil4);
-        int32x4_t base = vaddq_s32(S32(pc->tilenum), ltile);
-        uint32x4_t sameTile = vorrq_u32(dis, vandq_u32(mag, vdupq_n_u32(om->sharpen_tex_en ? 0 : ~0u)));
-        if (!om->detail_tex_en) {
-            int32x4_t t1v = vandq_s32(base, S32(7));
-            int32x4_t t2v = vbslq_s32(sameTile, t1v, vandq_s32(vaddq_s32(t1v, S32(1)), S32(7)));
-            tl1[h] = t1v; tl2[h] = t2v;
-        } else {
-            int32x4_t t1v = vandq_s32(vaddq_s32(base, vbslq_s32(mag, S32(0), S32(1))), S32(7));
-            uint32x4_t far2 = vandq_u32(vmvnq_u32(dis), vmvnq_u32(mag));
-            int32x4_t t2v = vandq_s32(vaddq_s32(base, vbslq_s32(far2, S32(2), S32(1))), S32(7));
-            tl1[h] = t1v; tl2[h] = t2v;
+        if (tiles) {   /* tile selection (TEX_LOD_EN) */
+            uint16x8_t ltile = vbslq_u16(dis, vdupq_n_u16((uint16_t)max_level), ltil);
+            uint16x8_t base = vaddq_u16(vdupq_n_u16((uint16_t)pc->tilenum), ltile);
+            uint16x8_t k7 = vdupq_n_u16(7), one = vdupq_n_u16(1);
+            uint16x8_t t1v, t2v;
+            if (!detail) {
+                uint16x8_t same = vorrq_u16(dis, sharpen ? vdupq_n_u16(0) : mag);
+                t1v = vandq_u16(base, k7);
+                t2v = vbslq_u16(same, t1v, vandq_u16(vaddq_u16(t1v, one), k7));
+            } else {
+                t1v = vandq_u16(vaddq_u16(base, vbicq_u16(one, mag)), k7);
+                uint16x8_t far2 = vbicq_u16(vmvnq_u16(dis), mag);
+                t2v = vandq_u16(vaddq_u16(base, vbslq_u16(far2, vdupq_n_u16(2), one)), k7);
+            }
+            vst1_u8(lb->t1 + o, vmovn_u16(t1v));
+            vst1_u8(lb->t2 + o, vmovn_u16(t2v));
         }
-    }
-    res->lf = vcombine_s16(lf16[0], lf16[1]);
-    if (om->tex_lod_en) {
-        res->t1 = vmovn_u16(vcombine_u16(vmovn_u32(vreinterpretq_u32_s32(tl1[0])), vmovn_u32(vreinterpretq_u32_s32(tl1[1]))));
-        res->t2 = vmovn_u16(vcombine_u16(vmovn_u32(vreinterpretq_u32_s32(tl2[0])), vmovn_u32(vreinterpretq_u32_s32(tl2[1]))));
-    } else {
-        res->t1 = vdup_n_u8((uint8_t)pc->tilenum);
-        res->t2 = vdup_n_u8((uint8_t)((pc->tilenum + 1) & 7));
     }
 }
 
-/* One texture cycle with a per-lane tile: every distinct tile of the group gets a pass, results are merged */
-static void tex_cycle_tiles(const struct rdp *r, struct tctx *cxs, uint32_t *have, const struct tsp *base, const struct tsp *fixed, uint8x8_t ids,
-                            const int32x4_t sss[2], const int32x4_t sst[2], int16x8_t out[4])
+static __attribute__((noinline)) void lod_pass_p1t(const struct rdp *r, const int32_t *s, const int32_t *t, const int32_t *w, const int32_t add[3], int ng, int16_t *lfo, struct lodbuf *lb)
+{ lod_pass_impl(r, s, t, w, add, ng, lfo, lb, 1, 1); }
+static __attribute__((noinline)) void lod_pass_p1(const struct rdp *r, const int32_t *s, const int32_t *t, const int32_t *w, const int32_t add[3], int ng, int16_t *lfo, struct lodbuf *lb)
+{ lod_pass_impl(r, s, t, w, add, ng, lfo, lb, 1, 0); }
+static __attribute__((noinline)) void lod_pass_p0t(const struct rdp *r, const int32_t *s, const int32_t *t, const int32_t *w, const int32_t add[3], int ng, int16_t *lfo, struct lodbuf *lb)
+{ lod_pass_impl(r, s, t, w, add, ng, lfo, lb, 0, 1); }
+static __attribute__((noinline)) void lod_pass_p0(const struct rdp *r, const int32_t *s, const int32_t *t, const int32_t *w, const int32_t add[3], int ng, int16_t *lfo, struct lodbuf *lb)
+{ lod_pass_impl(r, s, t, w, add, ng, lfo, lb, 0, 0); }
+
+FOIR_INLINE void lod_pass(const struct rdp *r, const int32_t *s, const int32_t *t, const int32_t *w, const int32_t add[3], int ng, int16_t *lfo,
+                          struct lodbuf *lb, int persp, int tiles)
+{
+    if (persp) { if (tiles) lod_pass_p1t(r, s, t, w, add, ng, lfo, lb); else lod_pass_p1(r, s, t, w, add, ng, lfo, lb); }
+    else       { if (tiles) lod_pass_p0t(r, s, t, w, add, ng, lfo, lb); else lod_pass_p0(r, s, t, w, add, ng, lfo, lb); }
+}
+
+/* One texture cycle with a per-lane tile. The common group has the same tile in every lane: one pass, straight into out. Mixed
+ * groups (a few percent) go through tex_cycle_multi(): a pass per distinct tile, results merged by lane masks. */
+static __attribute__((noinline)) void tex_cycle_multi(const struct rdp *r, struct tctx *cxs, uint32_t *have, const struct tsp *base, uint8x8_t ids,
+                                                     const int32x4_t sss[2], const int32x4_t sst[2], int16x8_t out[4])
 {
     uint8_t idv[8] ALIGN16;
     vst1_u8(idv, ids);
@@ -622,15 +721,30 @@ static void tex_cycle_tiles(const struct rdp *r, struct tctx *cxs, uint32_t *hav
         for (int l = 0; l < 8; l++) if ((idv[l] & 7) == v) done |= 1u << l;
         if (!(*have & (1u << v))) {
             const struct tile *tv = &r->tile[v];
-            /* a specialised variant knows that every tile of the mip chain has the format it was built for (checked per batch) */
-            const struct tsp sp = fixed ? *fixed : (struct tsp){ tv->size, tv->format, base->tlut, r->om.tlut_type, base->smp, base->mid, base->bilerp };
+            const struct tsp sp = { tv->size, tv->format, base->tlut, r->om.tlut_type, base->smp, base->mid, base->bilerp };
             tctx_init(&cxs[v], r, tv, &sp);
             *have |= 1u << v;
         }
         int16x8_t t[4];
-        tex_cycle(r, &cxs[v], fixed ? fixed : &cxs[v].sp, sss, sst, t);
+        tex_cycle(r, &cxs[v], &cxs[v].sp, sss, sst, t);
         for (int c = 0; c < 4; c++) out[c] = vbslq_s16(m16, t[c], out[c]);
     }
+}
+
+/* fixed: the format description a specialised variant was built for (all tiles of the chain have it); NULL: take it from the tile */
+FOIR_INLINE void tex_cycle_tiles(const struct rdp *r, struct tctx *cxs, uint32_t *have, const struct tsp *base, const struct tsp *fixed, uint8x8_t ids,
+                                 const int32x4_t sss[2], const int32x4_t sst[2], int16x8_t out[4])
+{
+    const uint64_t same = vget_lane_u64(vreinterpret_u64_u8(vceq_u8(ids, vdup_lane_u8(ids, 0))), 0);
+    if (same != ~0ull) { tex_cycle_multi(r, cxs, have, base, ids, sss, sst, out); return; }
+    const int v = vget_lane_u8(ids, 0) & 7;
+    if (!(*have & (1u << v))) {
+        const struct tile *tv = &r->tile[v];
+        const struct tsp sp = fixed ? *fixed : (struct tsp){ tv->size, tv->format, base->tlut, r->om.tlut_type, base->smp, base->mid, base->bilerp };
+        tctx_init(&cxs[v], r, tv, &sp);
+        *have |= 1u << v;
+    }
+    tex_cycle(r, &cxs[v], fixed ? fixed : &cxs[v].sp, sss, sst, out);
 }
 
 /* ---- kernel ---------------------------------------------------------------------------------------------- */
@@ -670,58 +784,77 @@ FOIR_INLINE void texture_body(struct rdp *r, struct px_batch *b, const struct ts
     const int32x4_t dsi = S32(pc->dsinc), dti = S32(pc->dtinc), dwi = S32(pc->dwinc);
     const int lodtiles = S->lodtiles;
     (void)om;
+#ifdef FOIR_STATS
+    {
+        int mi = S->two | (S->persp << 1) | (S->c0.smp << 2) | (S->c0.tlut << 3) | (lodtiles << 4) | (S->dolod << 5) | (om->detail_tex_en << 6) |
+                 (om->sharpen_tex_en << 7) | (S->anyfmt << 8) | (S->nx << 9) | (S->t1 << 10);
+        LST_ADD(lst_batches[mi], 1); LST_ADD(lst_pixels[mi], b->n); LST_ADD(lst_groups[mi], ng);
+        if (lodtiles) LST_ADD(lst_fmt[tl0->format & 7][tl0->size & 3], 1);
+    }
+#endif
+
+    /* level of detail of the whole batch: fraction (b->lodfrac), tiles, divided coordinates of every lane */
+    struct lodbuf lb, lbn;
+    if (S->dolod) {
+        static const int32_t zero3[3] = { 0, 0, 0 };
+        lod_pass(r, b->s, b->t, b->w, zero3, ng, b->lodfrac, &lb, S->persp, lodtiles);
+    }
+    if (S->nx && lodtiles) {
+        /* the next pixel is evaluated as a pixel of its own: its LOD comes from its own neighbours */
+        const int32_t add[3] = { pc->dsinc, pc->dtinc, pc->dwinc };
+        int16_t lfn[FOIR_LANES] ALIGN16;
+        lod_pass(r, b->s, b->t, b->w, add, ng, lfn, &lbn, S->persp, 1);
+    }
+    const int32_t *lrs = LB(lb.rs_), *lrt = LB(lb.rt_), *nrs = LB(lbn.rs_), *nrt = LB(lbn.rt_);
+#ifdef FOIR_STATS
+    if (S->dolod && lodtiles)
+        for (int g = 0; g < ng; g++) {
+            unsigned m1 = lst_distinct(vld1_u8(lb.t1 + 8 * g)), m2 = lst_distinct(vld1_u8(lb.t2 + 8 * g));
+            LST_ADD(lst_dist[0][__builtin_popcount(m1)], 1); LST_ADD(lst_dist[1][__builtin_popcount(m2)], 1);
+            LST_ADD(lst_distu[__builtin_popcount(m1 | m2)], 1);
+            if (vminv_u8(vceq_u8(vld1_u8(lb.t1 + 8 * g), vld1_u8(lb.t2 + 8 * g)))) LST_ADD(lst_same12, 1);
+            if (S->nx) LST_ADD(lst_dist[2][__builtin_popcount(lst_distinct(vld1_u8(lbn.t1 + 8 * g)))], 1);
+        }
+#endif
 
     for (int g = 0; g < ng; g++) {
         const int o = g * 8;
-        int32x4_t sss[2], sst[2], rs[2], rt[2], S_[2], T[2], W[2];
+        int32x4_t sss[2], sst[2];
         int32x4_t nsss[2], nsst[2];
         for (int h = 0; h < 2; h++) {
-            int32x4_t s = vld1q_s32(&b->s[o + 4 * h]), t = vld1q_s32(&b->t[o + 4 * h]), w = vld1q_s32(&b->w[o + 4 * h]);
-            S_[h] = s; T[h] = t; W[h] = w;
             int32x4_t a, bb;
-            tc_divide4(S->persp, vshrq_n_s32(s, 16), vshrq_n_s32(t, 16), vshrq_n_s32(w, 16), &a, &bb);
-            rs[h] = a; rt[h] = bb;
+            if (S->dolod) {
+                a = vld1q_s32(lrs + o + 4 * h); bb = vld1q_s32(lrt + o + 4 * h);
+            } else {
+                tc_divide4(S->persp, vld1q_s32(&b->s[o + 4 * h]), vld1q_s32(&b->t[o + 4 * h]), vld1q_s32(&b->w[o + 4 * h]), &a, &bb);
+            }
             sss[h] = clamp17v(a); sst[h] = clamp17v(bb);
             if (S->nx) {
-                tc_divide4(S->persp, vshrq_n_s32(vaddq_s32(s, dsi), 16), vshrq_n_s32(vaddq_s32(t, dti), 16),
-                           vshrq_n_s32(vaddq_s32(w, dwi), 16), &a, &bb);
+                if (lodtiles) {
+                    a = vld1q_s32(nrs + o + 4 * h); bb = vld1q_s32(nrt + o + 4 * h);
+                } else {
+                    int32x4_t s = vld1q_s32(&b->s[o + 4 * h]), t = vld1q_s32(&b->t[o + 4 * h]), w = vld1q_s32(&b->w[o + 4 * h]);
+                    tc_divide4(S->persp, vaddq_s32(s, dsi), vaddq_s32(t, dti), vaddq_s32(w, dwi), &a, &bb);
+                }
                 nsss[h] = clamp17v(a); nsst[h] = clamp17v(bb);
             }
         }
-        struct lodres lr = { vdupq_n_s16(0), vdup_n_u8(0), vdup_n_u8(0) };
-        if (S->dolod) {
-            lod_group(r, S_, T, W, rs, rt, &lr);
-            vst1q_s16(&b->lodfrac[o], lr.lf);
-        }
         if (S->t0) {
             int16x8_t t0[4];
-            if (lodtiles) tex_cycle_tiles(r, cxs0, &have0, &S->c0, S->lodfix ? &S->c0 : NULL, lr.t1, sss, sst, t0);
+            if (lodtiles) tex_cycle_tiles(r, cxs0, &have0, &S->c0, S->lodfix ? &S->c0 : NULL, vld1_u8(lb.t1 + o), sss, sst, t0);
             else tex_cycle(r, &cx0, &cx0.sp, sss, sst, t0);
             for (int c = 0; c < 4; c++) vst1q_s16(&b->tex0[c][o], t0[c]);
         }
         if (two && S->t1) {
             int16x8_t t1[4];
-            if (lodtiles) tex_cycle_tiles(r, cxs1, &have1, &S->c1, S->lodfix ? &S->c1 : NULL, lr.t2, sss, sst, t1);
+            if (lodtiles) tex_cycle_tiles(r, cxs1, &have1, &S->c1, S->lodfix ? &S->c1 : NULL, vld1_u8(lb.t2 + o), sss, sst, t1);
             else tex_cycle(r, &cx1, &cx1.sp, sss, sst, t1);
             for (int c = 0; c < 4; c++) vst1q_s16(&b->tex1[c][o], t1[c]);
         }
         if (S->nx) {
             int16x8_t tn[4];
-            if (lodtiles) {
-                /* the next pixel is evaluated as a pixel of its own: its LOD comes from its own neighbours */
-                int32x4_t S2[2], T2[2], W2[2];
-                for (int h = 0; h < 2; h++) { S2[h] = vaddq_s32(S_[h], dsi); T2[h] = vaddq_s32(T[h], dti); W2[h] = vaddq_s32(W[h], dwi); }
-                int32x4_t a, bb, ns[2], nt[2];
-                for (int h = 0; h < 2; h++) {
-                    tc_divide4(S->persp, vshrq_n_s32(S2[h], 16), vshrq_n_s32(T2[h], 16), vshrq_n_s32(W2[h], 16), &a, &bb);
-                    ns[h] = a; nt[h] = bb;
-                }
-                struct lodres ln;
-                lod_group(r, S2, T2, W2, ns, nt, &ln);
-                tex_cycle_tiles(r, cxsn, &haven, &S->c0, S->lodfix ? &S->c0 : NULL, ln.t1, nsss, nsst, tn);
-            } else {
-                tex_cycle(r, &cx0, &cx0.sp, nsss, nsst, tn);
-            }
+            if (lodtiles) tex_cycle_tiles(r, cxsn, &haven, &S->c0, S->lodfix ? &S->c0 : NULL, vld1_u8(lbn.t1 + o), nsss, nsst, tn);
+            else tex_cycle(r, &cx0, &cx0.sp, nsss, nsst, tn);
             for (int c = 0; c < 4; c++) {
                 vst1q_s16(&b->tex0n[c][o], tn[c]);
                 if (!two) vst1q_s16(&b->tex1[c][o], tn[c]);
@@ -729,6 +862,10 @@ FOIR_INLINE void texture_body(struct rdp *r, struct px_batch *b, const struct ts
         }
     }
 }
+
+/* The LOD selects tile tilenum + 0 .. max_level for cycle 0 and 1 (cycle 1 is one tile above cycle 0 unless the LOD is
+ * distant or magnified); with detail textures cycle 0 is one tile higher and cycle 1 two above the level: + 1. */
+FOIR_INLINE int lod_chain_last(const struct rdp *r) { return r->pc.max_level + (r->om.detail_tex_en ? 1 : 0); }
 
 void neon_texture(struct rdp *r, struct px_batch *b)
 {
@@ -743,7 +880,7 @@ void neon_texture(struct rdp *r, struct px_batch *b)
     int unsupp = tl0->format == FORMAT_YUV || (!om->bi_lerp0 && !pointplain);
     if (two) unsupp |= tl1->format == FORMAT_YUV || (!om->bi_lerp1 && !pointplain) || om->convert_one;
     if (om->tex_lod_en)         /* any tile the LOD can select */
-        for (int k = 0; k <= r->pc.max_level + 2 && k < 8; k++)
+        for (int k = 0; k <= lod_chain_last(r) && k < 8; k++)
             unsupp |= r->tile[(prim_tile + k) & 7].format == FORMAT_YUV;
 #ifdef FOIR_STATS
     if (unsupp) {
@@ -857,7 +994,7 @@ FOIR_INLINE void copy_body(struct rdp *r, int y, const struct span *sp, const in
             int32x4_t s = vmlaq_n_s32(S32(sp->s), gi, pc->ds), t = vmlaq_n_s32(S32(sp->t), gi, pc->dt);
             int32x4_t w = vmlaq_n_s32(S32(sp->w), gi, pc->dw);
             int32x4_t a, b;
-            tc_divide4(persp, vshrq_n_s32(s, 16), vshrq_n_s32(t, 16), vshrq_n_s32(w, 16), &a, &b);
+            tc_divide4(persp, s, t, w, &a, &b);
             int32x4_t cs = sign16(clamp17v(a)), ct = sign16(clamp17v(b));
             cs = shs < 11 ? vshlq_s32(cs, S32(-shs)) : sign16(vshlq_s32(cs, S32(16 - shs)));
             ct = sht < 11 ? vshlq_s32(ct, S32(-sht)) : sign16(vshlq_s32(ct, S32(16 - sht)));

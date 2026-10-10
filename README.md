@@ -22,6 +22,8 @@ N64's RDP command stream on the CPU with NEON SIMD kernels, and it takes
 > the colour / Z buffer access is inlined, checks the RDRAM bounds once per batch and prefetches (3-7 % on the 3D replays); the texture unit has a second tier of
 > 38 "any format" kernels behind the exact variants and the Z compare is compiled for every combination of its inputs, which takes the share of pixels that run in a
 > specialised variant from 91.5 % to 100 % (texture) and 93.5 % to 100 % (Z compare) over 62 games, and from 91.7 % to 99.9 % / 97.1 % to 100 % out of sample (leave-one-game-out).
+> **The mip-map (LOD) texture path after the cheap wins** ([results](#lod--mip-map-texture-path)): in Banjo-Kazooie and Donkey Kong 64, 45-62 % of the LOD batches ran in the generic kernel because the variants checked two tiles too many; that is fixed, the LOD is computed once per batch with
+> the neighbouring pixel's divide reused, and the texture cycle takes a one-tile fast path: **replay -13 to -15 % (Banjo-Kazooie), -10 to -13 % (Donkey Kong 64)**, bit-exact.
 > Not implemented yet: VI filters, a few rarely used RDP modes in NEON (see [known gaps](#known-gaps)).
 
 ---
@@ -428,6 +430,7 @@ python3 tools/specstats.py --def --stage tex --shapes log*.txt        # exact TE
 python3 tools/specmatrix.py zcmp > src/spec_zcmp.def                  # the complete Z compare list (no statistics needed)
 python3 tools/specstats.py --loo 40 log*.txt                          # leave-one-log-out coverage estimate
 # 3. rebuild; `make check` fuzzes every variant (kfuzz -S) against the scalar reference
+#    (the statistics build also prints `LODSTAT ...` lines at exit: texture batches / pixels / groups per mode, distinct tiles per group, generic-kernel fallbacks of the LOD variants, next-pixel divides redone)
 ```
 
 ---
@@ -1033,6 +1036,152 @@ median (min-max) over the runs; "RDP" is the emulation thread's time in the RDP 
 | **NEON walker inline in the row loop (kept)** | **-2.3 % / -2.4 %** (two sessions) | +0.6 % / -2.9 % | |
 | decode of the 44-word record on the workers instead of on the parser (job = the 176-byte record + scissor) | not built | not built | upper bound measured: skipping the whole decode (`setup_walk`) in `--setup-only` saves 0.04-0.22 ms per dump (Paper Mario 0.04, Donkey Kong 64 0.08, Star Fox 64 0.11, Super Mario 64 0.14, Rocket 0.17, Snap 0.22 ms), i.e. at most 2-8 % of the emulation thread's remaining RDP time, in exchange for decoding every primitive three times; not worth the second copy of the state the decode reads (scissor, cycle type, interlace field, seed) |
 
+### LOD / mip-map texture path
+
+**The request and what was found.** The in-game profile of the batch-builder sweep (`test-output/sweep-bb1/analysis/perf_shares.txt`) lists "texture helpers" -- `lod_group`, `tex_cycle*`, `fetch_decode`, `neon_texture` -- as 31.4 % of foir's CPU time in Banjo-Kazooie, 23.8 % in
+Donkey Kong 64 and 5.9 % in Paper Mario, and they had been read as scalar LOD code. **They are not scalar.** Everything on the LOD path was already NEON: `lod_group` computes the level of detail of eight pixels in `int32x4_t` halves, the texture cycles run per tile on the lanes that selected it.
+The names are the out-of-line (not inlined into a variant) NEON functions that the *generic* texture kernel `neon_texture` calls. Two things sent most LOD batches there (statistics build, `-DFOIR_STATS`, 6 gameplay dumps captured at VI frames 1800 / 2400 / 3000 of Banjo-Kazooie and Donkey Kong 64
+-- the 12 old dumps hold almost no mip-mapped draws -- plus the three old dumps with a LOD):
+
+* **The variants checked too many tiles.** A `TEXL` / `TEXAL` variant requires every tile the LOD can select to have the texel format it was built for, and checked tiles `tilenum .. tilenum + max_level + 2`. The LOD selects at most `tilenum + max_level` (cycle 1 is level + 1 unless distant or magnified, both
+  capped at the max level), and `+ 1` with detail textures. The two extra tiles are whatever the game left in its tile descriptors (in these dumps the tiles after the chain have other formats), the check failed, and `tex_generic()` handed the batch to the generic kernel, which is 1.4-1.8x the cost of a variant:
+  **60-62 % of the LOD batches in the three Banjo-Kazooie dumps, 46 % in Donkey Kong 64 (3000), 8-15 % in its other dumps, 8 % in Rocket**, with all their pixels. In the profile that is `neon_texture` + `tex_cycle` + `fetch_decode` + `tex_cycle_tiles`: 18.8 % of Banjo-Kazooie's foir time.
+* **Point-sampled LOD had no variant.** Donkey Kong 64 draws part of its scenes with TEX_LOD_EN and SAMPLE_TYPE = point (IA8, RGBA16 with perspective; I4 without): the keys were in neither the exact list nor the "any format" list (which only had bilinear LOD forms): 39.5 % (2400) and 21.5 % (800) of the textured pixels of those dumps ran in the generic kernel.
+
+What the real LOD draws are (6 dumps + Rocket + GoldenEye 007): all TEX_LOD_EN; no detail or sharpen; perspective except a few DK64 draws; two-cycle in Banjo-Kazooie (cycle 0 and 1 on adjacent levels, blended by the LOD fraction), one-cycle in GoldenEye and part of DK64; bilinear except DK64's point-sampled ones;
+Banjo-Kazooie CI4 + TLUT 79 % of its LOD batches (frame 2400), RGBA16 11 %, RGBA32 8 %, CI8 1 %; DK64 (3000) IA8 49 %, RGBA16 21 %, CI4 + TLUT 20 %, RGBA32 9 %, I8 2 %. **Tile mix per group of eight lanes:** all eight lanes select the same tile of cycle 0 in 98.5-99.6 % of the groups (Banjo-Kazooie 2400 99.6 %, DK64 3000 98.5 %), the same tile of cycle 1 in 99.5 % / 93.1 %;
+the two cycles' tiles together are one tile in 86-91 % of the groups, two adjacent ones in 8-12 %, three in 0.4-1.4 %. A lane mix is therefore not the case to build for; it is the case to keep correct and out of line.
+
+**Changes** (`src/kneon_tex.c`, `src/kspec_tex.inc`, `src/spec_tex.def`; everything bit-exact with the scalar reference):
+
+1. **The chain bound** is `lod_chain_last() = max_level + (detail ? 1 : 0)` in the variants' check and in the YUV test of `neon_texture`. Alone: replay -8 % (Banjo-Kazooie) / -8 % (DK64 3000).
+2. **`lod_pass()`: the LOD of the whole batch in one out-of-line call** (4 instances: perspective x tile selection; was one `lod_group` call per group of eight). Phase 1 stores the divided coordinates of every lane (the texture cycles take their `sss` / `sst` from there, the divide of the main loop is gone for LOD kernels).
+   Phase 2, per group: the *next pixel* divide (`s + dsinc`, ...) is taken from the neighbouring lane's phase-1 result (lane + 1 for `flip`, else lane - 1) **when that lane really holds `s + dsinc`, `t + dtinc`, `w + dwinc`** (three vector compares; a divide is a function of its inputs, so the reuse is exact whatever the batch looks like). Only a half-group that has a lane
+   at a scanline-run boundary or at the batch end divides again (20-25 % of the half-groups in the Banjo-Kazooie / DK64 gameplay dumps, 63-69 % in the two dumps with very short spans, DK64 800 and GoldenEye), the *row below* divide is always computed. The four |differences| of the 17-bit sign/magnitude coordinates come from one halving subtract each (`vhsubq`: the 18-bit difference << 14, so no overflow; a negative difference is flipped by `v ^ (v >> 31)`),
+   their maximum is saturated to 15 bits, and the rest (`lodfrac_lodtile`: level, distant / magnify, fraction, detail / sharpen, tiles) runs on **eight 16-bit lanes** (it needs `clz` of a byte and shifts by at most 7 only; the fold of `lod_4x17_to_15` collapses to "largest difference, or overflow if >= 0x4000"). Roughly 90 NEON instructions fewer per group, one call per batch instead of per group.
+3. **One-tile fast path** (`tex_cycle_tiles`): if all eight lanes select the same tile (93-99.6 % of the groups) the cycle runs once straight into the output; mixed groups go to `tex_cycle_multi()`, out of line, one pass per distinct tile merged by lane masks (the old loop). The variants shrank (TEXL 112 -> 101 KB for 21 -> 24 kernels).
+4. **`tc_divide4`** (perspective divide, 4 lanes; the lookups stay scalar): takes the raw 16.16 interpolants (the arithmetic shift already sign-extends, so the three `sign16` go), and the out-of-bounds test is "the top shift + 1 bits of the product are not all equal" as shift / sign-extend / compare instead of building `tempmask` (51 instead of 65 instructions).
+   -2 to -3 % on top for the LOD dumps, neutral elsewhere.
+5. **Variants for point-sampled LOD**: `TEXL` for DK64's IA8 and RGBA16 (persp) and I4 (no persp) one-cycle forms, and `TEXAL(0, 1,0,0, 0, tlut, persp, 1,0, 1)` x {TLUT, no TLUT} x {persp, none}. The share of textured pixels that run in the generic kernel is **0.0 % in every dump** (was up to 39.5 %).
+
+**Fallback rate.** Batches that went from a LOD variant to the generic kernel: Banjo-Kazooie 1838 / 2967, 1981 / 3252, 1684 / 2823 (frames 1800 / 2400 / 3000), Donkey Kong 64 335 / 4318 (2400, plus 39.5 % of the pixels without a variant), 1523 / 3298 (3000), 236 / 1536 (800), Rocket 243 / 2972 -> **0 in all of them**.
+In the new path, the only per-lane fallbacks are the mixed-tile groups (`tex_cycle_multi`: 0.4-1.5 % of the groups for cycle 0, 0.5-7 % for cycle 1 in the two games) and the half-groups that divide the next pixel again (20-25 %, perspective only).
+
+**Variant count and code size** (`.text` of `mupen64plus-rdp-foir.so`, aarch64, `-O3` generic armv8-a): 2,080,328 -> 2,087,384 bytes (+7,056, +0.34 %); table entries 492 -> 499 (texture 157 -> 164: +3 `TEXL`, +4 `TEXAL`; the `TEXL` kernels are 101 KB for 24 entries (112 KB for 21 before), the `TEXAL` 235 KB for 22 (206 KB for 18 before; one is 10.5 KB));
+the shared LOD code is `lod_pass` x 4 (7,540 bytes, was `lod_group` 1,568 + `tex_cycle_tiles` 880) + `tex_cycle_multi` 884. The generic kernel is no longer on the LOD path for any state seen.
+
+**Exactness** (all at 0 differences; log files `test-output/lodvec/exactness/`):
+
+* `make check` (aarch64 under qemu, 2 GB-capped scope): `foir-walkfuzz` 40,000 primitives; `neoncheck.py` **47 scenes** (18 captured frames, 25 + 4 synthetic), `mtfuzz.py` 60 + 40 + 40 scenes; `foir-kfuzz` 3000, `-m 32` 20,000, `-m 64` 40,000, `-S` 15,000 over all **499** entries (0 never exercised), `-S -T 5` 15,000, `-S -T 0` 8,000, and the new `-L -m 1` 20,000 (16,067 ramp scenes, 18,362 LOD batches verified, 128 mode combinations)
+  and `-L -S -T 0` 8,000 (every texture variant, 1,981 ramp scenes). 7 min 48 s.
+* `make all replay ref NEON=0 && python3 tools/regress.py`: **25 of 25** scenes with 0 differing pixels (15 old + 10 new mip-map scenes).
+* `FOIR_NEON_VERIFY=1 FOIR_KNOBS=exact`, all 18 dumps at `-t 0` and `-t 3` (36 runs): **105,667 texture batches verified, 0 mismatching, of which 28,025 computed a LOD** (all TEX_LOD_EN; perspective 27,493; two-cycle 19,103; `lod_verify.txt`).
+* x86_64 scalar build vs aarch64 `foir-replay -o` RDRAM, 18 dumps x {`-t 0`, `-t 3`}: **36 of 36 identical**.
+* Detail and sharpen are not in any captured frame; they are covered by the fuzzers (`-L`: 6,058 / 6,076 of 18,362 batches), the synthetic scenes (angrylion-exact) and `mtfuzz.py`.
+
+**Mutations** (a deliberately wrong build in a copy of the tree, `test-output/lodvec/scripts/mutate_lod.sh`; numbers are failing iterations of 20,000 / 8,000 / 3,000 and dumps that differ from the scalar replay, of 9 LOD dumps):
+
+| mutation | `kfuzz -L -m 1` | `kfuzz -S -T 0` | `kfuzz` (default) | 9 LOD dumps |
+|---|---|---|---|---|
+| level off by one (`15 - clz` -> `14 - clz`) | 20 fail | 21 fail | 20 fail | 6 differ |
+| fraction shifted one bit too far | 20 | 20 | 20 | 6 |
+| wrong tile in one lane (cycle 1 tile ^ 1 in lane 5) | 20 | 20 | 20 | 6 |
+| chain bound without the detail tile | 20 | 20 | 0 | 0 |
+| chain bound one tile short (max level >= 1) | 20 | 20 | 3 | 0 |
+| neighbour-lane reuse ignores `w` | 4 | 3 | 0 | 0 |
+| run-boundary guard lanes accepted as neighbours | 20 | 20 | 20 | 6 |
+| out-of-bounds test of the perspective divide inverted | 20 | 21 | 20 | 8 |
+| LOD saturation (`vqshrn` -> `vshrn`) | 20 | 20 | 10 | 0 |
+
+The captured frames alone catch only the first, second, third, seventh and eighth mutation: the chain-bound, `w`-check and saturation errors need the fuzz scenes that were added (a disagreeing tile inside the chain; ramps with one lane off; steps beyond 0x4000).
+
+
+**Timing, offline replay** (`foir-replay --fast`, rgdsplus, `performance` governor restored to `schedutil`, `2af08de` vs this tree, run alternately with the order rotated every round, 6 rounds in two sessions, median (min-max), `-n 10..100` repeats per run; the first eight rows are the LOD dumps; in the `-t 3` table the emulation thread's wait at `SYNC_FULL` holds all
+the pixel work the workers have not finished, so the sum is the frame time):
+
+-t 0: ms per run, median (min-max)
+| dump | old (2af08de) | new | new vs old |
+|---|---:|---:|---:|
+| Banjo-Kazooie (1800) | 40.66 (40.20-40.82) | 34.43 (34.24-34.88) | -15.3 % |
+| Banjo-Kazooie (2400) | 45.56 (45.41-46.02) | 39.02 (38.87-39.10) | -14.3 % |
+| Banjo-Kazooie (3000) | 38.42 (38.01-38.54) | 33.20 (33.13-33.38) | -13.6 % |
+| Donkey Kong 64 (2400) | 44.63 (44.41-44.91) | 40.33 (40.06-40.60) | -9.6 % |
+| Donkey Kong 64 (3000) | 37.97 (37.70-38.50) | 33.20 (32.91-33.36) | -12.6 % |
+| Donkey Kong 64 (800) | 14.91 (14.80-15.06) | 13.91 (13.78-13.95) | -6.7 % |
+| Rocket Robot on Wheels (1500) | 26.57 (26.43-26.70) | 25.56 (25.41-25.61) | -3.8 % |
+| GoldenEye 007 (900) | 5.57 (5.53-5.63) | 5.31 (5.26-5.36) | -4.6 % |
+| Super Mario 64 (650) | 18.83 (18.73-19.11) | 18.93 (18.77-19.04) | +0.5 % |
+| Paper Mario (900) | 11.88 (11.86-11.91) | 11.73 (11.71-11.82) | -1.3 % |
+| Pokemon Snap (300) | 71.18 (71.14-71.59) | 71.83 (71.51-72.24) | +0.9 % |
+| Star Fox 64 (1000) | 17.95 (17.92-18.00) | 17.73 (17.62-17.92) | -1.3 % |
+| **geometric mean of the ratios** | | | **0.930** |
+
+-t 3: ms per run, median (min-max); emulation thread: own work / waiting at SYNC_FULL
+| dump | old (2af08de) | new | new vs old | emulation thread own work old -> new | wait at SYNC_FULL old -> new |
+|---|---:|---:|---:|---:|---:|
+| Banjo-Kazooie (1800) | 14.88 (13.82-15.75) | 12.15 (11.80-12.75) | -18.3 % | 2.73 -> 2.75 (+1 %) | 12.11 -> 9.38 |
+| Banjo-Kazooie (2400) | 16.27 (15.72-18.18) | 14.00 (13.76-15.65) | -14.0 % | 2.56 -> 2.51 (-2 %) | 13.77 -> 11.49 |
+| Banjo-Kazooie (3000) | 13.90 (13.67-14.58) | 12.20 (11.87-12.82) | -12.2 % | 2.66 -> 2.69 (+1 %) | 11.19 -> 9.34 |
+| Donkey Kong 64 (2400) | 17.14 (16.49-17.88) | 15.07 (14.55-15.91) | -12.1 % | 2.82 -> 2.86 (+1 %) | 14.31 -> 12.20 |
+| Donkey Kong 64 (3000) | 14.22 (13.67-14.53) | 11.93 (11.79-12.99) | -16.1 % | 1.36 -> 1.33 (-2 %) | 12.87 -> 10.60 |
+| Donkey Kong 64 (800) | 6.33 (5.96-6.43) | 5.94 (5.61-6.24) | -6.1 % | 1.27 -> 1.27 (+1 %) | 5.06 -> 4.64 |
+| Rocket Robot on Wheels (1500) | 10.70 (10.07-11.26) | 10.38 (9.65-10.93) | -3.0 % | 2.32 -> 2.33 (+1 %) | 8.39 -> 8.06 |
+| GoldenEye 007 (900) | 2.40 (2.33-2.54) | 2.33 (2.29-2.50) | -3.0 % | 0.41 -> 0.42 (+2 %) | 1.99 -> 1.91 |
+| Super Mario 64 (650) | 7.27 (6.91-7.77) | 7.12 (6.96-7.87) | -2.0 % | 1.38 -> 1.35 (-2 %) | 5.90 -> 5.77 |
+| Paper Mario (900) | 4.76 (4.68-4.83) | 4.83 (4.66-4.94) | +1.5 % | 0.81 -> 0.80 (-1 %) | 3.95 -> 4.04 |
+| Pokemon Snap (300) | 26.03 (25.29-27.54) | 26.37 (25.15-28.75) | +1.3 % | 2.58 -> 2.59 (+0 %) | 23.42 -> 23.79 |
+| Star Fox 64 (1000) | 7.13 (7.03-7.39) | 7.24 (6.96-7.47) | +1.5 % | 1.09 -> 1.11 (+1 %) | 6.02 -> 6.10 |
+| **geometric mean of the ratios** | | | **0.929** | **1.001** | |
+
+The LOD dumps get **6.7-15 % faster at one thread** (Banjo-Kazooie -13.6 to -15.3 %, Donkey Kong 64 -9.6 to -12.6 %, DK64 800 -6.7 %, Rocket -3.8 %, GoldenEye -4.6 %) and 6-18 % with three workers (the emulation thread's own work does not change; the wait is the workers). The dumps without LOD are within +-1.5 % (Super Mario 64 +0.5 %, Pokemon Snap +0.9 %
+at one thread: the new `tc_divide4` / code layout is not free for them; a variant that keeps the old divide for the non-LOD kernels was +1.5 to +5 % slower, so the layout of the 164 texture kernels moves things by about that much either way). Development steps, Banjo-Kazooie 2400 / DK64 2400 / DK64 3000 at one thread:
+old 45.6 / 44.6 / 38.0 ms -> chain bound only 42.0 / 43.8 / 34.6 -> `lod_pass` + one-tile path 40.4 / 41.0 / 33.1 -> new `tc_divide4` 38.9 / 40.3 / 33.2 ms (`replay/r1.txt .. r4.txt`).
+
+**Timing, in game** (rgdsplus, rsp-hle with parallel-rsp as RspFallback, rsp-timing, `FOIR_THREADS=3`, default knobs, scripted input, 75 s runs, VI frames 1440 on; the method of the batch-builder sweep, fresh private configuration `/storage/foir-dev/lodvec/cfg`, `HOME` / `XDG_*` private; 3 runs of each build, alternating, three runs per
+session under the device lock, governor `performance` -> `schedutil`; median (min-max); "RDP" is the emulation thread's time in the RDP per frame -- parse + setup + the wait at `SYNC_FULL`; CPU is the whole process, the workers' idle spin included; `2af08de` vs this tree):
+
+| game | RDP ms/frame, emulation thread (parse + setup + wait) old -> new | of which own work old -> new | wait at SYNC_FULL old -> new | process CPU ms/frame old -> new | fps old -> new |
+|---|---|---|---|---|---|
+| Banjo-Kazooie | 2.63 (2.61-2.66) -> **2.30 (2.25-2.31)** (-13 %) | 1.57 (1.56-1.58) -> 1.61 (1.61-1.61) (+3 %) | 1.07 (1.04-1.08) -> 0.69 (0.64-0.70) | 31.18 (31.15-31.23) -> **30.48 (30.38-30.54)** (-2.2 %) | 59.6 (59.6-59.6) -> 59.6 (59.6-59.6) |
+| Donkey Kong 64 | 4.24 (4.23-4.30) -> **3.55 (3.52-3.55)** (-16 %) | 1.35 (1.34-1.36) -> 1.42 (1.40-1.42) (+5 %) | 2.89 (2.87-2.96) -> 2.13 (2.10-2.15) | 36.01 (36.00-36.01) -> **33.90 (33.90-33.98)** (-5.9 %) | 59.8 (59.8-59.9) -> 59.9 (59.9-59.9) |
+| Paper Mario | 2.54 (2.50-2.54) -> **2.23 (2.22-2.31)** (-12 %) | 0.98 (0.98-0.99) -> 0.99 (0.99-1.00) (+1 %) | 1.55 (1.52-1.56) -> 1.24 (1.24-1.31) | 22.80 (22.77-22.82) -> **21.93 (21.91-22.08)** (-3.8 %) | 59.9 (59.9-59.9) -> 60.0 (59.9-60.0) |
+| Zelda: Ocarina of Time | 1.38 (1.35-1.47) -> **1.37 (1.36-1.37)** (-1 %) | 0.78 (0.64-0.78) -> 0.81 (0.80-0.81) (+4 %) | 0.60 (0.57-0.82) -> 0.56 (0.56-0.57) | 16.02 (14.24-16.02) -> **16.19 (16.12-16.22)** (+1.1 %) | 59.9 (59.7-60.0) -> 60.0 (60.0-60.0) |
+| Mario Kart 64 | 1.62 (1.61-1.63) -> **1.58 (1.58-1.60)** (-2 %) | 1.49 (1.48-1.49) -> 1.47 (1.45-1.48) (-1 %) | 0.13 (0.13-0.14) -> 0.13 (0.11-0.13) | 23.59 (23.58-23.66) -> **23.37 (23.30-23.47)** (-0.9 %) | 59.0 (59.0-59.0) -> 59.0 (59.0-59.0) |
+| Star Fox 64 | 1.21 (1.21-1.23) -> **1.15 (1.14-1.20)** (-5 %) | 0.67 (0.66-0.67) -> 0.66 (0.66-0.67) (-2 %) | 0.55 (0.54-0.55) -> 0.49 (0.47-0.54) | 19.19 (19.17-19.21) -> **19.00 (18.93-19.11)** (-1.0 %) | 59.8 (59.8-59.8) -> 59.8 (59.8-59.8) |
+| Super Mario 64 | 1.61 (1.60-1.67) -> **1.57 (1.56-1.58)** (-3 %) | 0.59 (0.59-0.60) -> 0.60 (0.60-0.61) (+2 %) | 1.02 (1.02-1.07) -> 0.96 (0.95-0.98) | 21.86 (21.77-21.97) -> **21.76 (21.60-21.83)** (-0.5 %) | 59.9 (59.9-59.9) -> 59.9 (59.9-59.9) |
+| Toy Story 2 | 1.99 (1.97-2.01) -> **1.96 (1.96-1.96)** (-2 %) | 1.02 (1.01-1.03) -> 1.00 (1.00-1.01) (-1 %) | 0.97 (0.96-0.97) -> 0.96 (0.95-0.96) | 12.82 (12.81-12.83) -> **12.74 (12.72-12.78)** (-0.6 %) | 58.6 (58.6-58.6) -> 58.6 (58.6-58.6) |
+| Pokemon Snap | 2.19 (2.18-2.19) -> **2.18 (2.16-2.18)** (-0 %) | 0.34 (0.34-0.34) -> 0.34 (0.34-0.34) (+1 %) | 1.85 (1.84-1.85) -> 1.84 (1.82-1.84) | 11.91 (11.90-11.92) -> **11.86 (11.82-11.87)** (-0.5 %) | 60.0 (60.0-60.0) -> 60.0 (60.0-60.0) |
+| **geometric mean of the new / old medians** | **0.938** | 1.012 | | **0.984** | |
+
+* The emulation thread waits at `SYNC_FULL` for the workers, so faster texture work shows up there: Donkey Kong 64 **-0.69 ms of 4.24 (-16 %)**, Banjo-Kazooie -0.33 ms of 2.63 (-13 %), Paper Mario -0.31 ms of 2.54 (-12 %: CI4 LOD draws); its own work is unchanged to +5 % (not looked into). Process CPU per frame falls 5.9 % (DK64), 3.8 % (Paper Mario), 2.2 % (Banjo-Kazooie): less than the replay's 10-15 %,
+  because the workers' idle spin fills what they no longer need. The games without a LOD path (Mario Kart, Star Fox, Super Mario, Toy Story 2, Snap, Zelda) are within -5 to +1 % on RDP time and -1.0 to +1.1 % on CPU (Zelda +1.1 % is an old-build outlier run again: old run 1 was 14.24 ms against 16.02 in the other two). All nine games stay at the frame-rate cap (Banjo-Kazooie 59.6, DK64 59.8 -> 59.9 fps).
+* Geometric mean over the nine games: RDP time **0.938**, own work 1.012, CPU 0.984.
+
+**Where the in-game time is now** (`perf record -F 499` of the whole process, 30 s from second 28 of a scripted run, one run per build and game with `-g` builds whose `.text` is byte-identical to the measured ones; shares of the foir work without the workers' idle spin; `test-output/lodvec/perf/`):
+
+| game | texture helpers (`lod_group` / `lod_pass*`, `tex_cycle*`, `fetch_decode`, `neon_texture`) old -> new | of which `lod_group` -> `lod_pass*` | LOD variants (`spec_texl*`, `spec_texal*`) old -> new | whole texture stage old -> new |
+|---|---:|---:|---:|---:|
+| Banjo-Kazooie | 32.5 % -> **14.8 %** | 13.1 % -> 14.3 % | 5.4 % -> 15.1 % | 42.5 % -> 35.3 % |
+| Donkey Kong 64 | 25.4 % -> **12.4 %** | 11.3 % -> 10.8 % | 5.8 % -> 11.6 % | 44.6 % -> 38.6 % |
+
+(Shares of a smaller total: the generic kernel and its helpers, 19.4 / 14.1 % of the old profiles, moved into the variants, the whole texture stage lost 7-6 points; `lod_pass` is now the single largest function after the batch builder. In absolute terms the replay says it costs 5.4 ms of Banjo-Kazooie 2400's 38.9 ms, own divide included.)
+
+**Tried and left out**
+
+| variant | result | why not |
+|---|---|---|
+| table lookups of `tc_divide4` as lane loads (`vgetq_lane` + `vld1q_lane`) instead of store / reload | 0 to +1 % | neutral on the A55 |
+| old `tc_divide4` kept for the non-LOD kernels | +1.5 to +5 % slower | code layout; one divide for everything |
+| LOD tail in 32-bit halves as before | not built | the 16-bit tail is exact (checked by the mutations) and half the instructions |
+| NEON merge of the lanes of a group that select different tiles (several fetches combined) | not built | 0.4-7 % of the groups; `tex_cycle_multi` stays out of line |
+| `TEXAL` for two-cycle point-sampled LOD, and exact `TEXL` for more formats | not added | not seen in any dump; 10.5 KB each; they run the (correct) generic kernel |
+| skipping the row-below divide | not possible | no lane holds the pixel below; its coordinates are `s + dsdy` with the masked `dsdy`, not the next row's span |
+| vector `vqtbl`-based reciprocal instead of the 128 KB `k_tcdiv` table | not built | needs 12 table registers; the lookups are 14 of 51 instructions |
+
+**Deviations from the workspace rules:** none that change a result. Six new dumps (Banjo-Kazooie and Donkey Kong 64 at VI frames 1800 / 2400 / 3000; DK64 1800 has no textured draw and is not kept) and `Rocket_1500` were added to `test-data/dumps` (git-ignored, regenerate as described in `test-data/README.md`); they were captured on the rgdsplus with the HEAD plugin
+and the sweep's scripted input. The `-DFOIR_STATS` build (`POSTFIX=-st`) was built in the tree once and from a copy otherwise; the `-st` object directory was removed afterwards.
+
+
 ### In-game frame rate
 
 | game (VI frames ending at) | M2 scalar | NEON | NEON + 1 worker | NEON + 2 | NEON + 3 |
@@ -1350,7 +1499,7 @@ python3 ../../tools/regress.py ../../test-output/synthetic            # scalar v
 python3 ../../tools/vitest.py ./foir-replay                           # interlace hack
 ```
 
-* `neoncheck.py` replays every scene (the 12 captured real frames in `test-data/dumps` plus the 15 synthetic scenes) with
+* `neoncheck.py` replays every scene (the captured real frames in `test-data/dumps` -- 18 now, six of them with mip-mapped draws -- plus the 25 + 4 synthetic scenes of `regress.py`, `SCENES` and `XSCENES`) with
   `--scalar` as the reference and with the default kernels (specialised variants on) at 0, 1, 2 and 3 worker threads, with the
   combiner path forced by `FOIR_SPEC_COMB=shape|exact|generic` and the texture path by `FOIR_SPEC_TEX=shape|exact|generic` (inline and with 3 workers), with the
   variants off (`--nospec`, the generic NEON kernels) inline and with 3 workers, and with the plugin-default knobs
@@ -1358,6 +1507,13 @@ python3 ../../tools/vitest.py ./foir-replay                           # interlac
   images must be byte-identical. It also prints the share of the pixels that ran in specialised variants per scene.
 * `foir-kfuzz -m 64` checks the batch builder (`raster.c`) against its portable reference, which the replay-based checks cannot do (they replace the kernels, not the builder); see
   [the results](#batch-builder-edge-zone-coverage-and-fixed-size-ramps). The aarch64-vs-x86 cross check is a plain `foir-replay -o` of each dump from the `NEON=0` x86_64 build and the aarch64 build, compared with `cmp`.
+* **LOD / mip-map scenes.** `foir-kfuzz -L` makes every iteration a mip-map scene: TEX_LOD_EN (mostly), detail and sharpen now and then, perspective (mostly), one and two cycles, point and bilinear sampling, TLUT, a combiner that reads TEXEL0 / TEXEL1 / the LOD fraction,
+  batches whose scanline runs are linear ramps of s, t, w with steps from sub-texel to the largest the 14-bit LOD holds (also around the powers of two where a level changes), a different row-below step, the odd ramp with one lane off by a little, and a tile chain
+  (`tilenum .. tilenum + max_level`, one more with detail) that has the texel format of the primitive's tile with arbitrary tiles after it, or, one time in four, a disagreeing tile inside it (the specialised variants must hand that to a generic kernel).
+  The default `kfuzz` run draws one iteration in four that way, `kfuzz -S` does it for the LOD variants (with detail / sharpen, which are not part of the variant key), and `make check` runs `-L -m 1` (20,000) and `-L -S -T 0` (8,000) on top. The run prints how many LOD batches it verified by mode
+  (`kfuzz LOD: ...`). `mtfuzz.py` scenes now switch TEX_LOD_EN / detail on in a third / a sixth of their triangles, with a four-level mip chain in tiles 0-3 and a random max level. `regress.py` has ten mip-map scenes (two cycles; detail; sharpen; min level; no perspective; IA8 point sampled one cycle;
+  CI4 + TLUT; RGBA32 with mirror; IA16 with clamp / mirror / detail; I4 with clamp): scalar vs angrylion, 0 differing pixels. Four more (`XSCENES`: one-cycle perspective LOD with a max level above 0, where the scalar reference and angrylion differ in the far part of the plane --
+  angrylion's `tclod_1cycle_current` has span-edge cases the scalar kernel does not model; not investigated) are NEON-vs-scalar scenes only.
 * `foir-walkfuzz` (any architecture; `make check` runs 40,000 primitives) checks the per-row edge walker (`walk_row`, `src/walk.h`) against the sequential walker of the
   previous design: `tools/walk_ref.inc` is `walk_edges()` as it was at commit c73eb8e (every subscanline from the top vertex, repeated additions, one `struct span` per
   row), kept verbatim as the oracle. Random primitives -- ordinary triangles and rectangles, vertices anywhere in the 14-bit range (up to 12,000 subscanlines of
@@ -1421,6 +1577,8 @@ pixels, primitives and skipped frames.
 * **What was checked how, for the COPY kernel and the buffer access.** Offline replay (184 dumps with `FOIR_NEON_VERIFY=1`, 27 scenes in `neoncheck`), fuzzers and in game for Paper Mario, Rocket, Mischief Makers, Super Mario 64, Donkey Kong 64 (and Banjo-Kazooie), 60-75 s each. The row-ownership
   rule (an odd-aligned window and a COPY window must not leave its row) is only tested for equal output, not with a data-race detector (ThreadSanitizer cannot run the NEON kernels on x86_64). `flip = 0` COPY spans and 8-bit colour buffers are only exercised by the fuzzers, where they take the scalar kernel on both sides. The in-game
   profile covers two games and is noisy to about 10 %; the three-worker replay timings of the two-frame dumps are noisy to the same order (see the tables).
+* **LOD.** One-cycle perspective LOD with a max level above 0 is not angrylion-exact in the scalar reference (`XSCENES` in `tools/regress.py`; the far part of the plane differs), the NEON path follows the scalar reference. Detail and sharpen occur in no captured frame
+  (fuzzers and synthetic scenes only). A point-sampled two-cycle LOD state has no variant (generic kernel). The variants require one texel format along `tilenum .. tilenum + max_level (+ 1 with detail)`, as before but without the two spare tiles.
 * Some hidden-bit and COPY-mode details are still approximations (inherited from M1).
 * The pseudo random noise is not the hardware sequence.
 * The parallel-rsp pairing was verified on the RK3566 (aarch64) only; the x86_64 plugin builds but was not run in an emulator.

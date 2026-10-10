@@ -385,6 +385,60 @@ def scene_copy_tlut():
     return s, vi_320x240(FB)
 
 
+# ---- mip-mapped scenes (TEX_LOD_EN, detail, sharpen): LOD / tile selection / fraction -------------------------------------
+
+def _lvl_words(size, w):
+    """TMEM words (8 bytes) a w x w level takes (the low bank only for 32-bit texels)"""
+    bits = {0: 4, 1: 8, 2: 16, 3: 32}[size]
+    line = max(1, w // 4) if size == 3 else max(1, (w * bits + 63) // 64)
+    return line * w
+
+
+def scene_lod(fmt=0, size=2, w0=32, nlev=5, cycles=2, persp=1, detail=0, sharpen=0, smp=1, tlut=0, tilekw=None, maxlevel=3,
+              scale=96.0, minlevel=0, ntri=1):
+    """A ground-plane-like triangle sampled through a mip chain (tiles 0 .. nlev - 1, sizes w0, w0/2, ...), the perspective makes the
+    LOD range from magnified (near) to distant (far); two cycles blend level and level + 1 by the LOD fraction"""
+    s = Scene()
+    prologue(s, z=True)
+    clear(s, 0x00010001 * rgba16(10, 10, 40))
+    s.add(set_other_modes(cycle=3), set_fill_color(0xFFFCFFFC), set_color_image(0, 2, 320, ZB), fill_rect(0, 0, 320, 240),
+          set_color_image(0, 2, 320, FB), sync_pipe())
+    if fmt == 2:
+        pal = 0x180000
+        for k in range(256):
+            s.wr16(pal + 2 * k, rgba16((k * 3) & 255, (k * 7) & 255, (255 - k) & 255, 1))
+        s.add(set_texture_image(0, 2, 1, pal), set_tile(0, 0, 0, 0x100, 5), load_tlut(5, 0, 0, 255, 0), sync_pipe())
+    tmem = 0
+    for lvl in range(nlev):
+        w = max(1, w0 >> lvl)
+        kw = dict(tilekw or {})
+        lg = max(0, w.bit_length() - 1)
+        kw.setdefault('masks', lg); kw.setdefault('maskt', lg)
+        if fmt == 2:
+            kw['pal'] = 0
+        upload_tex(s, fmt, size, w, w, TEXMEM + lvl * 0x2000, tmem, tile=lvl, **kw)
+        tmem += (_lvl_words(size, w) + 1) & ~1
+    one = cycles == 1
+    if one:
+        s.add(set_combine(8, 8, 16, 1, 7, 7, 7, 1, 8, 8, 16, 1, 7, 7, 7, 1))
+    else:   # (TEXEL1 - TEXEL0) * LOD fraction + TEXEL0, then the second cycle passes TEXEL0 of tile + 1 ... (A - B) * C + D with D = COMBINED
+        s.add(set_combine(2, 1, 13, 1, 2, 1, 0, 1, 8, 8, 16, 0, 7, 7, 7, 0))
+    s.add(set_prim_color(0xFFFFFFFF, minlevel, 0x80))
+    s.add(set_other_modes(cycle=0 if one else 1, persp=persp, detail=detail, sharpen=sharpen, lod=1, tlut=tlut, bilerp_sample=smp,
+                          bi0=1, bi1=1, aa=1, z_compare=1, z_update=1, m1a0=0, m1b0=0, m2a0=1, m2b0=0, m1a1=0, m1b1=0, m2a1=1, m2b1=0))
+    for k in range(ntri):
+        # a wide near edge and a narrow far one: texels per pixel grow with the distance (and with scale)
+        y0 = 232 - 20 * k
+        s.add(triangle([(8 + 8 * k, y0), (312 - 8 * k, y0), (160, 36 + 14 * k)], shade=[(255, 255, 255, 255)] * 3,
+                       tex=[(0, 0, 1.0), (scale, 0, 1.0), (scale / 2, scale, 0.1)], zs=[10000, 10000, 40000], level=maxlevel))
+    s.add(sync_full())
+    return s, vi_320x240(FB)
+
+
+def _mk(**k):
+    return lambda: scene_lod(**k)
+
+
 SCENES = {
     'fill': scene_fill,
     'shaded': scene_shaded,
@@ -401,6 +455,27 @@ SCENES = {
     'zmodes': scene_zmodes,
     'alphacvg': scene_alphacmp_cvg,
     'copytlut': scene_copy_tlut,
+    # mip-mapped: TEX_LOD_EN, level / fraction / tile selection, detail, sharpen, formats, wrap / mirror / clamp, one and two cycles
+    'lod2c': _mk(),
+    'lod2c_min': _mk(minlevel=3, scale=40.0),
+    'lod2c_detail': _mk(detail=1, scale=128.0),
+    'lod2c_sharpen': _mk(sharpen=1, scale=64.0),
+    'lod2c_nopersp': _mk(persp=0, scale=300.0, maxlevel=4),
+    'lod1c_ia8_point': _mk(fmt=3, size=1, cycles=1, persp=0, smp=0, scale=200.0),
+    'lod1c_i4_ml0': _mk(fmt=4, size=0, cycles=1, persp=1, tilekw=dict(cs=1, ct=1), scale=64.0, maxlevel=0),
+    'lod2c_ci4': _mk(fmt=2, size=0, tlut=1, scale=100.0),
+    'lod2c_rgba32_mirror': _mk(fmt=0, size=3, w0=16, nlev=4, tilekw=dict(ms=1, mt=1), scale=60.0, maxlevel=2),
+    'lod2c_ia16_clampmirror': _mk(fmt=3, size=2, tilekw=dict(cs=1, mt=1), scale=150.0, maxlevel=4, detail=1, nlev=6),
+}
+
+# Scenes the scalar reference does NOT reproduce angrylion on: one-cycle perspective LOD with max level > 0 (the far part of the plane differs;
+# angrylion's tclod_1cycle_current has span-edge special cases the scalar kernel does not model). They are NEON-vs-scalar scenes only:
+# neoncheck.py replays them, regress.py runs them only when asked by name.
+XSCENES = {
+    'lod1c_i4_clamp': _mk(fmt=4, size=0, cycles=1, persp=1, tilekw=dict(cs=1, ct=1), scale=64.0),
+    'lod1c_rgba16_wide': _mk(cycles=1, scale=400.0, maxlevel=4, ntri=2),
+    'lod1c_ci4_detail': _mk(fmt=2, size=0, tlut=1, cycles=1, detail=1, scale=200.0, nlev=6, maxlevel=3),
+    'lod1c_rgba16_sharpen': _mk(cycles=1, sharpen=1, scale=120.0, maxlevel=3),
 }
 
 
@@ -412,10 +487,11 @@ MIN_PIXELS = {'fill': 76800 + 80 * 60, 'copy': 76800 + 2 * 32 * 32}
 def main():
     out = sys.argv[1] if len(sys.argv) > 1 else '../../test-output/synthetic'
     names = sys.argv[2:] or list(SCENES)
+    allscenes = dict(SCENES, **XSCENES)
     os.makedirs(out, exist_ok=True)
     here = os.path.dirname(os.path.abspath(__file__))
     for name in names:
-        s, vi = SCENES[name]()
+        s, vi = allscenes[name]()
         dump = os.path.join(out, name + '.fdump')
         s.write(dump, vi)
         prefix = os.path.join(out, name)

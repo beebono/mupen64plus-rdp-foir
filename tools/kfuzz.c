@@ -74,6 +74,14 @@ static uint32_t rbits(int n) { return rnd() & (n >= 32 ? ~0u : ((1u << n) - 1));
 
 struct fz_opts { int wide_modes; };
 
+/* -L: every iteration is a LOD / mipmap scene (see random_state, random_batch, shape_lod_chain); without it one iteration in four is */
+static int g_lod_mode;
+static int g_lod_scene;                 /* the current iteration is one */
+static int g_spec_mode;                 /* -S: walk through the specialised variants */
+static long g_lod_modes[256];           /* verified texture batches that computed a LOD, by mode (lod_mode_index) */
+static long g_lod_runs;                 /* batches with a linear-ramp LOD scene */
+static long g_lod_lf[5];                /* lanes by reference LOD fraction: 0xff, 0, 1..0xfe, >= 0x100 (sharpen), other */
+
 static void random_state(struct rdp *r)
 {
     /* other modes: random bits, one or two cycle */
@@ -83,10 +91,35 @@ static void random_state(struct rdp *r)
     if (rndn(3)) w0 &= ~(1u << 8);                /* key_en rarely */
     if (rndn(5) == 0) w0 &= ~(3u << 6), w0 |= 2u << 6;           /* random rgb dither sometimes */
     uint32_t w1 = rnd();
+    g_lod_scene = !g_spec_mode && (g_lod_mode || rndn(4) == 0);       /* (-S: the variant walk keeps the state its key asks for; LOD variants set the scene up after the key is applied) */
+    if (g_lod_scene) {
+        /* TEX_LOD_EN (bit 16) usually, detail (18) and sharpen (17) now and then, perspective (19) mostly; the cycle type is as drawn */
+        w0 &= ~((1u << 16) | (1u << 17) | (1u << 18) | (1u << 19));
+        if (rndn(5)) w0 |= 1u << 16;
+        if (rndn(3) == 0) w0 |= 1u << 18;
+        if (rndn(3) == 0) w0 |= 1u << 17;
+        if (rndn(3)) w0 |= 1u << 19;
+        if (rndn(2)) w0 &= ~((1u << 11) | (1u << 10));        /* BI_LERP 0 selects the colour conversion (scalar fallback): rarely */
+        else w0 |= (1u << 11) | (1u << 10);
+        if (rndn(4) == 0) w0 &= ~(1u << 13);                 /* point sampling */
+        else w0 |= 1u << 13;
+        w0 &= ~(1u << 9);                                    /* no convert-one feedback */
+    }
     cmd(r, w0, w1);
 
     /* combiner */
-    cmd(r, (0x3cu << 24) | rbits(24), rnd());
+    {
+        uint32_t c0 = rbits(24), c1 = rnd();
+        if (g_lod_scene) {
+            /* read the texels: TEXEL0 in both cycles (sub A), now and then the LOD fraction, TEXEL1 or the alpha LOD fraction as a multiplier */
+            if (rndn(4)) c0 = (c0 & ~(0xfu << 20)) | (1u << 20);
+            c0 = (c0 & ~0x1fu) | (rndn(3) == 0 ? 2u : rndn(2) ? 13u : rbits(4)), c0 = (c0 & ~(0xfu << 5)) | ((rndn(5) ? 1u : rbits(4)) << 5);
+            if (rndn(3) == 0) c0 &= ~(7u << 9);              /* alpha multiplier 0: LOD fraction */
+            if (rndn(3) == 0) c0 = (c0 & ~(0x1fu << 15)) | (13u << 15);   /* cycle 0 RGB multiplier: LOD fraction */
+            if (rndn(4) == 0) c0 = (c0 & ~(0x1fu << 15)) | (2u << 15);    /* TEXEL1 */
+        }
+        cmd(r, (0x3cu << 24) | c0, c1);
+    }
 
     /* tiles */
     for (int t = 0; t < 8; t++) {
@@ -159,6 +192,22 @@ static int32_t rnd_coord(void)
     }
 }
 
+/* a texture coordinate step per pixel in s16.16 of S10.5 texels: from sub-texel (LOD 0, magnified) up to the largest the 14-bit LOD can hold */
+static int32_t rnd_slope(void)
+{
+    int32_t v;
+    switch (rndn(7)) {
+    case 0: v = (int32_t)(rnd() & 0x3ff); break;
+    case 1: v = (int32_t)(rnd() & 0xffff); break;
+    case 2: v = (int32_t)(rnd() & 0xfffff) << rndn(5); break;
+    case 3: v = (int32_t)((rnd() & 0x3ff) << rndn(21)); break;
+    case 4: v = (int32_t)(rnd() & 0x3fffffff) >> rndn(14); break;
+    case 5: v = (int32_t)(1u << (10 + rndn(20))) + (int32_t)rndn(3) - 1; break;       /* around a power of two: the level boundaries */
+    default: v = (int32_t)(rnd() & 0x3fffffff); break;
+    }
+    return rndn(2) ? v : -v;
+}
+
 static void random_batch(struct rdp *r, struct px_batch *b, int tilenum)
 {
     memset(b, 0, sizeof(*b));
@@ -185,9 +234,11 @@ static void random_batch(struct rdp *r, struct px_batch *b, int tilenum)
     b->n = n;
     int pos = 0;
     int width = r->fb_width;
+    int runs[FOIR_BATCH + 1], nruns = 0;          /* start lane of every scanline run (+ n) */
     while (pos < n) {
         int len = 1 + (int)rndn(rndn(2) ? 24 : 70);
         if (len > n - pos) len = n - pos;
+        runs[nruns++] = pos;
         uint32_t row = rndn(12), x0 = rndn((uint32_t)(width > 16 ? width - 8 : 1));
         if (rndn(3) == 0) x0 = (x0 & ~1u);
         for (int i = 0; i < len; i++) {
@@ -198,10 +249,42 @@ static void random_batch(struct rdp *r, struct px_batch *b, int tilenum)
         }
         pos += len;
     }
+    runs[nruns] = n;
     int cvgmode = (int)rndn(3);
+    /* LOD scene: every run is a linear ramp of s, t, w (what the rasteriser hands over), steps from tiny to huge, the row below at
+     * dsdy ..., the odd ramp with a broken lane (the "next pixel" shortcut of the LOD pass has to notice) */
+    const int lodscene = g_lod_scene && r->om.dolod && rndn(8) != 0;
+    if (lodscene) {
+        int32_t ds = rnd_slope(), dt = rnd_slope(), dw;
+        if (rndn(3) == 0) dt = ds / (int32_t)(1 + rndn(4));
+        if (rndn(2)) dw = (int32_t)((rnd() & 0x3ff) << rndn(11)) * (rndn(2) ? 1 : -1); else dw = 0;
+        if (rndn(8) == 0) ds = dt = 0;
+        pc->ds = ds; pc->dt = dt; pc->dw = dw;
+        pc->dsinc = pc->flip ? ds : -ds; pc->dtinc = pc->flip ? dt : -dt; pc->dwinc = pc->flip ? dw : -dw;
+        pc->dsdy = rndn(4) ? rnd_slope() & ~0x7fff : (ds & ~0x7fff); pc->dtdy = rndn(4) ? rnd_slope() & ~0x7fff : (dt & ~0x7fff);
+        pc->dwdy = rndn(2) ? (int32_t)((rnd() & 0x3ff) << rndn(11)) * (rndn(2) ? 1 : -1) : dw & ~0x7fff;
+        for (int q = 0; q < nruns; q++) {
+            uint32_t s0 = rndn(3) ? (rnd() & 0x3fffffff) - 0x20000000 : (uint32_t)rnd_coord();
+            uint32_t t0 = rndn(3) ? (rnd() & 0x3fffffff) - 0x20000000 : (uint32_t)rnd_coord();
+            uint32_t w0 = rndn(10) ? (rnd() & 0x7fff0000) | (rnd() & 0xffff) : (uint32_t)rnd_coord();
+            if (rndn(2)) w0 = (w0 & 0x7fff0000) >> 1 | 0x00400000;
+            for (int i = runs[q]; i < runs[q + 1]; i++) {
+                uint32_t k = (uint32_t)(i - runs[q]);
+                b->s[i] = (int32_t)(s0 + k * (uint32_t)ds); b->t[i] = (int32_t)(t0 + k * (uint32_t)dt); b->w[i] = (int32_t)(w0 + k * (uint32_t)dw);
+            }
+            if (rndn(8) == 0) {                                     /* a lane off the ramp */
+                int i = runs[q] + (int)rndn((uint32_t)(runs[q + 1] - runs[q]));
+                int32_t d = (int32_t)rndn(5) - 2;
+                switch (rndn(3)) { case 0: b->s[i] += d; break; case 1: b->t[i] += d; break; default: b->w[i] += d << rndn(17); break; }
+            }
+        }
+        g_lod_runs++;
+    }
     for (int i = 0; i < n; i++) {
+        if (!lodscene) {
         b->s[i] = rnd_coord(); b->t[i] = rnd_coord();
         b->w[i] = rndn(4) ? (int32_t)((rnd() & 0x3fff) << 16) : rnd_coord();
+        }
         b->cr[i] = rnd_coord(); b->cg[i] = rnd_coord(); b->cb[i] = rnd_coord(); b->ca[i] = rnd_coord();
         b->cz[i] = (int32_t)(rnd() >> (rndn(3) ? 2 : 0)) & (rndn(2) ? ~0 : 0x3fffffff);
         uint8_t m = cvgmode == 0 ? 0xff : (uint8_t)rnd();
@@ -218,6 +301,37 @@ static void random_batch(struct rdp *r, struct px_batch *b, int tilenum)
     for (int i = n; i < FOIR_LANES; i++) { b->fbidx[i] = 0; b->cvg[i] = 8; }
 }
 
+
+/* LOD scene: the tiles the LOD can select (tilenum .. tilenum + max_level, one more with detail textures) usually all get the texel
+ * format and size of the primitive's tile -- what a mip chain looks like, and what the specialised variants require --, and the tiles
+ * beyond them get arbitrary ones (any format, YUV included): a variant that looks at too few or too many tiles shows up as a difference. */
+static void shape_lod_chain(struct rdp *r)
+{
+    if (!g_lod_scene || !r->om.tex_lod_en || rndn(4) == 0) return;
+    const int tn = r->pc.tilenum & 7, last = r->pc.max_level + (r->om.detail_tex_en ? 1 : 0);
+    const int fmt0 = r->tile[tn].format, siz0 = r->tile[tn].size;
+    for (int k = 0; k < 8; k++) {
+        struct tile *t = &r->tile[(tn + k) & 7];
+        if (k == 1 && r->om.cycle_type == CYCLE_TYPE_2) continue;       /* (part of the variant key of a two-cycle state: leave it) */
+        if (k <= last) {
+            t->format = fmt0; t->size = siz0;
+        } else {
+            t->format = (int)rndn(5); t->size = (int)rndn(4);
+        }
+        tile_update_derived(t);
+    }
+    /* one time in four a tile of the chain itself disagrees (the last one half of the time): a specialised variant has to notice and hand
+     * the batch to a generic kernel; one that looks at too few tiles runs on and gets the lanes that select that tile wrong */
+    if (rndn(4) == 0 && last >= 1) {
+        int k = rndn(2) ? last : 1 + (int)rndn((uint32_t)last);
+        if (k > 7) k = 7;
+        if (!(k == 1 && r->om.cycle_type == CYCLE_TYPE_2)) {
+            struct tile *t = &r->tile[(tn + k) & 7];
+            do { t->format = (int)rndn(5); t->size = (int)rndn(4); } while (t->format == fmt0 && t->size == siz0);
+            tile_update_derived(t);
+        }
+    }
+}
 
 /* one iteration in eight: the colour buffer or the Z buffer is moved to the first or last pixels of RDRAM so that the
  * vector windows of the memory kernels run over the edges (the bounds checks / per-lane fallbacks) */
@@ -289,7 +403,6 @@ static void dump_state(const struct rdp *r)
     }
 }
 
-static int g_spec_mode;                 /* -S: walk through the specialised variants */
 static int g_spec_only = -1;            /* -T: only this table */
 static long g_spec_hits[SPEC_NSTAGES + 1][512];
 static long g_spec_other;               /* iterations in which a stage other than the one under test ran a variant */
@@ -334,6 +447,11 @@ static int run_one(uint64_t seed, int mask, int verbose, long iter)
         foir_spec_set_tex_mode(vstage == SPEC_TEX && foir_spec_tabs[SPEC_TEX].ent[vidx].k.tex.any ? COMB_SHAPE : COMB_AUTO);
         if (vstage == SPEC_SHAPE) foir_shape_apply(&foir_spec_tabs[vstage].ent[vidx].k, &ra, rnd64());
         else foir_spec_apply(vstage, &foir_spec_tabs[vstage].ent[vidx].k, &ra);
+        if (vstage == SPEC_TEX && foir_spec_tabs[vstage].ent[vidx].k.tex.lod) {
+            /* a LOD variant: usually a ramp scene, with detail / sharpen (not part of the key) now and then */
+            g_lod_scene = g_lod_mode || rndn(4) != 0;
+            ra.om.detail_tex_en = rndn(3) == 0; ra.om.sharpen_tex_en = rndn(3) == 0;
+        }
         relaxed = ra.cfg.relaxed_precision;
     }
     rdp_update_derived(&ra);
@@ -357,6 +475,7 @@ static int run_one(uint64_t seed, int mask, int verbose, long iter)
     }
     struct px_batch *bref = malloc(sizeof(*bref)), *bn = malloc(sizeof(*bn)), *pre = malloc(sizeof(*pre));
     random_batch(&ra, bref, tilenum);
+    shape_lod_chain(&ra);
     const struct foir_kernels *refk = &foir_kernels_scalar;
 
     /* B context: identical render state and memory */
@@ -416,6 +535,11 @@ static int run_one(uint64_t seed, int mask, int verbose, long iter)
                 }
                 if (ra.om.dolod) CHK("lodfrac", bn->lodfrac[i], bref->lodfrac[i], i);
             }
+            if (ra.om.dolod)
+                for (int i = 0; i < n; i++) g_lod_lf[bref->lodfrac[i] == 0xff ? 0 : bref->lodfrac[i] == 0 ? 1 : bref->lodfrac[i] < 0xff ? 2 : bref->lodfrac[i] >= 0x100 ? 3 : 4]++;
+            if (ra.om.dolod)
+                g_lod_modes[ra.om.tex_lod_en | (ra.om.detail_tex_en << 1) | (ra.om.sharpen_tex_en << 2) | (ra.om.persp_tex_en << 3) | (two << 4) |
+                            (ra.om.sample_type << 5) | (ra.om.en_tlut << 6)]++;
             if (g_bad != bad_before) { fprintf(stderr, "seed %llu: %s\n", (unsigned long long)seed, stage); dump_state(&ra); goto done; }
         }
         /* keep the reference output as input for the next stage */
@@ -842,8 +966,9 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "-m") && i + 1 < argc) mask = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-v")) verbose = 1;
         else if (!strcmp(argv[i], "-S")) g_spec_mode = 1;
+        else if (!strcmp(argv[i], "-L")) g_lod_mode = 1;
         else if (!strcmp(argv[i], "-T") && i + 1 < argc) g_spec_only = atoi(argv[++i]);
-        else { fprintf(stderr, "usage: kfuzz [-n iterations] [-s seed] [-m stage mask] [-v] [-S [-T table]]\n"); return 2; }
+        else { fprintf(stderr, "usage: kfuzz [-n iterations] [-s seed] [-m stage mask] [-v] [-S [-T table]] [-L]\n"); return 2; }
     }
     raster_init_tables();
     foir_spec_init();
@@ -877,6 +1002,21 @@ int main(int argc, char **argv)
             }
         printf("kfuzz -S: %ld variants, %ld never exercised, %ld iterations also ran a variant of another stage\n", nvar, nmiss, g_spec_other);
         if (nmiss && iters >= nvar) failed++;
+    }
+    {
+        long tot = 0, lt = 0, dt = 0, sh = 0, pe = 0, tw = 0, pt = 0, tl = 0;
+        for (int i = 0; i < 256; i++) {
+            if (!g_lod_modes[i]) continue;
+            tot += g_lod_modes[i]; lt += (i & 1) ? g_lod_modes[i] : 0; dt += (i & 2) ? g_lod_modes[i] : 0; sh += (i & 4) ? g_lod_modes[i] : 0;
+            pe += (i & 8) ? g_lod_modes[i] : 0; tw += (i & 16) ? g_lod_modes[i] : 0; pt += (i & 32) ? 0 : g_lod_modes[i]; tl += (i & 64) ? g_lod_modes[i] : 0;
+        }
+        if (tot) {
+            int used = 0;
+            for (int i = 0; i < 256; i++) used += g_lod_modes[i] != 0;
+            printf("kfuzz LOD: %ld texture batches with a LOD computed (%ld ramp scenes): TEX_LOD_EN %ld, detail %ld, sharpen %ld, perspective %ld, two-cycle %ld, point sampled %ld, TLUT %ld; %d distinct mode combinations\n",
+                   tot, g_lod_runs, lt, dt, sh, pe, tw, pt, tl, used);
+            printf("kfuzz LOD: lanes by LOD fraction: 0xff %ld, 0 %ld, 1..0xfe %ld, >= 0x100 %ld\n", g_lod_lf[0], g_lod_lf[1], g_lod_lf[2], g_lod_lf[3]);
+        }
     }
     printf("kfuzz: %ld iterations, %ld failing, %ld value checks\n", iters, failed, g_checks);
     return failed ? 1 : 0;

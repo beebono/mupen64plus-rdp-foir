@@ -154,6 +154,15 @@ TEXA(1, 0,1,0, 1, 0, 0, 1,1)  /* 0.00% mean */
 TEXAL(1, 0,0,0, 1, 1, 1, 1,1, 1)  /* 0.00% mean */
 TEXAL(1, 1,1,0, 1, 0, 1, 1,1, 0)  /* 0.00% mean */
 TEXA(1, 0,0,1, 1, 0, 1, 1,1)  /* 0.00% mean */
+/* point-sampled (SAMPLE_TYPE 0) mip-mapped one-cycle texture reads (TEX_LOD_EN): Donkey Kong 64 draws some of its surfaces this way (exact variants for the formats of the dumps, a
+   structural kernel for everything else); bilinear LOD was the only form listed before */
+TEXL(0, 1,0,0, 3,1, 0,0, 0,0, 0,0, 1, 1,0, 1)  /* DK64: IA8 */
+TEXL(0, 1,0,0, 0,2, 0,0, 0,0, 0,0, 1, 1,0, 1)  /* DK64: RGBA16 */
+TEXL(0, 1,0,0, 4,0, 0,0, 0,0, 0,0, 0, 1,0, 1)  /* DK64: I4, no perspective */
+TEXAL(0, 1,0,0, 0, 0, 1, 1,0, 1)
+TEXAL(0, 1,0,0, 0, 0, 0, 1,0, 1)
+TEXAL(0, 1,0,0, 0, 1, 1, 1,0, 1)
+TEXAL(0, 1,0,0, 0, 1, 0, 1,0, 1)
 /* the LOD fraction without TEX_LOD_EN (e.g. a detail / sharpen combiner), bilinear, texel 0 only (structural matrix) */
 TEXAL(0, 1,0,0, 1, 0, 0, 1,0, 0)
 TEXAL(0, 1,0,0, 1, 0, 1, 1,0, 0)

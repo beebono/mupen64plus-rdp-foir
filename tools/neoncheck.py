@@ -71,7 +71,7 @@ def collect_scenes(args, tmp):
                     scenes.append((fn[:-6], p))
     if not args.no_synthetic:
         import regress
-        for name, fn in regress.SCENES.items():
+        for name, fn in list(regress.SCENES.items()) + list(regress.XSCENES.items()):
             s, vi = fn()
             q = os.path.join(tmp, 'syn_' + name + '.fdump')
             s.write(q, vi)
