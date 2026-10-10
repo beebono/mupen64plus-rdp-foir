@@ -165,10 +165,11 @@ looked at: stock rsp-hle's own cost in the pairing (about 4 % of the emulation t
        |
        v
  +--------------+   +-----------------+   +-------------------------------+
- | Command      |-->| Primitive setup |-->| Job: span records of the      |
- | parser       |   | (edge walker,   |   | primitive + constants + (if   |
- | (state, TMEM)|   |  4 subscanlines)|   | changed) render-state and TMEM|
- +--------------+   +-----------------+   | snapshots                     |
+ | Command      |-->| Primitive setup |-->| Job: walker record (edge and  |
+ | parser       |   | (decode edge /  |   | interpolant coefficients, one |
+ | (state, TMEM)|   |  interpolant    |   | small struct) + constants +   |
+ +--------------+   |  coefficients)  |   | (if changed) render-state and |
+                    +-----------------+   | TMEM snapshots                |
                                           +-------------------------------+
                                                          |  lock-free ring
                   +--------------------------------------+------------------+
@@ -177,7 +178,7 @@ looked at: stock rsp-hle's own cost in the pairing (about 4 % of the emulation t
    owns rows y with (y/4) % N == id  (its own FB / Z / hidden-bit rows)
                   |
                   v
-   per primitive: spans -> pixel batches (64 px, struct-of-arrays, several scanlines)
+   per row it owns: edge walker (4 subscanlines, NEON) -> span -> pixel batches (64 px, struct-of-arrays, several scanlines)
         texture -> combine -> zcmp -> blend -> store      (NEON kernels, 8 px per step)
 ```
 
@@ -258,10 +259,21 @@ eight lanes (dead lanes cost the whole texture / combiner / blender pipeline, ab
 
 ### Threading
 
-* The parser thread decodes commands, keeps TMEM, and runs primitive setup. Each primitive becomes a
-  **job** (span records in a ring-buffer arena, the per-primitive constants and indices of the state /
+* The parser thread decodes commands, keeps TMEM, and runs primitive setup, which only *decodes* the primitive: the edge
+  positions and slopes and the interpolant values and steps become a **walker record** (`struct prim_walk`, 192 bytes,
+  `rdp.h`). Each primitive becomes a **job** (that record, the per-primitive constants and indices of the state /
   TMEM snapshots it needs). Snapshots (about 1.1 KB of render state, 4 KB of TMEM) are taken only when
   something changed since the previous job.
+* **The edge walker runs on the workers, one row at a time** (`walk_row`, `src/walk.h`). The RDP walks a primitive in subscanlines
+  (four per row) and everything it carries from one subscanline to the next is linear in the subscanline number (edge
+  positions, interpolants; the left edge restarts from the lower edge at the middle vertex), while the per-row state (min / max
+  edge, the all-over / all-under / all-invalid flags) is reset at every row. The span of row `j` is therefore a function of `j` and
+  the record: the edge position of subscanline `k` is `start + (k - k0) * step` and the interpolants of row `j` are `a0 + (j - j0) * step`,
+  in wrapping 32-bit arithmetic -- exactly what `k - k0` repeated additions produce, since unsigned addition and multiplication
+  are ring operations modulo 2^32 (`foir-walkfuzz` checks it against the sequential walker, below). A worker computes the span of
+  each row it owns (the four subscanlines in the four lanes of a NEON vector; a portable version for the scalar build), hands it
+  to the batch builder and forgets it: no span records are written, queued or read by another core. The scalar and the inline
+  (`Threads = -1`, `foir-replay -t 0`) paths use the same `walk_row`.
 * Workers run the whole pixel pipeline for the **rows they own**: row `y` belongs to worker
   `(y >> 2) % N` (4-row stripes). A worker is a private `struct rdp` context whose render-state block is
   refreshed from the snapshot, so the kernels read `r->om`, `r->tile[]`, ... unchanged. Workers share nothing
@@ -905,6 +917,122 @@ Also run: `make check` as a whole (`neoncheck.py`: 12 captured frames + 15 synth
 
 (A change of the right-edge value that only touches bits outside the subscanline's own mask is not a mutation: `A & B` hides it, as it should -- a first attempt, `^ 1`, passed everything.)
 
+### Edge walker on the workers (`walk_row`)
+
+The edge walker (`walk_edges` of `setup.c`) walked every subscanline of every primitive on the emulation thread, inside parallel-rsp's `ProcessRdpList` callback, and wrote one 96-byte `struct span` per scanline into an arena
+that the workers, on other cores, then read. In the in-game profiles it was 2.8-10 % of foir's CPU time (mean 6.5 %, Paper Mario 10.1 %), about 60 % of the emulation thread's own RDP work, and the span records
+were a source of cross-core stalls in `raster_render_job` (backend load stalls 16-23 % of its cycles). The emulation thread's time in the RDP per frame was 5.5 ms in Donkey Kong 64, 3.6 Banjo-Kazooie, 3.3 Paper Mario, 2.6 Mario Kart 64, 2.4 Super Mario 64,
+1.9 Ocarina of Time, 1.8 Star Fox 64.
+
+**Design.** The span geometry of a primitive is a pure function of its edge coefficients and the scanline (see [Threading](#threading) for the argument), so the parser now only *decodes*: `setup_walk()` (`setup.c`) turns the 44-word edge record
+into the per-primitive constants (`r->pc`, as before) and a **walker record**, `struct prim_walk` (192 bytes: the start, step and middle-vertex switch of the three edges, the scissor, the interpolants at the first row with their per-row steps and the two adjustment terms,
+the interlace field). The record travels in the job (`mt.c`; the 16 MB span arena is gone, the job ring grew from 208 to 368 bytes per job). Each worker calls `walk_row()` (`src/walk.h`) for the rows of its stripes -- row `y` still belongs to worker `(y >> 2) % N` --
+into a local `struct span` and feeds the same batch builder as before; the inline path (`-t 0`, `Threads = -1`) does the same on the emulation thread. `walk_row` computes the four subscanlines in the four lanes of NEON vectors
+(positions `start + k * step` with the left edge taken from the lower-edge formula from the middle vertex on, the clipping and crossing tests lane-wise, horizontal min / max / flags), the interpolants as two vectors of four
+(`a0 + (j - j0) * step`, masked, adjusted by the sub-pixel position of the right edge), and returns early for an invalid row without touching the interpolants; `walk_row_c` is the same in portable C for the x86 / scalar build. All arithmetic
+is unsigned 32-bit, so a jump by multiplication equals the sequential additions modulo 2^32 for any coordinates, however extreme.
+What `prefetch_piece` and the batch builder expect from `struct span` is unchanged (`r g b a s t w z` are now also an array, `att[8]`, for the vector store).
+
+**Memory traffic** (per replay run of the dump = one frame; 96 B per span record, 192 B per primitive):
+
+| dump | primitives | scanlines (valid) | span records written by the parser, before | read by the workers, before | walker records, after (written once, read by each of the 3 workers) |
+|---|---:|---:|---:|---:|---:|
+| Paper Mario | 183 | 4523 (4314) | 424 KB | 404 KB | 34 KB |
+| Banjo-Kazooie | 156 | 6811 (6766) | 639 KB | 634 KB | 29 KB |
+| Donkey Kong 64 | 531 | 10382 (10242) | 973 KB | 960 KB | 100 KB |
+| Pokemon Snap | 1214 | 27075 (26606) | 2538 KB | 2494 KB | 228 KB |
+| Rocket Robot on Wheels | 870 | 10428 (9573) | 978 KB | 897 KB | 163 KB |
+| Super Mario 64 | 823 | 10364 (10088) | 972 KB | 946 KB | 154 KB |
+| Star Fox 64 | 475 | 3534 (3493) | 331 KB | 327 KB | 89 KB |
+| GoldenEye 007 | 172 | 5771 (5717) | 541 KB | 536 KB | 32 KB |
+
+The parser used to write every scanline of every primitive (plus a pass that cleared the `validline` of each row of the arena) and the workers read the valid ones from another core's cache; now each primitive is one record in the job, which the three workers read (3 x 192 B each),
+and the spans are made and consumed in the registers and L1 of the core that renders the row.
+
+**Exactness.** The walker is not exercised against a reference by the replay-based checks (`neoncheck.py`, `mtfuzz.py` and `foir-kfuzz` compare the NEON or threaded renderer with the scalar one, and both sides use the same walker; the mutations below pass them), so the walker has its own test:
+`foir-walkfuzz` ([Tests](#tests)) compares `walk_row` / `walk_row_c` with the sequential walker of commit c73eb8e, kept verbatim in `tools/walk_ref.inc`, over random primitives: `make check` runs 40,000, and 1,000,000 (seed 7) were run on x86_64 and on aarch64 (qemu): 543,842 visible
+primitives, 156,777,712 scanlines compared (60,795,882 valid, 30.7 M with a wrapped edge product, 54.4 M with a wrapped interpolant product, 74,766 with the left-edge switch inside the row, 8.7 M on a scissored interlace field) by both walkers, **0 differences**.
+Also, all at 0 differences: `make check` (`neoncheck.py` 27 scenes, `mtfuzz.py` 60 + 40 + 40 scenes, `foir-kfuzz` including `-m 64` and `-S`); `make all replay ref NEON=0 && python3 tools/regress.py` (15 of 15 scenes, 0 differing pixels);
+`FOIR_NEON_VERIFY=1` on the 13 dumps at 0 and 3 workers (26 runs, 538,438 batches, 0 mismatching); the final RDRAM of every dump from the x86_64 scalar build and from the aarch64 build, inline and with 3 workers (26 comparisons: 0 differ);
+the final RDRAM of the aarch64 build against a build of the previous commit (26 comparisons: 0 differ); ASan / UBSan on `foir-walkfuzz` and the replay with 3 workers, and ThreadSanitizer on the replay with 3 workers on four dumps: no reports.
+
+**Mutations** (a deliberately wrong walker is built in a copy of the tree, in both the NEON and the portable version; the tests are run on it):
+
+| mutation | `foir-walkfuzz` (first failing primitive) | `regress.py` (scenes with 0 differing pixels) | RDRAM vs previous commit (26 runs) | `neoncheck.py`, `mtfuzz.py`, `kfuzz -m 64` |
+|---|---|---|---|---|
+| edge positions jump one subscanline too far (`k0 - ycur + 1`) | fails, primitive 5 | 6 of 15 | 20 differ | 0 differences |
+| interpolants jump one row too far (`j - j0 + 1`) | fails, primitive 5 | 4 of 15 | 26 differ | 0 differences |
+| left edge switches to `xl` one subscanline late (`k == ym + 1`) | fails, primitive 39 | 12 of 15 | 14 differ | 0 differences |
+| `ym == ycur` does not count as "switch inside the walk" (`ym > ycur`) | fails, primitive 57 | 13 of 15 | 18 differ | 0 differences |
+
+**Timing, offline replay** (`foir-replay --fast`, rgdsplus, `performance` governor restored to `schedutil`, build of `devel` HEAD c73eb8e vs this tree, run alternately with the order rotated every round, 6 rounds, median (min-max); one session; `-n 10..100` repeats per run;
+the rows of the `-t 3` table are the emulation thread's time in the replay: its own work -- parse, setup, queueing -- and the wait for the workers at `SYNC_FULL`, which in a replay also holds all the pixel work the workers have not yet finished, so the sum is the frame time):
+
+**One thread (`-t 0`)**, ms per run, median (min-max):
+
+| dump | old | new | new vs old |
+|---|---:|---:|---:|
+| Paper Mario (900) | 12.00 (11.95-12.13) | 11.89 (11.85-11.97) | -0.9 % |
+| Banjo-Kazooie (450) | 35.28 (35.16-35.63) | 35.79 (35.60-35.97) | +1.5 % |
+| Donkey Kong 64 (800) | 15.75 (15.69-15.79) | 14.89 (14.83-14.95) | -5.4 % |
+| Pokemon Snap (300) | 72.52 (72.02-72.67) | 71.56 (70.64-71.71) | -1.3 % |
+| Rocket Robot on Wheels (1500) | 26.96 (26.87-27.39) | 26.59 (26.33-26.75) | -1.3 % |
+| Super Mario 64 (650) | 19.40 (19.29-19.52) | 18.82 (18.72-18.90) | -3.0 % |
+| Star Fox 64 (1000) | 18.15 (17.99-18.18) | 17.95 (17.89-18.10) | -1.1 % |
+| GoldenEye 007 (900) | 6.05 (6.01-6.15) | 5.61 (5.57-5.64) | -7.4 % |
+| **geometric mean of the ratios** | | | **0.976** |
+
+**Three workers (`-t 3`)**, ms per run, median (min-max); the emulation thread's own work and its wait at `SYNC_FULL`, ms (change of the own work in brackets):
+
+| dump | old | new | new vs old | emulation thread own work old -> new | wait at SYNC_FULL old -> new |
+|---|---:|---:|---:|---:|---:|
+| Paper Mario (900) | 4.81 (4.66-5.01) | 4.69 (4.54-5.19) | -2.6 % | 1.80 -> 0.80 (-55 %) | 3.00 -> 3.88 |
+| Banjo-Kazooie (450) | 11.99 (11.86-12.75) | 12.50 (12.15-13.17) | +4.3 % | 2.34 -> 0.90 (-62 %) | 9.66 -> 11.61 |
+| Donkey Kong 64 (800) | 6.69 (6.16-6.77) | 6.33 (6.18-6.87) | -5.5 % | 3.38 -> 1.26 (-63 %) | 3.26 -> 5.06 |
+| Pokemon Snap (300) | 26.50 (25.16-26.89) | 25.55 (25.03-27.38) | -3.6 % | 8.70 -> 2.61 (-70 %) | 17.79 -> 22.95 |
+| Rocket Robot on Wheels (1500) | 10.59 (10.12-10.82) | 10.26 (10.12-10.88) | -3.1 % | 4.60 -> 2.32 (-50 %) | 5.96 -> 7.95 |
+| Super Mario 64 (650) | 7.37 (6.94-7.98) | 7.15 (6.96-7.78) | -2.9 % | 3.58 -> 1.36 (-62 %) | 3.77 -> 5.80 |
+| Star Fox 64 (1000) | 7.32 (7.14-7.53) | 7.21 (7.09-7.89) | -1.5 % | 1.86 -> 1.10 (-41 %) | 5.47 -> 6.12 |
+| GoldenEye 007 (900) | 2.67 (2.50-2.78) | 2.45 (2.41-2.61) | -8.1 % | 1.60 -> 0.42 (-74 %) | 1.07 -> 2.04 |
+| **geometric mean of the ratios** | | | **0.971** | **0.392** | |
+
+The sequential walk cost 173-175 ns a row (~275 cycles; `--setup-only`, old minus new, Paper Mario, Donkey Kong 64 and Snap alike); `walk_row` costs 41-113 ns a row on the real primitives (median 80 ns, ~125 cycles; measured by calling it twice per row
+and taking the difference of the one-thread replay times, 4 rounds), and it no longer writes or reads a 96-byte record per row. At one thread that is -2.4 % overall (-5.4 % Donkey Kong 64, -7.4 % GoldenEye, +1.5 % Banjo-Kazooie, the one dump that gets slower). With three workers
+the emulation thread's own work falls by 61 % (a replay has nothing else to overlap with, so the wait at `SYNC_FULL` absorbs what the parser no longer does: the workers set the frame time, which is -2.9 % within the noise of that configuration, +-3 %).
+
+**Timing, in game** (rgdsplus, rsp-hle with parallel-rsp as RspFallback, rsp-timing, `FOIR_THREADS=3`, default knobs, scripted input, 75 s runs, VI frames 1440 on, the method of the batch-builder sweep; 3 runs of each build in alternating order, in sessions of three runs;
+median (min-max) over the runs; "RDP" is the emulation thread's time in the RDP per frame -- parse + setup + the wait at `SYNC_FULL`; CPU is the whole process, workers' idle spin included):
+
+| game | RDP ms/frame, emulation thread (parse + setup + wait) old -> new | of which own work old -> new | wait at SYNC_FULL old -> new | process CPU ms/frame old -> new | fps old -> new |
+|---|---|---|---|---|---|
+| Banjo-Kazooie | 3.36 (3.33-3.36) -> **2.64 (2.63-2.66)** (-21 %) | 2.67 (2.67-2.68) -> 1.58 (1.56-1.58) (-41 %) | 0.68 (0.65-0.69) -> 1.06 (1.05-1.10) | 34.37 (34.35-34.37) -> **31.34 (31.26-31.37)** (-8.8 %) | 59.3 (59.3-59.3) -> 59.5 (59.5-59.5) |
+| Donkey Kong 64 | 5.28 (5.26-5.36) -> **4.30 (4.29-4.34)** (-18 %) | 3.02 (3.00-3.04) -> 1.34 (1.34-1.35) (-55 %) | 2.27 (2.24-2.32) -> 2.96 (2.94-3.00) | 40.60 (40.59-40.93) -> **36.00 (35.98-36.02)** (-11.3 %) | 59.3 (59.2-59.3) -> 59.8 (59.8-59.8) |
+| Mario Kart 64 | 2.23 (2.21-2.25) -> **1.63 (1.63-1.65)** (-27 %) | 2.13 (2.12-2.13) -> 1.49 (1.49-1.52) (-30 %) | 0.11 (0.08-0.12) -> 0.13 (0.13-0.14) | 26.01 (26.01-26.09) -> **23.70 (23.57-23.77)** (-8.9 %) | 59.0 (59.0-59.0) -> 59.0 (59.0-59.0) |
+| Paper Mario | 3.06 (2.97-3.07) -> **2.42 (2.36-2.52)** (-21 %) | 2.38 (2.37-2.40) -> 0.98 (0.96-0.99) (-59 %) | 0.67 (0.60-0.68) -> 1.44 (1.39-1.54) | 25.17 (25.02-25.17) -> **22.58 (22.44-22.84)** (-10.3 %) | 59.9 (59.9-59.9) -> 60.0 (59.9-60.0) |
+| Pokemon Snap | 2.17 (2.16-2.19) -> **2.19 (2.19-2.20)** (+1 %) | 0.50 (0.49-0.50) -> 0.35 (0.33-0.35) (-31 %) | 1.68 (1.66-1.69) -> 1.85 (1.85-1.86) | 11.80 (11.79-11.80) -> **11.97 (11.91-11.97)** (+1.4 %) | 60.0 (60.0-60.0) -> 60.0 (60.0-60.0) |
+| Star Fox 64 | 1.60 (1.58-1.64) -> **1.22 (1.17-1.23)** (-24 %) | 1.17 (1.17-1.17) -> 0.67 (0.67-0.68) (-42 %) | 0.43 (0.42-0.47) -> 0.55 (0.50-0.55) | 20.46 (20.42-20.66) -> **19.22 (19.06-19.23)** (-6.1 %) | 59.8 (59.7-59.8) -> 59.8 (59.8-59.8) |
+| Super Mario 64 | 2.11 (2.08-2.13) -> **1.62 (1.61-1.70)** (-23 %) | 1.50 (1.50-1.52) -> 0.59 (0.59-0.60) (-60 %) | 0.61 (0.58-0.61) -> 1.03 (1.01-1.10) | 23.94 (23.88-24.12) -> **21.86 (21.62-22.00)** (-8.7 %) | 59.9 (59.9-59.9) -> 59.9 (59.9-59.9) |
+| Toy Story 2 | 1.96 (1.95-1.98) -> **1.98 (1.97-2.02)** (+1 %) | 1.17 (1.17-1.18) -> 1.01 (1.01-1.03) (-14 %) | 0.79 (0.78-0.80) -> 0.96 (0.96-0.99) | 12.86 (12.83-12.87) -> **12.82 (12.81-12.86)** (-0.3 %) | 58.6 (58.5-58.6) -> 58.6 (58.6-58.6) |
+| Zelda: Ocarina of Time | 1.84 (1.83-1.87) -> **1.36 (1.34-1.38)** (-26 %) | 1.43 (1.23-1.43) -> 0.78 (0.78-0.78) (-45 %) | 0.41 (0.40-0.64) -> 0.58 (0.56-0.60) | 17.89 (15.86-17.90) -> **16.01 (15.98-16.05)** (-10.5 %) | 59.9 (59.7-59.9) -> 60.0 (59.9-60.0) |
+| **geometric mean of the new / old medians** | **0.817** | 0.562 | | **0.929** | |
+
+* The emulation thread's RDP time falls by 18-27 % in seven of the nine games (geometric mean of the medians of all nine **-18 %**), its own work (parse + setup + queueing) by 30-60 % (**-44 %** over the nine), and the process CPU time per frame by 6-11 % in the same seven games
+  (**-7 %** over the nine). The CPU saving is larger than the emulation thread's (1.3-4.6 ms against 0.5-1.0 ms a frame): the other threads' CPU time falls by 1.5-3.5 ms a frame too, with the walk now on them -- most likely the stalls on span records written by another core
+  (and the idle spin that follows the faster job hand-over). All nine games run at the frame-rate cap (59-60 fps, Toy Story 2 58.6); what changes is the headroom: Donkey Kong 64 goes from 5 slow 120-frame windows of 24 to 1 of 25 (59.3 -> 59.8 fps), Banjo-Kazooie 59.3 -> 59.5 fps.
+* The wait at `SYNC_FULL` grows by about what the own work shrinks wherever the workers are what the emulation thread waits for at the end of the frame: Pokemon Snap (RDP-bound; RDP 2.17 -> 2.19 ms, process CPU 11.80 -> 11.97 ms, +1.4 %) and Toy Story 2 (1.96 -> 1.98 ms, CPU -0.3 %) do not gain
+  on the emulation thread, because the frame ends when the workers have rendered it, and the workers now also walk. In the other games the wait is mostly the RSP finishing, not the RDP, and the emulation thread gets the time back.
+* Zelda old run 1 is the scripted run that took a different path (cpu 15.9 against 17.9 ms in the other two, the same outlier as in the batch-builder sweep); medians are used.
+
+**Tried and left out** (all with the same replay method, 3-4 rounds, geometric mean of the new / old ratios of the eight dumps; the in-game numbers are only for the version that is in the tree):
+
+| variant | replay `-t 0` | replay `-t 3` | why not |
+|---|---:|---:|---|
+| `walk_row_c` (the portable C walker, inline in the row loop) on aarch64 | +1.2 % / +0.9 % (two sessions) | +2.0 % / +1.8 % | jumping by multiplication in scalar code costs 190-320 ns a row on the A55 (the sequential walker, which adds, is 175; in-order core, four dependent chains per row), so the vector version is the one kept; the portable version stays for x86 / the scalar build |
+| the same, gathering the rows of 16 into a worker-local span array first (`noinline` gather function; nothing is written for other cores, but the 96-byte rows go through L1) | +3.8 % | +3.4 % | the extra copy costs more than the registers it frees |
+| NEON walker + the gather of 16 | -1.0 % | +2.0 % | -2.3 % for the inline version in the same session |
+| **NEON walker inline in the row loop (kept)** | **-2.3 % / -2.4 %** (two sessions) | +0.6 % / -2.9 % | |
+| decode of the 44-word record on the workers instead of on the parser (job = the 176-byte record + scissor) | not built | not built | upper bound measured: skipping the whole decode (`setup_walk`) in `--setup-only` saves 0.04-0.22 ms per dump (Paper Mario 0.04, Donkey Kong 64 0.08, Star Fox 64 0.11, Super Mario 64 0.14, Rocket 0.17, Snap 0.22 ms), i.e. at most 2-8 % of the emulation thread's remaining RDP time, in exchange for decoding every primitive three times; not worth the second copy of the state the decode reads (scissor, cycle type, interlace field, seed) |
+
 ### In-game frame rate
 
 | game (VI frames ending at) | M2 scalar | NEON | NEON + 1 worker | NEON + 2 | NEON + 3 |
@@ -1181,9 +1309,10 @@ performance-neutral (foir-replay 1-2.5% faster single-threaded, 2-5% slower with
 src/plugin.c          Mupen64Plus exports, [Video-Foir] config, frame skipping, UpdateScreen/ReadScreen2, the suxty interface
 src/foir_suxty.h      the suxty interface table (ABI 1), shared with mupen64plus-input-suxty
 src/parser.c          DP command list reader, command dispatch, state-setting commands, derived pipeline flags
-src/setup.c           primitive setup: triangle / texrect / fillrect -> edge walker -> span records
-src/raster.c          span -> pixel-batch builder (NEON: fixed-size ramps, edge-zone coverage; portable reference builder), worker row ownership
-src/mt.c              worker pool: job ring, state / TMEM snapshots, hazards and barriers
+src/setup.c           primitive setup: triangle / texrect / fillrect -> canonical 44-word record -> per-primitive constants + walker record (setup_walk)
+src/walk.h            the edge walker for one row from the walker record (walk_row: NEON, walk_row_c: portable)
+src/raster.c          row loop (walk_row per owned row) and span -> pixel-batch builder (NEON: fixed-size ramps, edge-zone coverage; portable reference builder), worker row ownership
+src/mt.c              worker pool: job ring (walker record + constants), state / TMEM snapshots, hazards and barriers
 src/tmem.c            TMEM model, LOAD_TILE/BLOCK/TLUT (word-wise fast path), texel readback
 src/kernels_scalar.c  scalar reference kernels (combiner, Z, blender, FB store, FILL, COPY)
 src/kernels_tex.c     scalar texture kernel (perspective, LOD, filtering, TLUT, YUV)
@@ -1202,7 +1331,7 @@ src/vi.c              VI: crop the active framebuffer to one RGBA texture (NEON)
 src/gl_out.c          draws that texture through the core's VidExt (GLES2, no link-time GL)
 src/capture.c         optional frame capture for offline replay (FOIR_DUMP=prefix)
 src/stats.c           debug statistics (-DFOIR_STATS): pixels per pipeline state and per stage key
-tools/                foir-replay (offline renderer), kfuzz, ref-angrylion, neoncheck.py, mtfuzz.py, regress.py,
+tools/                foir-replay (offline renderer), kfuzz, walkfuzz (+ walk_ref.inc, the sequential walker it checks against), ref-angrylion, neoncheck.py, mtfuzz.py, regress.py,
                       compare.py, vitest.py, rdpgen.py, specstats.py / specmatrix.py (variant lists), shapegen.py (shape kernel list)
 test-data/dumps/      captured frames of real games (xz-compressed .fdump)
 test-output/          reference images (synthetic scenes, rig screenshots, M2 screenshots)
@@ -1215,7 +1344,7 @@ All of these run on x86_64; the NEON ones also under `qemu-aarch64-static` or na
 ```sh
 cd projects/unix
 make check CROSS_COMPILE=aarch64-linux-gnu- HOST_CPU=aarch64 \
-           RUNNER="qemu-aarch64-static -L /usr/aarch64-linux-gnu"      # neoncheck.py + mtfuzz.py + kfuzz (+ kfuzz -m 32: COPY kernel, kfuzz -S: every variant, any-format and shape kernel)
+           RUNNER="qemu-aarch64-static -L /usr/aarch64-linux-gnu"      # walkfuzz + neoncheck.py + mtfuzz.py + kfuzz (+ kfuzz -m 32: COPY kernel, kfuzz -S: every variant, any-format and shape kernel)
 python3 ../../tools/neoncheck.py                                       # on a device / x86 host (native)
 python3 ../../tools/regress.py ../../test-output/synthetic            # scalar vs angrylion, 15 synthetic scenes
 python3 ../../tools/vitest.py ./foir-replay                           # interlace hack
@@ -1229,6 +1358,13 @@ python3 ../../tools/vitest.py ./foir-replay                           # interlac
   images must be byte-identical. It also prints the share of the pixels that ran in specialised variants per scene.
 * `foir-kfuzz -m 64` checks the batch builder (`raster.c`) against its portable reference, which the replay-based checks cannot do (they replace the kernels, not the builder); see
   [the results](#batch-builder-edge-zone-coverage-and-fixed-size-ramps). The aarch64-vs-x86 cross check is a plain `foir-replay -o` of each dump from the `NEON=0` x86_64 build and the aarch64 build, compared with `cmp`.
+* `foir-walkfuzz` (any architecture; `make check` runs 40,000 primitives) checks the per-row edge walker (`walk_row`, `src/walk.h`) against the sequential walker of the
+  previous design: `tools/walk_ref.inc` is `walk_edges()` as it was at commit c73eb8e (every subscanline from the top vertex, repeated additions, one `struct span` per
+  row), kept verbatim as the oracle. Random primitives -- ordinary triangles and rectangles, vertices anywhere in the 14-bit range (up to 12,000 subscanlines of
+  walking before the first visible row), full-range 28-bit edge positions and 30-bit slopes and 32-bit interpolant values, so that the products wrap around many times, fully
+  random records, random scissors (also the reset one), interlace fields and cycle types -- go through both; compared are the visibility, the first and last row, the
+  per-primitive constants (`r->pc`) and, for every row, the validity and every field of the span; the rows are computed in ascending and in shuffled order, and in the aarch64
+  build by both the NEON and the portable walker. Mutations of the row jump and of the middle-vertex switch are caught within the first 60 primitives (see [the results](#edge-walker-on-the-workers-walk_row)).
 * `foir-kfuzz` (aarch64 only) draws random render states through the real command parser, random TMEM /
   framebuffer / Z contents and random pixel batches and requires every NEON stage to equal the scalar stage;
   the store stage is checked on the resulting RDRAM including the hidden bits. **`foir-kfuzz -S` fuzzes the specialised

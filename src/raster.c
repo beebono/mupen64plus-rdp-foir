@@ -18,6 +18,7 @@
 #include "rdp.h"
 #include "mt.h"
 #include "spec.h"
+#include "walk.h"
 #if defined(FOIR_NEON)
 #include <arm_neon.h>
 #endif
@@ -559,7 +560,9 @@ static void prim_prepare(struct rdp *r)
     pc->dwinc = f ? pc->dw : -pc->dw; pc->dzinc = f ? pc->dz : -pc->dz;
 }
 
-FOIR_INLINE void render_job(struct rdp *r, const struct span *rows, int jlo, int start, int end, int ref)
+/* Render the rows start..end of a job that this context owns. The spans come from the setup record `pw` (computed here, one
+ * row at a time, by walk_row) or, for the tests, from the ready-made array `rows` (pw == NULL). */
+FOIR_INLINE void render_job(struct rdp *r, const struct span *rows, int jlo, const struct prim_walk *pw, int start, int end, int ref)
 {
     const struct foir_kernels *k = r->k;
     struct px_batch *b = &r->batch;
@@ -567,13 +570,18 @@ FOIR_INLINE void render_job(struct rdp *r, const struct span *rows, int jlo, int
     (void)ref;
     int nw = r->nworkers > 1 ? r->nworkers : 1;
     int wid = r->worker_id;
+    struct span row;
+
+#define NEXT_ROW() \
+        if (nw > 1 && ((y >> FOIR_STRIPE_SHIFT) % nw) != wid) continue; \
+        const struct span *sp; \
+        if (pw) { if (!walk_row(pw, y, &row)) continue; sp = &row; } \
+        else { sp = &rows[y - jlo]; if (!sp->validline) continue; }
 
     if (ct == CYCLE_TYPE_FILL) {
         if (r->fb_size == PIXEL_SIZE_4BIT) return;
         for (int y = start; y <= end; y++) {
-            if (nw > 1 && ((y >> FOIR_STRIPE_SHIFT) % nw) != wid) continue;
-            const struct span *sp = &rows[y - jlo];
-            if (!sp->validline) continue;
+            NEXT_ROW();
             int x0 = sp->lx < sp->rx ? sp->lx : sp->rx;
             int x1 = sp->lx < sp->rx ? sp->rx : sp->lx;
             if (x1 >= r->fb_width) x1 = r->fb_width - 1;   /* no wrap into the next row (owned by another worker) */
@@ -586,9 +594,7 @@ FOIR_INLINE void render_job(struct rdp *r, const struct span *rows, int jlo, int
     if (ct == CYCLE_TYPE_COPY) {
         if (r->fb_size == PIXEL_SIZE_32BIT) return;
         for (int y = start; y <= end; y++) {
-            if (nw > 1 && ((y >> FOIR_STRIPE_SHIFT) % nw) != wid) continue;
-            const struct span *sp = &rows[y - jlo];
-            if (!sp->validline) continue;
+            NEXT_ROW();
             k->copy(r, y, sp, r->pc.flip);
             r->stat_pixels += (uint32_t)(sp->lx < sp->rx ? sp->rx - sp->lx : sp->lx - sp->rx) + 1;
         }
@@ -603,9 +609,7 @@ FOIR_INLINE void render_job(struct rdp *r, const struct span *rows, int jlo, int
     span_vec_init(&sv, &r->pc);
 #endif
     for (int y = start; y <= end; y++) {
-        if (nw > 1 && ((y >> FOIR_STRIPE_SHIFT) % nw) != wid) continue;
-        const struct span *sp = &rows[y - jlo];
-        if (!sp->validline) continue;
+        NEXT_ROW();
 #if defined(FOIR_NEON)
         if (ref) render_span_ref(r, y, sp);
         else render_span_cycle(r, y, sp, &sv);
@@ -613,29 +617,35 @@ FOIR_INLINE void render_job(struct rdp *r, const struct span *rows, int jlo, int
         render_span_ref(r, y, sp);
 #endif
     }
+#undef NEXT_ROW
     batch_flush(r, b);
+}
+
+void raster_render_walk(struct rdp *r, const struct prim_walk *pw, int start, int end)
+{
+    render_job(r, NULL, 0, pw, start, end, 0);
 }
 
 void raster_render_job(struct rdp *r, const struct span *rows, int jlo, int start, int end)
 {
-    render_job(r, rows, jlo, start, end, 0);
+    render_job(r, rows, jlo, NULL, start, end, 0);
 }
 
 /* the same with the portable span builder (tools/kfuzz.c compares the two) */
 void raster_render_job_ref(struct rdp *r, const struct span *rows, int jlo, int start, int end)
 {
-    render_job(r, rows, jlo, start, end, 1);
+    render_job(r, rows, jlo, NULL, start, end, 1);
 }
 
-void raster_draw(struct rdp *r, struct span *rows, int jlo, int start, int end)
+void raster_draw(struct rdp *r, const struct prim_walk *pw, int start, int end)
 {
     if (r->cfg.debug_nopixels || r->skip_pixels) return;
     prim_prepare(r);
     if (r->mt) {
-        mt_submit(r, rows, jlo, start, end);
+        mt_submit(r, pw, start, end);
         return;
     }
     r->nworkers = 1;
     r->worker_id = 0;
-    raster_render_job(r, rows, jlo, start, end);
+    raster_render_walk(r, pw, start, end);
 }

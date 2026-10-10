@@ -169,13 +169,15 @@ CORE_OBJECTS := $(patsubst $(SRCDIR)/%.c, $(OBJDIR)/%.o, $(CORE_SOURCE))
 PLUGIN_OBJECTS := $(patsubst $(SRCDIR)/%.c, $(OBJDIR)/%.o, $(PLUGIN_SOURCE))
 REPLAY_OBJECTS := $(OBJDIR)/tools/replay.o
 FUZZ_OBJECTS := $(OBJDIR)/tools/kfuzz.o
-OBJECTS := $(CORE_OBJECTS) $(PLUGIN_OBJECTS) $(REPLAY_OBJECTS) $(FUZZ_OBJECTS)
+WALKFUZZ_OBJECTS := $(OBJDIR)/tools/walkfuzz.o
+OBJECTS := $(CORE_OBJECTS) $(PLUGIN_OBJECTS) $(REPLAY_OBJECTS) $(FUZZ_OBJECTS) $(WALKFUZZ_OBJECTS)
 OBJDIRS = $(dir $(OBJECTS))
 $(shell $(MKDIR) $(OBJDIRS) $(OUTDIR))
 
 TARGET = $(OUTDIR)mupen64plus-rdp-foir$(POSTFIX).$(SO_EXTENSION)
 REPLAY = $(OUTDIR)foir-replay
 KFUZZ = $(OUTDIR)foir-kfuzz
+WALKFUZZ = $(OUTDIR)foir-walkfuzz
 
 targets:
 	@echo "mupen64plus-rdp-foir makefile. "
@@ -184,6 +186,7 @@ targets:
 	@echo "    replay        == Build the offline replay tool ($(REPLAY))"
 	@echo "    check         == Run the bit-exactness checks (neoncheck.py, mtfuzz.py, kfuzz incl. the COPY kernel, the batch builder, every specialised variant, texture any-format kernel and combiner shape kernel)"
 	@echo "    fuzz          == Build the NEON-vs-scalar kernel fuzzer ($(KFUZZ), needs an aarch64 build)"
+	@echo "    walkfuzz      == Build the per-row edge walker test ($(WALKFUZZ))"
 	@echo "    clean         == remove object files"
 	@echo "    rebuild       == clean and re-build all"
 	@echo "    install       == Install the plugin"
@@ -209,11 +212,14 @@ replay: $(REPLAY)
 
 fuzz: $(KFUZZ)
 
+walkfuzz: $(WALKFUZZ)
+
 # bit-exactness of the optimised paths against the scalar reference (see tools/neoncheck.py, tools/mtfuzz.py and the
 # kernel fuzzer tools/kfuzz.c, whose -S mode walks through every specialised variant);
 # cross builds: make check CROSS_COMPILE=aarch64-linux-gnu- HOST_CPU=aarch64 RUNNER="qemu-aarch64-static -L /usr/aarch64-linux-gnu"
 RUNNER ?=
-check: replay $(if $(filter AARCH,$(CPU)),fuzz)
+check: replay walkfuzz $(if $(filter AARCH,$(CPU)),fuzz)
+	$(RUNNER) ./$(WALKFUZZ) -n 40000
 	python3 $(TOOLDIR)/neoncheck.py --replay ./$(REPLAY) --runner "$(RUNNER)"
 	python3 $(TOOLDIR)/mtfuzz.py -n 60 --replay ./$(REPLAY) --runner "$(RUNNER)"
 ifeq ("$(CPU)","AARCH")
@@ -235,7 +241,7 @@ uninstall:
 	$(RM) "$(DESTDIR)$(PLUGINDIR)/$(notdir $(TARGET))"
 
 clean:
-	$(RM) -r _obj* _out_* mupen64plus-rdp-foir*.so foir-replay foir-kfuzz ref-angrylion
+	$(RM) -r _obj* _out_* mupen64plus-rdp-foir*.so foir-replay foir-kfuzz foir-walkfuzz ref-angrylion
 
 rebuild: clean all
 
@@ -251,6 +257,7 @@ ref-angrylion: $(TOOLDIR)/ref_angrylion.c $(ANGRYDIR)/n64video.c $(ANGRYDIR)/par
 	@$(CROSS_COMPILE)g++ $(OBJDIR)/ref_angrylion.o $(OBJDIR)/angry_n64video.o $(OBJDIR)/angry_parallel.o -lpthread -o ref-angrylion
 
 CFLAGS += -MD -MP
+$(OBJDIR)/tools/walkfuzz.o: $(TOOLDIR)/walk_ref.inc
 -include $(OBJECTS:.o=.d)
 
 $(OBJDIR)/%.o: $(SRCDIR)/%.c
@@ -265,8 +272,11 @@ $(TARGET): $(CORE_OBJECTS) $(PLUGIN_OBJECTS)
 $(KFUZZ): $(CORE_OBJECTS) $(FUZZ_OBJECTS)
 	$(Q_LD)$(CC) $(CFLAGS) $^ -lm -lpthread -o $@
 
+$(WALKFUZZ): $(CORE_OBJECTS) $(WALKFUZZ_OBJECTS)
+	$(Q_LD)$(CC) $(CFLAGS) $^ -lm -lpthread -o $@
+
 # the replay tool is a plain executable: no export map, no -shared, no core dependency
 $(REPLAY): $(CORE_OBJECTS) $(REPLAY_OBJECTS)
 	$(Q_LD)$(CC) $(CFLAGS) $^ -lm -lpthread -o $@
 
-.PHONY: all replay fuzz check ref clean install uninstall targets rebuild
+.PHONY: all replay fuzz walkfuzz check ref clean install uninstall targets rebuild

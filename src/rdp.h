@@ -136,14 +136,40 @@ struct combiner {
     int raw[16];           /* raw set_combine fields, for debugging */
 };
 
-/* one scanline of edge-walker output */
+/* one scanline of edge-walker output (walk_row, walk.h) */
 struct span {
     int lx, rx, unscrx, validline;
-    int32_t r, g, b, a, s, t, w, z;
+    union {
+        struct { int32_t r, g, b, a, s, t, w, z; };
+        int32_t att[8];                  /* the same, in this order */
+    };
     int32_t majorx[4], minorx[4], invalyscan[4];
 };
 
-#define MAX_SPANS 1030
+/* The setup record of a primitive: everything the edge walker needs to produce the span of any one scanline, so
+ * that the rows can be computed by whichever thread renders them (setup.c fills it, walk.h consumes it).
+ *
+ * Scanline j covers the subscanlines k = 4j .. 4j+3. The edge positions of subscanline k are linear in k (wrapping
+ * 32-bit arithmetic, as in the sequential walker): xright = xr0 + (k - ycur) * xri; xleft = xm0 + (k - ycur) * xmi
+ * below the middle vertex (k < ysw) and xl0 + (k - ysw) * xli from there on. The interpolants of scanline j are
+ * a0 + (j - ycur / 4) * de. All arrays are in the order r g b a s t w z. */
+#define ALIGN16 __attribute__((aligned(16)))
+
+struct prim_walk {
+    int32_t ycur;                  /* first subscanline of the sequential walk (multiple of 4) */
+    int32_t ysw;                   /* subscanline at which the left edge switches to xl (INT32_MAX: never) */
+    int32_t yhlimit, yllimit;      /* clipped top / bottom subscanlines (rows outside are invalid) */
+    int32_t clipxl2, clipxh2;      /* scissor, in the walker's x units (<< 1) */
+    uint32_t xr0, xri;             /* right (major, xh) edge */
+    uint32_t xm0, xmi;             /* left edge above the middle vertex */
+    uint32_t xl0, xli;             /* left edge from the middle vertex on */
+    int32_t flip, ldflag;          /* ldflag: subscanline (0 or 3) whose x position adjusts the interpolants */
+    int32_t scfield, sckeepodd;    /* interlace field selection (valid rows) */
+    ALIGN16 uint32_t a0[8];        /* interpolants at row ycur / 4 */
+    ALIGN16 uint32_t de[8];        /* per-row step */
+    ALIGN16 uint32_t diff[8];      /* adjustment added to the masked interpolants */
+    ALIGN16 uint32_t dxh[8];       /* per-fraction x correction */
+};
 
 /* Pixels per batch handed to the kernels. A batch collects pixels of one
  * primitive, possibly from several consecutive scanlines. */
@@ -157,8 +183,6 @@ struct span {
 enum { CH_R = 0, CH_G = 1, CH_B = 2, CH_A = 3 };
 
 /* Per-primitive interpolation constants (valid while a primitive is drawn) */
-#define ALIGN16 __attribute__((aligned(16)))
-
 struct prim_ctx {
     int flip;
     int tilenum;
@@ -319,7 +343,6 @@ struct rdp {
 
     /* --- primitive / span state --- */
     struct prim_ctx pc;
-    struct span *span_scratch;     /* MAX_SPANS rows, used when rendering inline */
     uint8_t cvgbuf[1024 + 32];
 
     /* --- misc --- */
@@ -375,20 +398,24 @@ void rdp_run_command(struct rdp *r, const uint32_t *cmd); /* execute one decoded
 uint32_t rdp_command_words(uint32_t first_word);    /* length in 32-bit words of a command */
 void rdp_update_derived(struct rdp *r);
 
-/* setup.c: primitive decode + edge walker. Calls raster_draw(). */
+/* setup.c: primitive decode. Fills r->pc and the walker record, then calls raster_draw(). */
 void setup_triangle(struct rdp *r, const uint32_t *cmd);
 void setup_texrect(struct rdp *r, const uint32_t *cmd, bool flip);
 void setup_fillrect(struct rdp *r, const uint32_t *cmd);
+/* Decode the canonical 44-word edge record `ew` (words 0-7 edges, 8-23 shade, 24-39 texture, 40-43 depth): sets
+ * r->pc and *pw; false when no scanline is visible. Otherwise rows start..end (inclusive, <= 1023) are the ones to render. */
+bool setup_walk(struct rdp *r, const int32_t *ew, struct prim_walk *pw, int *start, int *end);
 
 /* stats.c (debug statistics, -DFOIR_STATS) */
 void foir_stats_batch(const struct rdp *r, int npix);
 void foir_stats_flush(void);   /* write the statistics to $FOIR_STATE_STATS_FILE (if set) */
 
 /* raster.c */
-/* Draw the scanlines start..end of the current primitive (r->pc). `rows[y - jlo]` is the span of
- * scanline y. Ownership of rows[] passes to the renderer for the duration of the call. */
-void raster_draw(struct rdp *r, struct span *rows, int jlo, int start, int end);
-/* Render rows of a job on worker context w: rows y with (y / FOIR_STRIPE) % nworkers == worker_id. */
+/* Draw scanlines start..end of the primitive described by r->pc and *pw (rows are computed on the fly, walk.h). */
+void raster_draw(struct rdp *r, const struct prim_walk *pw, int start, int end);
+/* Render the rows of a job on context w: rows y with (y / FOIR_STRIPE) % nworkers == worker_id. */
+void raster_render_walk(struct rdp *w, const struct prim_walk *pw, int start, int end);
+/* The same from ready-made spans (`rows[y - jlo]`), tests only: kfuzz drives the batch builder with them. */
 void raster_render_job(struct rdp *w, const struct span *rows, int jlo, int start, int end);
 void raster_render_job_ref(struct rdp *w, const struct span *rows, int jlo, int start, int end);   /* portable span builder (tests) */
 void raster_init_tables(void);

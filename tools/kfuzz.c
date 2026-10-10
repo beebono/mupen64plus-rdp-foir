@@ -364,7 +364,6 @@ static int run_one(uint64_t seed, int mask, int verbose, long iter)
     rb.rdram = mem_b; rb.hidden = calloc(1, (RDRAM_BYTES >> 1) + 16);
     memcpy(mem_b, mem_a, RDRAM_BYTES);
     memcpy(rb.hidden, ra.hidden, (RDRAM_BYTES >> 1) + 16);
-    rb.span_scratch = NULL;
     rb.k = nk;
     ra.k = &foir_kernels_scalar;
     if (g_spec_mode) {
@@ -592,7 +591,6 @@ static int run_copy(uint64_t seed, int verbose)
     rb.rdram = mem_b; rb.hidden = calloc(1, (RDRAM_BYTES >> 1) + 16);
     memcpy(mem_b, mem_a, RDRAM_BYTES);
     memcpy(rb.hidden, ra.hidden, (RDRAM_BYTES >> 1) + 16);
-    rb.span_scratch = NULL;
     rb.k = nk;
 
     foir_kernels_scalar.copy(&ra, y, &sp, pc->flip);

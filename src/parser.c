@@ -415,7 +415,6 @@ void rdp_init(struct rdp *r, const struct foir_config *cfg)
     r->ktab = r->kbase;
     r->k = &r->ktab;
     r->spec_dirty = true;
-    r->span_scratch = (struct span *)calloc(MAX_SPANS, sizeof(struct span));
     for (int i = 0; i < 8; i++) tile_update_derived(&r->tile[i]);
     uint32_t zero[2] = { 0, 0 };
     cmd_set_other_modes(r, zero);
@@ -461,6 +460,4 @@ void rdp_destroy(struct rdp *r)
     if (r->mt) mt_stop(r);
     free(r->hidden);
     r->hidden = NULL;
-    free(r->span_scratch);
-    r->span_scratch = NULL;
 }

@@ -76,7 +76,7 @@ int main(int argc, char **argv)
 #ifdef FOIR_STAGETIME
     uint64_t st_tk[8] = { 0 }, st_n[8] = { 0 }, st_cpix[3] = { 0 };
 #endif
-    double t_total = 0, t_submit = 0;
+    double t_total = 0, t_submit = 0, t_wait = 0;
     uint32_t prims = 0, pixels = 0;
     for (int rep = 0; rep < repeats; rep++) {
         memcpy(rdram, snap, h.rdram_size);
@@ -97,6 +97,7 @@ int main(int argc, char **argv)
         double t1 = now_ms();
         t_total += t1 - t0;
         t_submit += t_sub - t0;
+        t_wait += r.sync_wait_ms;
         prims = r.stat_prims;
         pixels = rdp_pixels(&r);
 #ifdef FOIR_STAGETIME
@@ -156,9 +157,14 @@ int main(int argc, char **argv)
         fprintf(stderr, "\n");
     }
 #endif
-    if (repeats > 0 && threads > 0)
+    if (repeats > 0 && threads > 0) {
         fprintf(stderr, "foir-replay: parser thread %.3f ms/run until the last primitive was queued, %.3f ms waiting for workers (%d workers)\n",
                 t_submit / repeats, (t_total - t_submit) / repeats, threads);
+        /* the parser thread's time in the RDP, as the plugin logs it: its own work (parse, setup, queueing; includes waits for
+         * ring space and barriers) plus the wait at SYNC_FULL */
+        fprintf(stderr, "foir-replay: emulation thread %.3f ms/run: own work %.3f, waiting at SYNC_FULL %.3f\n",
+                t_submit / repeats, (t_submit - t_wait) / repeats, t_wait / repeats);
+    }
 
     if (out_rdram) {
         FILE *o = fopen(out_rdram, "wb");

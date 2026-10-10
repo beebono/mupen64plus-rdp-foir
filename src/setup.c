@@ -10,8 +10,8 @@
  * Copyright (C) 2026 foir contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
+#include <limits.h>
 #include "rdp.h"
-#include "mt.h"
 
 static int32_t normalize_dzpix(int32_t sum)
 {
@@ -23,9 +23,11 @@ static int32_t normalize_dzpix(int32_t sum)
     return 0;
 }
 
-/* Walk the edges. `ew` is the canonical 44-word record (see setup_*): words
- * 0-7 edges, 8-23 shade, 24-39 texture, 40-43 depth. */
-static void walk_edges(struct rdp *r, const int32_t *ew)
+/* Decode the canonical 44-word record `ew` (see setup_*): words 0-7 edges, 8-23 shade, 24-39 texture, 40-43 depth,
+ * into the per-primitive constants (r->pc) and the setup record of the edge walker (walk.h), which the threads that
+ * render the rows use to compute the spans (the sequential walk over all subscanlines that used to run here is
+ * tools/walk_ref.inc). Returns false when no scanline of the primitive is visible. */
+bool setup_walk(struct rdp *r, const int32_t *ew, struct prim_walk *pw, int *pstart, int *pend)
 {
     struct prim_ctx *pc = &r->pc;
     int xleft, xright, xleft_inc, xright_inc;
@@ -152,30 +154,8 @@ static void walk_edges(struct rdp *r, const int32_t *ew)
         dsdxh = dtdxh = dwdxh = drdxh = dgdxh = dbdxh = dadxh = dzdxh = 0;
     }
 
-    struct span *rows = NULL;
-    int jlo = 0;
-    int j;
-    int xfrac = 0;
-#define SP(jj) rows[(jj) - jlo]
-
-#define ADJUST_ATTR()                                                         \
-    do {                                                                      \
-        SP(j).s = ((ss & ~0x1ff) + dsdiff - (xfrac * dsdxh)) & ~0x3ff;     \
-        SP(j).t = ((tt & ~0x1ff) + dtdiff - (xfrac * dtdxh)) & ~0x3ff;     \
-        SP(j).w = ((ww & ~0x1ff) + dwdiff - (xfrac * dwdxh)) & ~0x3ff;     \
-        SP(j).r = ((rr & ~0x1ff) + drdiff - (xfrac * drdxh)) & ~0x3ff;     \
-        SP(j).g = ((gg & ~0x1ff) + dgdiff - (xfrac * dgdxh)) & ~0x3ff;     \
-        SP(j).b = ((bb & ~0x1ff) + dbdiff - (xfrac * dbdxh)) & ~0x3ff;     \
-        SP(j).a = ((aa & ~0x1ff) + dadiff - (xfrac * dadxh)) & ~0x3ff;     \
-        SP(j).z = ((zz & ~0x1ff) + dzdiff - (xfrac * dzdxh)) & ~0x3ff;     \
-    } while (0)
-
-    int32_t maxxmx = 0, minxmx = 0, maxxhx = 0, minxhx = 0;
-    int spix;
-    int ycur = yh & ~3;
-    int ldflag = (sign_dxhdy ^ flip) ? 0 : 3;
-    int invaly = 1;
-    int32_t xrsc, xlsc, stickybit;
+    const int ycur = yh & ~3;
+    const int ldflag = (sign_dxhdy ^ flip) ? 0 : 3;
     int32_t yllimit, yhlimit;
 
     if (yl & 0x2000) yllimit = 1;
@@ -183,125 +163,55 @@ static void walk_edges(struct rdp *r, const int32_t *ew)
     else yllimit = (yl & 0xfff) < r->clip.yl;
     yllimit = yllimit ? yl : r->clip.yl;
 
-    int ylfar = yllimit | 3;
-    bool ylclear = false;
-    if ((yl >> 2) > (ylfar >> 2))
-        ylfar += 4;
-    else if ((yllimit >> 2) >= 0 && (yllimit >> 2) < 1023)
-        ylclear = true;
-
     if (yh & 0x2000) yhlimit = 0;
     else if (yh & 0x1000) yhlimit = 1;
     else yhlimit = (yh >= r->clip.yh);
     yhlimit = yhlimit ? yh : r->clip.yh;
 
     /* scanlines this primitive can produce: yhlimit >> 2 .. (yllimit >> 2) + 1 */
-    jlo = yhlimit >> 2;
+    int jlo = yhlimit >> 2;
+    if (jlo < 0) jlo = 0;
+    if ((yllimit >> 2) + 1 < jlo || (yllimit >> 2) < 0) return false;      /* nothing visible */
+
+    /* the sequential walk resets the left edge to xl / dxldy when it reaches the subscanline ym (only if it starts above it) */
+    pw->ycur = ycur;
+    pw->ysw = ym >= ycur ? ym : INT32_MAX;
+    pw->yhlimit = yhlimit;
+    pw->yllimit = yllimit;
+    pw->clipxl2 = r->clip.xl << 1;
+    pw->clipxh2 = r->clip.xh << 1;
+    pw->xr0 = (uint32_t)xright;  pw->xri = (uint32_t)xright_inc;
+    pw->xm0 = (uint32_t)xleft;   pw->xmi = (uint32_t)xleft_inc;
+    pw->xl0 = (uint32_t)(xl & ~1); pw->xli = (uint32_t)((dxldy >> 2) & ~1);
+    pw->flip = flip;
+    pw->ldflag = ldflag;
+    pw->scfield = r->scfield;
+    pw->sckeepodd = r->sckeepodd;
     {
-        int jhi = (yllimit >> 2) + 1;
-        if (jlo < 0) jlo = 0;
-        if (jhi < jlo || (yllimit >> 2) < 0) return;      /* nothing visible */
-        int nrows = jhi - jlo + 1;
-        rows = r->mt ? mt_alloc_rows(r, nrows) : r->span_scratch;
-        for (int q = 0; q < nrows; q++) rows[q].validline = 0;
-        (void)ylclear;
+        const int32_t a0[8] = { rr, gg, bb, aa, ss, tt, ww, zz };
+        const int32_t de[8] = { drde, dgde, dbde, dade, dsde, dtde, dwde, dzde };
+        const int32_t df[8] = { drdiff, dgdiff, dbdiff, dadiff, dsdiff, dtdiff, dwdiff, dzdiff };
+        const int32_t dh[8] = { drdxh, dgdxh, dbdxh, dadxh, dsdxh, dtdxh, dwdxh, dzdxh };
+        for (int i = 0; i < 8; i++) {
+            pw->a0[i] = (uint32_t)a0[i]; pw->de[i] = (uint32_t)de[i];
+            pw->diff[i] = (uint32_t)df[i]; pw->dxh[i] = (uint32_t)dh[i];
+        }
     }
-
-    int yhclose = yhlimit & ~3;
-    int32_t clipxlshift = r->clip.xl << 1;
-    int32_t clipxhshift = r->clip.xh << 1;
-    int allover = 1, allunder = 1, curover, curunder;
-    int allinval = 1;
-    int32_t curcross;
-
-    xfrac = (xright >> 8) & 0xff;
-
-    for (int k = ycur; k <= ylfar; k++) {
-        if (k == ym) {
-            xleft = xl & ~1;
-            xleft_inc = (dxldy >> 2) & ~1;
-        }
-        spix = k & 3;
-
-        if (k >= yhclose) {
-            invaly = k < yhlimit || k >= yllimit;
-            j = k >> 2;
-
-            if (spix == 0) {
-                if (flip) { maxxmx = 0; minxhx = 0xfff; }
-                else      { maxxhx = 0; minxmx = 0xfff; }
-                allover = allunder = 1;
-                allinval = 1;
-            }
-
-            stickybit = ((xright >> 1) & 0x1fff) > 0;
-            xrsc = ((xright >> 13) & 0x1ffe) | stickybit;
-            curunder = ((xright & 0x8000000) || (xrsc < clipxhshift && !(xright & 0x4000000)));
-            xrsc = curunder ? clipxhshift : (((xright >> 13) & 0x3ffe) | stickybit);
-            curover = ((xrsc & 0x2000) || (xrsc & 0x1fff) >= clipxlshift);
-            xrsc = curover ? clipxlshift : xrsc;
-            SP(j).majorx[spix] = xrsc & 0x1fff;
-            allover &= curover;
-            allunder &= curunder;
-
-            stickybit = ((xleft >> 1) & 0x1fff) > 0;
-            xlsc = ((xleft >> 13) & 0x1ffe) | stickybit;
-            curunder = ((xleft & 0x8000000) || (xlsc < clipxhshift && !(xleft & 0x4000000)));
-            xlsc = curunder ? clipxhshift : (((xleft >> 13) & 0x3ffe) | stickybit);
-            curover = ((xlsc & 0x2000) || (xlsc & 0x1fff) >= clipxlshift);
-            xlsc = curover ? clipxlshift : xlsc;
-            SP(j).minorx[spix] = xlsc & 0x1fff;
-            allover &= curover;
-            allunder &= curunder;
-
-            if (flip)
-                curcross = ((xleft ^ (1 << 27)) & (0x3fff << 14)) < ((xright ^ (1 << 27)) & (0x3fff << 14));
-            else
-                curcross = ((xright ^ (1 << 27)) & (0x3fff << 14)) < ((xleft ^ (1 << 27)) & (0x3fff << 14));
-
-            invaly |= curcross;
-            SP(j).invalyscan[spix] = invaly;
-            allinval &= invaly;
-
-            if (!invaly) {
-                if (flip) {
-                    maxxmx = (((xlsc >> 3) & 0xfff) > maxxmx) ? (xlsc >> 3) & 0xfff : maxxmx;
-                    minxhx = (((xrsc >> 3) & 0xfff) < minxhx) ? (xrsc >> 3) & 0xfff : minxhx;
-                } else {
-                    minxmx = (((xlsc >> 3) & 0xfff) < minxmx) ? (xlsc >> 3) & 0xfff : minxmx;
-                    maxxhx = (((xrsc >> 3) & 0xfff) > maxxhx) ? (xrsc >> 3) & 0xfff : maxxhx;
-                }
-            }
-
-            if (spix == ldflag) {
-                SP(j).unscrx = SIGN(xright >> 16, 12);
-                xfrac = (xright >> 8) & 0xff;
-                ADJUST_ATTR();
-            }
-
-            if (spix == 3) {
-                if (flip) { SP(j).lx = maxxmx; SP(j).rx = minxhx; }
-                else      { SP(j).lx = minxmx; SP(j).rx = maxxhx; }
-                SP(j).validline = !allinval && !allover && !allunder &&
-                                    (!r->scfield || (r->scfield && !(r->sckeepodd ^ (j & 1))));
-            }
-        }
-
-        if (spix == 3) {
-            ss += dsde; tt += dtde; ww += dwde;
-            rr += drde; gg += dgde; bb += dbde; aa += dade; zz += dzde;
-        }
-        xleft += xleft_inc;
-        xright += xright_inc;
-    }
-#undef ADJUST_ATTR
-#undef SP
-
     int start = yhlimit >> 2, end = yllimit >> 2;
     if (start < 0) start = 0;
     if (end > 1023) end = 1023;
+    *pstart = start;
+    *pend = end;
+    return true;
+}
+
+static void walk_edges(struct rdp *r, const int32_t *ew)
+{
+    struct prim_walk pw;
+    int start, end;
+    if (!setup_walk(r, ew, &pw, &start, &end)) return;
     r->stat_prims++;
-    raster_draw(r, rows, jlo, start, end);
+    raster_draw(r, &pw, start, end);
 }
 
 /* ---- triangles ----------------------------------------------------------- */

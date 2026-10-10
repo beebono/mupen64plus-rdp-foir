@@ -4,6 +4,7 @@
 /projects/unix/*.so
 /projects/unix/foir-replay
 /projects/unix/foir-kfuzz
+/projects/unix/foir-walkfuzz
 /projects/unix/ref-angrylion
 *.o
 *.d

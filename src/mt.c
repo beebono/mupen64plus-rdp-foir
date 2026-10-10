@@ -2,13 +2,15 @@
  * mupen64plus-rdp-foir - mt.c
  * Band-split worker pool.
  *
- * The parser thread decodes commands, runs primitive setup (edge walking) and
- * publishes each primitive as a job: the scanline records, the per-primitive
- * constants, and (when changed since the previous job) a snapshot of the RDP
- * render state and of TMEM. Worker threads run the pixel pipeline for the
- * stripes of rows they own -- row y belongs to worker (y >> FOIR_STRIPE_SHIFT)
- * % nworkers -- so the hot loop shares nothing between threads and needs no
- * locks: framebuffer, Z and "hidden bit" rows are private to their owner.
+ * The parser thread decodes commands, runs primitive setup and publishes each
+ * primitive as a job: the per-primitive constants, the edge walker's setup
+ * record (struct prim_walk: the edge and interpolant coefficients) and, when
+ * changed since the previous job, a snapshot of the RDP render state and of
+ * TMEM. Worker threads compute the span of each row they own from the setup
+ * record (walk.h) and run the pixel pipeline for it -- row y belongs to worker
+ * (y >> FOIR_STRIPE_SHIFT) % nworkers -- so the hot loop shares nothing between
+ * threads and needs no locks: framebuffer, Z and "hidden bit" rows are private
+ * to their owner, and no span records travel between cores.
  *
  * All workers stop together only when the parser needs a consistent RDRAM:
  * SYNC_FULL, VI scan-out, CPU framebuffer reads, a texture load from memory the
@@ -31,7 +33,6 @@
 #define MT_JOBS      8192           /* power of two */
 #define MT_SNAPS     1024
 #define MT_TMEMS     256
-#define MT_ARENA     (16u << 20)
 #define MT_MAXREG    8
 #ifndef MT_SPIN_US
 #define MT_SPIN_US   400            /* idle workers spin this long before sleeping */
@@ -39,12 +40,11 @@
 #define RS_MAX       2048
 
 struct mt_job {
-    struct span *rows;
-    int jlo, start, end;
-    struct prim_ctx pc;
+    int start, end;
     uint32_t state_gen, tmem_gen;
     uint16_t state_slot, tmem_slot;
-    uint64_t arena_end;               /* virtual arena offset after this job's rows */
+    struct prim_ctx pc;
+    struct prim_walk pw;
 };
 
 struct mt_region { uint32_t addr; int width, bpp; uint32_t lo, hi; };
@@ -62,7 +62,7 @@ struct mt_worker {
     char pad[64];
 };
 
-struct mt_stats { unsigned long jobs, region_syncs, range_syncs, full_syncs, alloc_waits, snap_waits, tmem_waits; };
+struct mt_stats { unsigned long jobs, region_syncs, range_syncs, full_syncs, alloc_waits, snap_waits, tmem_waits; };   /* alloc_waits: job ring full */
 
 struct rdp_mt {
     struct mt_stats st;
@@ -70,8 +70,6 @@ struct rdp_mt {
     struct mt_worker w[MT_MAXW];
     struct mt_job *jobs;
     _Atomic uint64_t head;            /* jobs published */
-    uint8_t *arena;
-    uint64_t arena_voff;              /* virtual allocation offset */
     struct mt_snap *snaps;
     struct mt_tmem *tmems;
     uint32_t gen_counter, cur_state_gen, cur_tmem_gen;
@@ -84,7 +82,6 @@ struct rdp_mt {
     pthread_cond_t cond;
     _Atomic int sleepers;
     _Atomic int stop;
-    int pending_rows;
 };
 
 static inline void cpu_relax(void)
@@ -122,7 +119,7 @@ static void run_job(struct mt_worker *wk, const struct mt_job *job)
         wk->tmem_gen = job->tmem_gen;
     }
     w->pc = job->pc;
-    raster_render_job(w, job->rows, job->jlo, job->start, job->end);
+    raster_render_walk(w, &job->pw, job->start, job->end);
 }
 
 static void *worker_main(void *arg)
@@ -193,11 +190,10 @@ bool mt_start(struct rdp *r, int nworkers)
     if (!mt) return false;
     if (RSTATE_BYTES > RS_MAX) { free(mt); return false; }
     mt->jobs = (struct mt_job *)calloc(MT_JOBS, sizeof(struct mt_job));
-    mt->arena = (uint8_t *)malloc(MT_ARENA);
     mt->snaps = (struct mt_snap *)calloc(MT_SNAPS, sizeof(struct mt_snap));
     mt->tmems = (struct mt_tmem *)calloc(MT_TMEMS, sizeof(struct mt_tmem));
-    if (!mt->jobs || !mt->arena || !mt->snaps || !mt->tmems) goto fail;
-    memset(mt->arena, 0, MT_ARENA);       /* fault the pages in now, not during the first frame */
+    if (!mt->jobs || !mt->snaps || !mt->tmems) goto fail;
+    memset(mt->jobs, 0, MT_JOBS * sizeof(struct mt_job));   /* fault the pages in now, not during the first frame */
     pthread_mutex_init(&mt->lock, NULL);
     pthread_cond_init(&mt->cond, NULL);
     mt->nw = nworkers;
@@ -227,7 +223,7 @@ bool mt_start(struct rdp *r, int nworkers)
     r->tmem_dirty = true;
     return true;
 fail:
-    free(mt->jobs); free(mt->arena); free(mt->snaps); free(mt->tmems); free(mt);
+    free(mt->jobs); free(mt->snaps); free(mt->tmems); free(mt);
     return false;
 }
 
@@ -248,7 +244,7 @@ void mt_stop(struct rdp *r)
     if (!mt) return;
     mt_sync(r);
     if (getenv("FOIR_MT_STATS"))
-        fprintf(stderr, "mt: %lu jobs, %lu syncs (%lu from render-target hazards, %lu from texture loads), waits for ring space: %lu arena, %lu state snapshots, %lu tmem snapshots\n",
+        fprintf(stderr, "mt: %lu jobs, %lu syncs (%lu from render-target hazards, %lu from texture loads), waits for ring space: %lu jobs, %lu state snapshots, %lu tmem snapshots\n",
                 (unsigned long)atomic_load(&mt->head), mt->st.full_syncs, mt->st.region_syncs, mt->st.range_syncs,
                 mt->st.alloc_waits, mt->st.snap_waits, mt->st.tmem_waits);
     atomic_store(&mt->stop, 1);
@@ -264,7 +260,7 @@ void mt_stop(struct rdp *r)
         free(mt->w[i].ctx);
     }
     r->stat_pixels += pix;
-    free(mt->jobs); free(mt->arena); free(mt->snaps); free(mt->tmems);
+    free(mt->jobs); free(mt->snaps); free(mt->tmems);
     pthread_mutex_destroy(&mt->lock);
     pthread_cond_destroy(&mt->cond);
     free(mt);
@@ -290,25 +286,6 @@ void mt_coverage(struct rdp *r, uint64_t pix[COV_N], uint64_t *tex_all)
             for (int k = 0; k < COV_N; k++) pix[k] += mt->w[i].ctx->cov_pix[k];
             *tex_all += mt->w[i].ctx->cov_tex_all;
         }
-}
-
-struct span *mt_alloc_rows(struct rdp *r, int nrows)
-{
-    struct rdp_mt *mt = r->mt;
-    mt->pending_rows = nrows;
-    uint64_t bytes = ((uint64_t)nrows * sizeof(struct span) + 63) & ~63ull;
-    uint64_t voff = mt->arena_voff;
-    if ((voff % MT_ARENA) + bytes > MT_ARENA) voff += MT_ARENA - (voff % MT_ARENA);   /* never straddle the end */
-    int spins = 0;
-    for (;;) {
-        uint64_t head = atomic_load_explicit(&mt->head, memory_order_relaxed);
-        uint64_t md = min_done(mt);
-        uint64_t tail = md ? mt->jobs[(md - 1) & (MT_JOBS - 1)].arena_end : 0;
-        if (voff + bytes - tail <= MT_ARENA && head - md < MT_JOBS - 1) break;
-        if (spins == 0) mt->st.alloc_waits++;
-        wait_progress(mt, &spins);
-    }
-    return (struct span *)(mt->arena + (voff % MT_ARENA));
 }
 
 static int bytes_per_px(int size) { return size == PIXEL_SIZE_4BIT ? 1 : (1 << size) >> 1; }
@@ -357,7 +334,7 @@ void mt_sync_range(struct rdp *r, uint32_t lo, uint32_t hi)
         if (lo < mt->reg[i].hi && mt->reg[i].lo < hi) { mt->st.range_syncs++; mt_sync(r); return; }
 }
 
-void mt_submit(struct rdp *r, struct span *rows, int jlo, int start, int end)
+void mt_submit(struct rdp *r, const struct prim_walk *pw, int start, int end)
 {
     struct rdp_mt *mt = r->mt;
     if (end < start) return;
@@ -378,7 +355,10 @@ void mt_submit(struct rdp *r, struct span *rows, int jlo, int start, int end)
 
     uint64_t head = atomic_load_explicit(&mt->head, memory_order_relaxed);
     struct mt_job *job = &mt->jobs[head & (MT_JOBS - 1)];
-    int spins;
+    int spins = 0;
+
+    /* a free slot in the job ring */
+    while (head - min_done(mt) >= MT_JOBS - 1) { if (spins == 0) mt->st.alloc_waits++; wait_progress(mt, &spins); }
 
     if (r->rs_dirty) {
         int slot = mt->next_snap;
@@ -405,16 +385,11 @@ void mt_submit(struct rdp *r, struct span *rows, int jlo, int start, int end)
     mt->snap_last_job[mt->cur_state_slot] = head + 1;
     mt->tmem_last_job[mt->cur_tmem_slot] = head + 1;
 
-    uint64_t bytes = (((uint64_t)(mt->pending_rows) * sizeof(struct span)) + 63) & ~63ull;
-    uint64_t voff = mt->arena_voff;
-    if ((voff % MT_ARENA) + bytes > MT_ARENA) voff += MT_ARENA - (voff % MT_ARENA);
-    mt->arena_voff = voff + bytes;
-
-    job->rows = rows; job->jlo = jlo; job->start = start; job->end = end;
+    job->start = start; job->end = end;
+    job->pw = *pw;
     job->pc = r->pc;
     job->state_gen = mt->cur_state_gen; job->state_slot = (uint16_t)mt->cur_state_slot;
     job->tmem_gen = mt->cur_tmem_gen; job->tmem_slot = (uint16_t)mt->cur_tmem_slot;
-    job->arena_end = mt->arena_voff;
     atomic_store_explicit(&mt->head, head + 1, memory_order_seq_cst);
     if (atomic_load(&mt->sleepers) > 0) wake_workers(mt);
 }
