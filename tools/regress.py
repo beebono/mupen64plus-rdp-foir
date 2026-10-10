@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""regress.py: build synthetic RDP scenes, run them through foir-replay and the
-angrylion reference tool, and compare the resulting framebuffers.
-
-usage: regress.py [outdir] [scene ...]   (run from projects/unix after `make replay ref`)
-"""
+"""regress.py [outdir] [scene ...]: synthetic RDP scenes through foir-replay and ref-angrylion, framebuffers compared (from projects/unix after `make replay ref`)"""
 import os
 import re
 import subprocess
@@ -94,7 +90,6 @@ def scene_tex_rect_copy():
     s.add(set_tile_size(0, 0, 0, 31, 31))
     s.add(set_other_modes(cycle=2, alpha_compare=0))
     s.add(tex_rect(0, 20, 20, 52, 52, 0, 0, 1.0, 1.0))
-    # tile 1 gets the gradient
     s.add(set_texture_image(0, 2, 32, TEXMEM + 0x1000))
     s.add(set_tile(0, 2, 0, 0x40, 7))
     s.add(load_block(7, 0, 0, 32 * 32 - 1, 256))
@@ -124,7 +119,6 @@ def scene_tex_1cycle():
     s.add(tex_rect(0, 16, 16, 112, 112, 0, 0, 1 / 3.0, 1 / 3.0))
     s.add(triangle([(150, 40), (300, 80), (200, 220)], shade=[(255, 255, 255, 255), (200, 200, 255, 255), (255, 200, 200, 255)],
                    tex=[(0, 0, 1), (31, 0, 1), (0, 31, 1)]))
-    # point sampled
     s.add(set_other_modes(cycle=0, bilerp_sample=0, bi0=1, bi1=1, aa=1, m1a0=0, m1b0=0, m2a0=1, m2b0=0,
                           m1a1=0, m1b1=0, m2a1=1, m2b1=0, rgb_dither=3, alpha_dither=3))
     s.add(tex_rect(0, 16, 130, 80, 194, 0, 0, 0.5, 0.5))
@@ -184,14 +178,11 @@ def scene_dither_noaa():
     return s, vi_320x240(FB)
 
 
-# ---- texture format coverage -------------------------------------------------------------
-
 def tex_pixel(x, y):
     return ((x * 9 + y * 3) & 255, (y * 13) & 255, ((x ^ y) * 7) & 255, 255 if (x + y) % 5 else 0)
 
 
 def put_texture(s, fmt, size, w, h, addr):
-    """write a test pattern in the given N64 format; returns bytes written"""
     off = addr
     for y in range(h):
         for x in range(w):
@@ -251,7 +242,7 @@ def scene_tex_formats():
     s = Scene()
     prologue(s)
     clear(s, 0x00010001 * rgba16(30, 0, 30))
-    s.add(set_combine(1, 8, 4, 7, 1, 7, 4, 7, 1, 8, 4, 7, 1, 7, 4, 7))  # T0 * shade (with shade = 255 via prim?)
+    s.add(set_combine(1, 8, 4, 7, 1, 7, 4, 7, 1, 8, 4, 7, 1, 7, 4, 7))
     s.add(set_combine(0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1))  # COMBINED = TEXEL0
     om = dict(cycle=0, bilerp_sample=1, bi0=1, bi1=1, aa=0, m1a0=0, m1b0=0, m2a0=1, m2b0=0, m1a1=0, m1b1=0, m2a1=1, m2b1=0)
     cases = [(0, 2, 32, 32), (0, 3, 16, 16), (3, 2, 16, 16), (3, 1, 16, 16), (3, 0, 16, 16),
@@ -262,7 +253,6 @@ def scene_tex_formats():
         addr = TEXMEM + i * 0x2000
         kw = {}
         if fmt == 2:
-            # palette
             pal = 0x180000
             for k in range(256):
                 s.wr16(pal + 2 * k, rgba16((k * 3) & 255, (k * 7) & 255, (255 - k) & 255, 1))
@@ -305,19 +295,17 @@ def scene_persp_lod(one_cycle=False):
     clear(s, 0x00010001 * rgba16(10, 10, 40))
     s.add(set_other_modes(cycle=3), set_fill_color(0xFFFCFFFC), set_color_image(0, 2, 320, ZB), fill_rect(0, 0, 320, 240),
           set_color_image(0, 2, 320, FB), sync_pipe())
-    # mip chain: level0 32x32, level1 16x16, level2 8x8 at different tmem offsets
     sizes = [(32, 0x000), (16, 0x100), (8, 0x140)]
     for lvl, (w, tm) in enumerate(sizes):
         put_texture(s, 0, 2, w, w, TEXMEM + lvl * 0x2000)
         s.add(set_texture_image(0, 2, 1, TEXMEM + lvl * 0x2000), set_tile(0, 2, 0, tm, 7),
               load_block(7, 0, 0, w * w - 1, max(1, 2048 // (w // 4))), sync_pipe(),
               set_tile(0, 2, w // 4, tm, lvl), set_tile_size(lvl, 0, 0, w - 1, w - 1))
-    s.add(set_combine(1, 2, 14, 1, 1, 2, 6, 1, 0, 0, 0, 0, 0, 0, 0, 0))   # lerp T0/T1 by lod frac? fields arbitrary
+    s.add(set_combine(1, 2, 14, 1, 1, 2, 6, 1, 0, 0, 0, 0, 0, 0, 0, 0))   # fields arbitrary
     cyc = 0 if one_cycle else 1
     s.add(set_combine(0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1 if one_cycle else 0, 0, 0, 0, 1 if one_cycle else 0))
     s.add(set_other_modes(cycle=cyc, persp=1, lod=1, bilerp_sample=1, bi0=1, bi1=1, aa=1, z_compare=1, z_update=1,
                           m1a0=0, m1b0=0, m2a0=1, m2b0=0, m1a1=0, m1b1=0, m2a1=1, m2b1=0))
-    # ground-plane-like quad: near edge larger s,t gradient
     s.add(triangle([(20, 230), (300, 230), (150, 40)], shade=[(255, 255, 255, 255)] * 3,
                    tex=[(0, 0, 1.0), (32, 0, 1.0), (0, 32, 0.15)], zs=[10000, 10000, 40000]))
     s.add(sync_full())
@@ -363,8 +351,7 @@ def scene_alphacmp_cvg():
 
 
 def scene_copy_tlut():
-    """COPY-cycle texture rectangles of CI8 / CI4 textures through a TLUT (what Paper Mario, Mischief Makers, Hydro Thunder
-    draw), RGBA16 textures, with and without alpha compare, with texture masks and at odd / even screen positions"""
+    """COPY-cycle texture rectangles of CI8 / CI4 textures through a TLUT, RGBA16 ones, with and without alpha compare, texture masks, odd / even screen positions"""
     s = Scene()
     prologue(s)
     clear(s, 0x00010001 * rgba16(40, 40, 40))
@@ -385,10 +372,7 @@ def scene_copy_tlut():
     return s, vi_320x240(FB)
 
 
-# ---- mip-mapped scenes (TEX_LOD_EN, detail, sharpen): LOD / tile selection / fraction -------------------------------------
-
 def _lvl_words(size, w):
-    """TMEM words (8 bytes) a w x w level takes (the low bank only for 32-bit texels)"""
     bits = {0: 4, 1: 8, 2: 16, 3: 32}[size]
     line = max(1, w // 4) if size == 3 else max(1, (w * bits + 63) // 64)
     return line * w
@@ -396,8 +380,7 @@ def _lvl_words(size, w):
 
 def scene_lod(fmt=0, size=2, w0=32, nlev=5, cycles=2, persp=1, detail=0, sharpen=0, smp=1, tlut=0, tilekw=None, maxlevel=3,
               scale=96.0, minlevel=0, ntri=1):
-    """A ground-plane-like triangle sampled through a mip chain (tiles 0 .. nlev - 1, sizes w0, w0/2, ...), the perspective makes the
-    LOD range from magnified (near) to distant (far); two cycles blend level and level + 1 by the LOD fraction"""
+    """a ground-plane-like triangle sampled through a mip chain (tiles 0 .. nlev - 1); the perspective makes the LOD range from magnified (near) to distant (far)"""
     s = Scene()
     prologue(s, z=True)
     clear(s, 0x00010001 * rgba16(10, 10, 40))
@@ -421,13 +404,12 @@ def scene_lod(fmt=0, size=2, w0=32, nlev=5, cycles=2, persp=1, detail=0, sharpen
     one = cycles == 1
     if one:
         s.add(set_combine(8, 8, 16, 1, 7, 7, 7, 1, 8, 8, 16, 1, 7, 7, 7, 1))
-    else:   # (TEXEL1 - TEXEL0) * LOD fraction + TEXEL0, then the second cycle passes TEXEL0 of tile + 1 ... (A - B) * C + D with D = COMBINED
+    else:   # (TEXEL1 - TEXEL0) * LOD fraction + TEXEL0, then the second cycle passes TEXEL0 of tile + 1
         s.add(set_combine(2, 1, 13, 1, 2, 1, 0, 1, 8, 8, 16, 0, 7, 7, 7, 0))
     s.add(set_prim_color(0xFFFFFFFF, minlevel, 0x80))
     s.add(set_other_modes(cycle=0 if one else 1, persp=persp, detail=detail, sharpen=sharpen, lod=1, tlut=tlut, bilerp_sample=smp,
                           bi0=1, bi1=1, aa=1, z_compare=1, z_update=1, m1a0=0, m1b0=0, m2a0=1, m2b0=0, m1a1=0, m1b1=0, m2a1=1, m2b1=0))
     for k in range(ntri):
-        # a wide near edge and a narrow far one: texels per pixel grow with the distance (and with scale)
         y0 = 232 - 20 * k
         s.add(triangle([(8 + 8 * k, y0), (312 - 8 * k, y0), (160, 36 + 14 * k)], shade=[(255, 255, 255, 255)] * 3,
                        tex=[(0, 0, 1.0), (scale, 0, 1.0), (scale / 2, scale, 0.1)], zs=[10000, 10000, 40000], level=maxlevel))
@@ -455,7 +437,6 @@ SCENES = {
     'zmodes': scene_zmodes,
     'alphacvg': scene_alphacmp_cvg,
     'copytlut': scene_copy_tlut,
-    # mip-mapped: TEX_LOD_EN, level / fraction / tile selection, detail, sharpen, formats, wrap / mirror / clamp, one and two cycles
     'lod2c': _mk(),
     'lod2c_min': _mk(minlevel=3, scale=40.0),
     'lod2c_detail': _mk(detail=1, scale=128.0),
@@ -468,9 +449,8 @@ SCENES = {
     'lod2c_ia16_clampmirror': _mk(fmt=3, size=2, tilekw=dict(cs=1, mt=1), scale=150.0, maxlevel=4, detail=1, nlev=6),
 }
 
-# Scenes the scalar reference does NOT reproduce angrylion on: one-cycle perspective LOD with max level > 0 (the far part of the plane differs;
-# angrylion's tclod_1cycle_current has span-edge special cases the scalar kernel does not model). They are NEON-vs-scalar scenes only:
-# neoncheck.py replays them, regress.py runs them only when asked by name.
+# Scenes the scalar reference does NOT reproduce angrylion on (one-cycle perspective LOD with max level > 0: angrylion's tclod_1cycle_current has span-edge
+# special cases the scalar kernel does not model). NEON-vs-scalar only: neoncheck.py replays them, regress.py runs them only when named.
 XSCENES = {
     'lod1c_i4_clamp': _mk(fmt=4, size=0, cycles=1, persp=1, tilekw=dict(cs=1, ct=1), scale=64.0),
     'lod1c_rgba16_wide': _mk(cycles=1, scale=400.0, maxlevel=4, ntri=2),
@@ -479,8 +459,7 @@ XSCENES = {
 }
 
 
-# FILL/COPY primitives must be counted in foir-replay's "N pixels" statistic (Hydro Thunder draws only
-# COPY-mode texrects and fills and used to report "0 pixels"); lower bound = full clear + the sprites.
+# lower bound of foir-replay's "N pixels": FILL / COPY primitives must be counted (full clear + the sprites)
 MIN_PIXELS = {'fill': 76800 + 80 * 60, 'copy': 76800 + 2 * 32 * 32}
 
 

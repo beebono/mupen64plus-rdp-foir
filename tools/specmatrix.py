@@ -1,15 +1,5 @@
 #!/usr/bin/env python3
-"""specmatrix.py: the part of the variant lists that is a plain cross product instead of a statistic.
-
-  specmatrix.py tex     the texture unit variants for every common texel format x point / bilinear x perspective x
-                        one / two cycles (what any game can use; the rarer combinations come from specstats.py)
-  specmatrix.py texl    the LOD (TEX_LOD_EN) variants of the same
-  specmatrix.py store   the FB / Z store variants: 16-bit RGBA colour buffer, every coverage destination x Z update
-  specmatrix.py zcmp    the Z compare variants: every combination of image read, Z mode, memory-alpha shifts and
-                        RelaxedPrecision for a 16-bit colour buffer (ANTIALIAS_EN / FORCE_BLEND are read at run time)
-
-Both print lines for src/spec_tex.def / src/spec_store.def (see kspec_tex.inc, kspec_mem.inc).
-"""
+"""specmatrix.py tex|texl|store|zcmp: prints the cross-product lines of src/spec_{tex,store,zcmp}.def (the rarer variants come from specstats.py)"""
 import sys
 
 # (format, size, tlut): RGBA16, RGBA32, IA4, IA8, IA16, I4, I8, CI4 + TLUT, CI8 + TLUT
@@ -21,15 +11,12 @@ def tex():
         for two in (0, 1):
             for smp in (0, 1):
                 for persp in (0, 1):
-                    # TEX(two, t0,t1,nx, fmt0,siz0, fmt1,siz1, smp,mid, tlut,tlt, persp, bl0,bl1)
                     print('TEX(%d, 1,0,0, %d,%d, 0,0, %d,0, %d,0, %d, 1,%d)' % (two, fmt, siz, smp, tlut, persp, two))
 
 
 def texl():
-    """LOD states: one cycle, bilinear, perspective (what mip-mapped 3D textures use), every common texel format, the LOD
-    selecting the tile (two-cycle and other LOD states come from the statistics)"""
+    """one cycle, bilinear, perspective, the LOD selecting the tile"""
     for fmt, siz, tlut in FORMATS:
-        # TEXL(two, t0,t1,nx, fmt0,siz0, fmt1,siz1, smp,mid, tlut,tlt, persp, bl0,bl1, lodt)
         print('TEXL(0, 1,0,0, %d,%d, 0,0, 1,0, %d,0, 1, 1,0, 1)' % (fmt, siz, tlut))
 
 

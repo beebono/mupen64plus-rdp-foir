@@ -1,13 +1,5 @@
 /*
  * mupen64plus-rdp-foir - kneon_comb.c
- * NEON colour combiner (1 and 2 cycle), 8 pixels per step. Chroma keying falls
- * back to the scalar kernel.
- *
- * Every combiner input is resolved per batch to a lane-indexed array (constants
- * are splatted into arrays once per batch), and every (cycle, channel)
- * equation is classified so the common shapes (D only, A*C, (A-B)*C, A*C+D)
- * skip the work their zero operands would need. Inputs that are known to stay
- * in 0..383 skip the 9-bit sign extension.
  *
  * Copyright (C) 2026 foir contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -25,13 +17,13 @@ struct cop {
     uint8_t mode, ea, eb, ec, ed;
 };
 
-/* registers whose value can be outside 0..383 (the A/B/D inputs then need the k_ext9 treatment) */
+/* value can be outside 0..383 */
 FOIR_INLINE bool reg_wide(int idx, bool tex_wide)
 {
     if (idx >= REG_TEX0 && idx < REG_TEX1 + 4) return tex_wide;
     return idx == REG_NOISE || idx == REG_LODF || idx == REG_K4 || idx == REG_K5 || (idx >= REG_COMB && idx < REG_COMB + 4);
 }
-/* registers that are not in 0..255 (the C input is sign extended from 9 bits) */
+/* not in 0..255: the C input is sign-extended from 9 bits */
 FOIR_INLINE bool reg_gt255(int idx, bool tex_wide) { return reg_wide(idx, tex_wide) || idx == REG_ONE; }
 
 static void cop_make(struct cop *op, const int16_t *const *src, bool tw, int ia, int ib, int im, int id)
@@ -48,7 +40,7 @@ static void cop_make(struct cop *op, const int16_t *const *src, bool tw, int ia,
 
 FOIR_INLINE int16x8_t cop_eval(const struct cop *op, int o)
 {
-    if (op->mode == M_D)                 /* (d << 8 + 0x80) >> 8, 9 bits: just the low 9 bits of d */
+    if (op->mode == M_D)                 /* (d << 8 + 0x80) >> 8 in 9 bits is just d & 0x1ff */
         return vandq_s16(vld1q_s16(op->pd + o), vdupq_n_s16(0x1ff));
     int16x8_t a = vld1q_s16(op->pa + o);
     int16x8_t c = vld1q_s16(op->pc + o);
@@ -75,7 +67,6 @@ FOIR_INLINE int16x8_t cop_eval(const struct cop *op, int o)
     return vandq_s16(vcombine_s16(vshrn_n_s32(lo, 8), vshrn_n_s32(hi, 8)), vdupq_n_s16(0x1ff));
 }
 
-/* shade channel with sub-pixel coverage correction -> clamp9 */
 FOIR_INLINE int16x8_t shade_chan_full(const int32_t *c)
 {
     int32x4_t lo = vld1q_s32(c), hi = vld1q_s32(c + 4);
@@ -106,18 +97,17 @@ void neon_combine(struct rdp *r, struct px_batch *b)
     const int two = om->cycle_type == CYCLE_TYPE_2;
     const int sh_rgb = r->pf.shade_rgb, sh_a = r->pf.shade_a || r->pf.shade_rgb;
     const struct tile *tl0 = &r->tile[r->pc.tilenum], *tl1 = &r->tile[(r->pc.tilenum + 1) & 7];
-    /* texel values are 0..255 unless the texture unit produced YUV conversions (or fell back to them) */
+    /* texel values are 0..255 unless YUV conversion is involved */
     bool tex_wide = tl0->format == FORMAT_YUV || !om->bi_lerp0 ||
                     (two && (tl1->format == FORMAT_YUV || !om->bi_lerp1 || om->convert_one));
-    if (!tex_wide && om->tex_lod_en)   /* LOD can select any tile of the mip chain: a YUV one makes the texels wide */
+    if (!tex_wide && om->tex_lod_en)   /* LOD can pick any tile of the mip chain */
         for (int t = 0; t < 8; t++)
             if (r->tile[t].format == FORMAT_YUV) tex_wide = true;
 
-    /* ---- per-batch input arrays ---- */
-    int16_t shade[4][FOIR_LANES] ALIGN16;       /* shade colour (only the used channels are written) */
-    int16_t comb0[4][FOIR_LANES] ALIGN16;       /* cycle 0 result, fed to cycle 1 */
+    int16_t shade[4][FOIR_LANES] ALIGN16;
+    int16_t comb0[4][FOIR_LANES] ALIGN16;
     int16_t noise_s[FOIR_LANES] ALIGN16;
-    int16_t cbuf[REG_COUNT][FOIR_LANES] ALIGN16; /* splatted constants, filled on demand */
+    int16_t cbuf[REG_COUNT][FOIR_LANES] ALIGN16;
     const int16_t *src0[REG_COUNT], *src1[REG_COUNT];
     uint8_t used[REG_COUNT];
     memset(used, 0, sizeof(used));
@@ -165,7 +155,6 @@ void neon_combine(struct rdp *r, struct px_batch *b)
         cop_make(&ops[cy][3], s, tex_wide, cb->alpha[cy][0], cb->alpha[cy][1], cb->alpha[cy][2], cb->alpha[cy][3]);
     }
 
-    /* dither tables */
     const uint8x16_t ptab = vld1q_u8((om->rgb_dither_sel == 0 || om->rgb_dither_sel == 2) ? magic_matrix : bayer_matrix);
     const int rgbsel = om->rgb_dither_sel, asel = om->alpha_dither_sel;
     const int need_noise = om->uses_noise || asel == 2;
@@ -176,7 +165,6 @@ void neon_combine(struct rdp *r, struct px_batch *b)
         const uint8x8_t cvg8 = vld1_u8(&b->cvg[o]);
         const int16x8_t cvg = vreinterpretq_s16_u16(vmovl_u8(cvg8));
 
-        /* ---- noise / dither ---- */
         uint8x8_t pv = vqtbl1_u8(ptab, vld1_u8(&b->ditidx[o]));
         int16x8_t cdv;
         uint8x8_t ad8;
@@ -205,7 +193,6 @@ void neon_combine(struct rdp *r, struct px_batch *b)
         vst1q_s16(&b->cdith[o], cdv);
         vst1_s8(&b->adith[o], vreinterpret_s8_u8(ad8));
 
-        /* ---- shade ---- */
         int16x8_t shade_a = vdupq_n_s16(0);
         if (sh_rgb || sh_a) {
             int16x8_t sh[4];
@@ -230,7 +217,6 @@ void neon_combine(struct rdp *r, struct px_batch *b)
             shade_a = sh[3];
         }
 
-        /* ---- cycles ---- */
         int16x8_t acalpha = vdupq_n_s16(0);
         if (two) {
             int16x8_t c0[4];
@@ -253,7 +239,6 @@ void neon_combine(struct rdp *r, struct px_batch *b)
         int16x8_t cf[4];
         for (int c = 0; c < 4; c++) cf[c] = cop_eval(&ops[1][c], o);
 
-        /* ---- finish ---- */
         int16x8_t pa = k_clamp9v(cf[3]);
         pa = vbslq_s16(vceqq_s16(pa, vdupq_n_s16(0xff)), vdupq_n_s16(0x100), pa);
         int16x8_t newcvg = cvg, temp = vdupq_n_s16(0);

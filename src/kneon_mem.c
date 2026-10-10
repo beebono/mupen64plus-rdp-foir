@@ -1,12 +1,5 @@
 /*
  * mupen64plus-rdp-foir - kneon_mem.c
- * NEON framebuffer / Z-buffer access: Z compare (no lookup tables), the
- * blender memory inputs, FB + Z store, FILL.
- *
- * RDRAM is held as host 32-bit words (so 16-bit pixel i lives at host halfword
- * i ^ 1) and every 16-bit pixel has a "hidden" byte (see rdram.h). A group of
- * eight pixels with consecutive indices is read / written with vector accesses
- * (reversing halfword pairs); anything else takes a per-lane path.
  *
  * Copyright (C) 2026 foir contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -17,15 +10,6 @@
 #if FOIR_HALF_XOR != 1 || FOIR_BYTE_XOR != 3
 #error "the NEON memory kernels assume a little-endian host with word-swapped RDRAM"
 #endif
-
-/* ---- 16-bit pixel (+ hidden bits) groups ------------------------------------------------ */
-
-/* A group of eight lanes with consecutive pixel indices is read / written with one vector window (a load, or a
- * load-modify-write with the lane mask). About a fifth of the groups straddle two scanlines of the batch and the tail
- * group of a batch may be short: those take the per-lane scalar path. (Splitting a straddling group into its two runs
- * and accessing each with its own window was measured and does not pay on the Cortex-A55: -2 % instructions, no change in
- * cycles, see the README.) The RDRAM bounds checks of the windows are done once per batch and buffer from the lowest and
- * highest pixel index of the batch instead of once per window. */
 
 FOIR_INLINE bool grp_contig(const struct px_batch *b, int o)
 {
@@ -45,7 +29,6 @@ FOIR_INLINE uint8x8_t hv_resolve(uint8x8_t h, uint16x8_t px)
     return vbsl_u8(vand_u8(valid, match), vand_u8(h, vdup_n_u8(3)), vmul_u8(lsb, vdup_n_u8(3)));
 }
 
-/* lowest / highest pixel index of the batch (builder maintained; batches made by other code are scanned) */
 FOIR_INLINE void batch_range(const struct px_batch *b, uint32_t *lo, uint32_t *hi)
 {
     if (FOIR_LIKELY(b->fbrange)) { *lo = b->fbmin; *hi = b->fbmax; return; }
@@ -54,13 +37,13 @@ FOIR_INLINE void batch_range(const struct px_batch *b, uint32_t *lo, uint32_t *h
     *lo = mn; *hi = mx;
 }
 
-/* every window (and every frame an odd window rewrites) of the batch lies in RDRAM, for the 16-bit pixel buffer at halfword base16 */
+/* every window (and the frame an odd window rewrites) of the batch lies in RDRAM; base16 = halfword base of the buffer */
 FOIR_INLINE bool win16_safe(const struct rdp *r, uint32_t base16, uint32_t lo, uint32_t hi)
 {
     return base16 + lo >= 8 && base16 + hi + 16 < (RDRAM_MASK >> 1) && ((base16 + hi + 16) << 1) <= r->rdram_size;
 }
 
-/* eight pixels from pixel index i0 (RDRAM is held as host words: pixel i lives at halfword i ^ 1), in pixel order */
+/* RDRAM is held as host words: pixel i lives at halfword i ^ 1 */
 FOIR_INLINE uint16x8_t win16_ld(const struct rdp *r, uint32_t i0)
 {
     const uint16_t *h = (const uint16_t *)r->rdram;
@@ -69,8 +52,7 @@ FOIR_INLINE uint16x8_t win16_ld(const struct rdp *r, uint32_t i0)
     return vextq_u16(P0, P1, 1);
 }
 
-/* write the lanes of m (0xffff) of px to the eight pixels from index i0 (and their hidden bytes); the window (an odd i0
- * rewrites the 16-pixel frame it overlaps) must be inside RDRAM and inside one row */
+/* an odd i0 rewrites the 16-pixel frame it overlaps; the window must lie in RDRAM and in one row */
 FOIR_INLINE void win16_st(struct rdp *r, uint32_t i0, uint16x8_t px, uint8x8_t hnew, uint16x8_t m)
 {
     uint16_t *h = (uint16_t *)r->rdram;
@@ -96,7 +78,6 @@ FOIR_INLINE uint8x8_t hidden_new(uint16x8_t px, uint8x8_t hv)
     return vorr_u8(vorr_u8(vdup_n_u8(8), vshl_n_u8(vand_u8(vmovn_u16(px), vdup_n_u8(1)), 2)), vand_u8(hv, vdup_n_u8(3)));
 }
 
-/* 16-bit pixels without the hidden bits (used for the Z value when the delta-Z logic is skipped) */
 FOIR_INLINE uint16x8_t fast_z_load(const struct rdp *r, uint32_t base16, const struct px_batch *b, int o, int cnt, bool contig, bool ok)
 {
     if (ok && contig) return win16_ld(r, base16 + b->fbidx[o]);
@@ -128,8 +109,7 @@ FOIR_INLINE void st16(struct rdp *r, uint32_t base16, const struct px_batch *b, 
                       uint16x8_t px, uint8x8_t hv, uint16x8_t mask)
 {
     if (ok && contig) {
-        /* An odd-aligned group rewrites the whole 16-pixel frame it overlaps (the pixels outside the group with
-         * their old value). Those must belong to the same row: other rows may be rendered by another worker. */
+        /* an odd-aligned group rewrites the whole 16-pixel frame; its other pixels must be in the same row (other rows belong to other workers) */
         const uint32_t i0 = base16 + b->fbidx[o];
         const int x0 = b->xpos[o];
         if (FOIR_LIKELY(!(i0 & 1) || (x0 >= 1 && x0 + 14 < r->fb_width))) {
@@ -143,8 +123,6 @@ FOIR_INLINE void st16(struct rdp *r, uint32_t base16, const struct px_batch *b, 
     for (int l = 0; l < cnt; l++)
         if (ma[l]) rdram_wr_pair16(r, base16 + b->fbidx[o + l], pa[l], ha[l]);
 }
-
-/* ---- 32-bit pixels --------------------------------------------------------------------------- */
 
 static void ld32(const struct rdp *r, uint32_t base32, const struct px_batch *b, int o, int cnt, bool contig,
                  uint32x4_t *lo, uint32x4_t *hi)
@@ -185,8 +163,6 @@ static void st32(struct rdp *r, uint32_t base32, const struct px_batch *b, int o
         if (ma[l]) rdram_wr32(r, base32 + b->fbidx[o + l], a[l]);
 }
 
-/* ---- Z compare --------------------------------------------------------------------------------- */
-
 FOIR_INLINE uint32x4_t vsel_u32(uint32x4_t m, uint32x4_t a, uint32x4_t b) { return vbslq_u32(m, a, b); }
 
 struct z4_out {
@@ -194,17 +170,15 @@ struct z4_out {
     int32x4_t sha, shb;
 };
 
-/* The Z / colour buffer read state the kernel depends on. The generic kernel fills it from the render state at run
- * time, a specialised variant (kspec_mem.inc) passes a literal one, so the same body serves both. */
 struct zs {
-    int is16;        /* 16-bit colour buffer (else 32) */
-    int rd;          /* IMAGE_READ_EN */
-    int rgba;        /* colour buffer format is RGBA */
-    int zc;          /* Z_COMPARE_EN */
+    int is16;
+    int rd;
+    int rgba;
+    int zc;
     int zmode;
     int aa, force;
-    int shifts;      /* the blender reads the memory alpha: the delta-Z shifts are needed */
-    int relaxed;     /* RelaxedPrecision */
+    int shifts;      /* the blender reads the memory alpha: delta-Z shifts needed */
+    int relaxed;
 };
 
 FOIR_INLINE void z_compare4(const struct rdp *r, const struct zs *S, uint32x4_t sz, uint32x4_t zval, uint32x4_t hval,
@@ -288,7 +262,6 @@ FOIR_INLINE void zcmp_body(struct rdp *r, struct px_batch *b, const struct zs S)
     static const uint16_t lane_iota[8] = { 0, 1, 2, 3, 4, 5, 6, 7 };
     const uint16x8_t iota = vld1q_u16(lane_iota);
     const int32_t dzpixenc = pc->dzpixenc;
-    /* opaque / transparent depth compare: the delta-Z logic is only needed for partially covered memory pixels */
     const int fast_z = S.zc && (S.zmode == ZMODE_OPAQUE || S.zmode == ZMODE_TRANSPARENT);
     const int need_shifts = S.shifts;
     const int relaxed_z = S.relaxed;
@@ -303,7 +276,6 @@ FOIR_INLINE void zcmp_body(struct rdp *r, struct px_batch *b, const struct zs S)
         const uint16x8_t lanemask = vcltq_u16(iota, vdupq_n_u16((uint16_t)cnt));
         const uint8x8_t cvg8 = vld1_u8(&b->cvg[o]);
 
-        /* ---- Z interpolant ---- */
         int32x4_t szv[2];
         {
             int32x4_t v0 = vandq_s32(vshrq_n_s32(vld1q_s32(&b->cz[o]), 10), vdupq_n_s32(0x3fffff));
@@ -328,7 +300,6 @@ FOIR_INLINE void zcmp_body(struct rdp *r, struct px_batch *b, const struct zs S)
             vst1q_s32(&b->sz[o], szv[0]); vst1q_s32(&b->sz[o + 4], szv[1]);
         }
 
-        /* ---- colour buffer read ---- */
         uint8x8_t memcvg8 = vdup_n_u8(7);
         if (S.rd) {
             int16x8_t mr, mg, mb, ma;
@@ -371,16 +342,13 @@ FOIR_INLINE void zcmp_body(struct rdp *r, struct px_batch *b, const struct zs S)
         }
         vst1_u8(&b->memcvg[o], memcvg8);
 
-        /* ---- Z compare ---- */
         const uint16x8_t memcvg16 = vmovl_u8(memcvg8);
         const uint16x8_t cvg16 = vmovl_u8(cvg8);
         uint32x4_t wen[2], ben[2], pre[2], ncvg[2];
         int32x4_t sha[2], shb[2];
         const uint16x8_t ovf16 = vtstq_u16(vaddq_u16(memcvg16, cvg16), vdupq_n_u16(8));
         if (fast_z && (relaxed_z || vminvq_u16(vorrq_u16(ovf16, vmvnq_u16(lanemask))) == 0xffff)) {
-            /* Plain depth compare (opaque / transparent modes). Exact when every lane has "overflowing"
-             * coverage (the delta-Z logic only matters for partially covered memory pixels); with
-             * RelaxedPrecision the delta-Z terms are dropped for the remaining lanes as well. */
+            /* exact when every lane has overflowing coverage (delta-Z only matters for partially covered memory pixels); RelaxedPrecision drops the delta-Z terms for the rest too */
             uint16x8_t zpx;
             uint8x8_t zhv = vdup_n_u8(0);
             if (need_shifts) ld16(r, zb16, b, o, cnt, contig, z_ok, &zpx, &zhv);
@@ -408,7 +376,6 @@ FOIR_INLINE void zcmp_body(struct rdp *r, struct px_batch *b, const struct zs S)
             vst1_u8(&b->blend_en[o], vmovn_u16(ben16));
             vst1_u8(&b->prewrap[o], vmovn_u16(vandq_u16(ovf16, vdupq_n_u16(1))));
             if (need_shifts) {
-                /* blender shifts from the memory pixel's delta-Z exponent */
                 int16x8_t rd = vreinterpretq_s16_u16(vorrq_u16(vshlq_n_u16(vandq_u16(zpx, vdupq_n_u16(3)), 2), vmovl_u8(zhv)));
                 int16x8_t enc16 = vdupq_n_s16((int16_t)dzpixenc);
                 int16x8_t sha8 = vminq_s16(vmaxq_s16(vsubq_s16(enc16, rd), vdupq_n_s16(0)), vdupq_n_s16(4));
@@ -470,9 +437,7 @@ void neon_zcmp(struct rdp *r, struct px_batch *b)
                                  .shifts = om->real_blendshifts, .relaxed = r->cfg.relaxed_precision });
 }
 
-/* ---- store ---------------------------------------------------------------------------------------- */
-
-/* Z value encoding (the inverse of the decode in z_compare4); sz is 18 bits */
+/* inverse of the decode in z_compare4; sz is 18 bits */
 FOIR_INLINE uint32x4_t z_encode4(uint32x4_t sz)
 {
     int32x4_t lead = vreinterpretq_s32_u32(vclzq_u32(vmvnq_u32(vshlq_n_u32(sz, 14))));
@@ -482,7 +447,6 @@ FOIR_INLINE uint32x4_t z_encode4(uint32x4_t sz)
     return vorrq_u32(vandq_u32(shifted, vdupq_n_u32(0x1ffc)), vshlq_n_u32(vreinterpretq_u32_s32(e), 13));
 }
 
-/* the state the store kernel depends on (generic: from the render state; variants: literal) */
 struct ss { int is16, rgba, cvgdest, zupd; };
 
 FOIR_INLINE void store_body(struct rdp *r, struct px_batch *b, const struct ss S)
@@ -511,7 +475,6 @@ FOIR_INLINE void store_body(struct rdp *r, struct px_batch *b, const struct ss S
 
         int16x8_t fr = vld1q_s16(&b->fcol[0][o]), fg = vld1q_s16(&b->fcol[1][o]), fbl = vld1q_s16(&b->fcol[2][o]);
 
-        /* final coverage */
         int16x8_t cvg = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(&b->cvg[o])));
         int16x8_t mcv = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(&b->memcvg[o])));
         uint16x8_t ben = vtstq_u16(vmovl_u8(vld1_u8(&b->blend_en[o])), vdupq_n_u16(1));
@@ -569,8 +532,6 @@ void neon_store(struct rdp *r, struct px_batch *b)
                                   .cvgdest = r->om.cvg_dest, .zupd = r->om.z_update_en });
 }
 
-/* ---- FILL ---------------------------------------------------------------------------------------------- */
-
 void neon_fill(struct rdp *r, int y, int x0, int x1)
 {
     uint32_t base = (uint32_t)(r->fb_width * y);
@@ -590,13 +551,12 @@ void neon_fill(struct rdp *r, int y, int x0, int x1)
         int n = x1 - x0 + 1;
         if (n >= 16 && ((i0 + (uint32_t)n + 2) << 1) <= r->rdram_size && i0 + (uint32_t)n + 2 <= (RDRAM_MASK >> 1)) {
             int i = 0;
-            /* head: odd pixel first */
             for (; (i0 + (uint32_t)i) & 1; i++) {
                 uint32_t hi = i0 + (uint32_t)i;
                 uint16_t val = (hi & 1) ? (uint16_t)(r->fill_color & 0xffff) : (uint16_t)(r->fill_color >> 16);
                 rdram_wr_pair16(r, hi, val, (uint8_t)(((val & 1) << 1) | (val & 1)));
             }
-            /* body: whole 32-bit host words hold (odd pixel = low half, even pixel = high half) */
+            /* host words: odd pixel = low half, even pixel = high half */
             uint32_t *w = (uint32_t *)r->rdram + ((i0 + (uint32_t)i) >> 1);
             uint8_t he = (uint8_t)((r->fill_color >> 16) & 1 ? 0xf : 0x8), ho = (uint8_t)((r->fill_color & 1) ? 0xf : 0x8);
             uint8_t *hid = r->hidden + i0 + (uint32_t)i;

@@ -1,12 +1,6 @@
 #!/usr/bin/env python3
-"""vitest.py: checks the VI output of an interlaced (480i) frame rendered one field at a time.
-
-The scene fills a 640x480 16-bit framebuffer blue and then, with the scissor "field" bits set to
-odd rows, fills it red. Scanning the buffer out as is (weave) shows blue even rows and red odd rows;
-the InterlaceHack shows the fresh (red) field on every row.
-
-usage: vitest.py [path/to/foir-replay]   (run from projects/unix after `make replay`)
-"""
+"""vitest.py [path/to/foir-replay] (from projects/unix after `make replay`): a 480i frame rendered one field at a time must show the fresh (red)
+field on every row with the InterlaceHack, not the woven blue / red rows"""
 import os
 import subprocess
 import sys

@@ -1,21 +1,14 @@
 #!/usr/bin/env python3
-"""shapegen.py: the shape-kernel list (src/spec_shape.def) from per-game combiner statistics.
+"""shapegen.py: src/spec_shape.def from per-game combiner statistics.
 
-A shape kernel (kspec_shape.inc) is keyed by the cycle count and, per cycle, the *shape* of the RGB and the alpha
-equation ((A - B) * C + D): each input is a letter 0 (zero), 1 (constant 1.0), C (COMBINED, cycle 1 of a two-cycle
-state) or V (variable: the operand comes from a per-draw table). This script reads the logs of a statistics build
-(`SPEC 1 <pixels> COMB(two, w0, w1, rgbd, ad, acmp, acs, cta, shrgb, sha, wide)` lines, see tools/specstats.py),
-maps every combiner key to its canonical shape key and prints SHAPE(...) lines.
-
-usage: shapegen.py [options] log-or-dir...
-  --min-share P     only shapes with a mean share (percent of combiner pixels, each log weighted equally) >= P
+usage: shapegen.py [options] log-or-dir...   (logs: the `SPEC 1 <pixels> COMB(...)` lines of a statistics build, see specstats.py)
+  --min-share P         only shapes with a mean share (percent of combiner pixels, each log weighted equally) >= P
   --one-cycle-product   add every one-cycle (RGB shape, alpha shape) pair of the observed one-cycle halves
-  --loo             print leave-one-log-out coverage of the generated list instead of the list
-  --cm              (split-operand experiment, FOIR_SK_SPLIT=1) key the kernels on which variable operands are constants
+  --loo                 print leave-one-log-out coverage instead of the list
+  --cm                  (FOIR_SK_SPLIT=1) key the kernels on which variable operands are constants
 
-The ext flag (a variable operand can leave 0..255) cannot be seen in the logs except for wide texels: shapes whose
-multiply input is the LOD fraction in some log also get an ext = 1 kernel (a sharpened LOD fraction), and so do keys
-logged with `wide`.
+ext (a variable operand can leave 0..255) is not visible in the logs except for wide texels: shapes with the LOD fraction as a multiply input in some
+log also get an ext = 1 kernel, as do keys logged with `wide`.
 """
 import argparse
 import collections
@@ -85,7 +78,6 @@ CONST_AL = {0: {3, 5}, 1: {3, 5}, 2: {3, 5, 6}, 3: {3, 5}}
 
 
 def shape_of(key):
-    """(two, ((rgb0, al0), (rgb1, al1)), ext, cm) of a COMB() key tuple (two, w0, w1, rgbd, ad, acmp, acs, cta, shrgb, sha, wide)"""
     two, w0, w1, wide = key[0], key[1], key[2], key[-1]
     cs = dec(two, w0, w1)
     out = [(0, 0), (0, 0)]
@@ -136,7 +128,6 @@ def load_logs(paths):
         files += sorted(glob.glob(os.path.join(p, '*.txt'))) if os.path.isdir(p) else [p]
     logs = {}
     for f in files:
-        # windows of one game (NAME_<frame>.txt) form one log
         name = re.sub(r'_\d+\.txt$', '', f) if re.search(r'_\d+\.txt$', f) else f
         cnt = logs.setdefault(name, collections.Counter())
         for l in open(f, errors='replace'):
@@ -152,8 +143,7 @@ def ident_of(sk, cm):
 
 
 def kernel_set(logs, a):
-    """the kernels for a set of logs: every shape seen (plus the ext = 1 form of the ones with the LOD fraction as a
-    multiply input), and with --one-cycle-product every (RGB, alpha) pair of the one-cycle halves seen"""
+    """every shape seen (plus the ext = 1 form of those with the LOD fraction as a multiply input); with --one-cycle-product every (RGB, alpha) pair of the one-cycle halves"""
     seen = set()
     for cnt in logs:
         for k in cnt:

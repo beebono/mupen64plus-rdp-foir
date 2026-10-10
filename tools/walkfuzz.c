@@ -1,21 +1,7 @@
 /*
- * foir-walkfuzz: the per-row edge walker against the sequential one.
- *
- *   foir-walkfuzz [-n iterations] [-s seed] [-v]
- *
- * Random primitives (the 44-word edge record, scissor, interlace field, cycle type) go through
- *   - the sequential walker of foir commit c73eb8e (tools/walk_ref.inc, verbatim: every subscanline from the top vertex,
- *     one struct span per scanline, accumulating by repeated 32-bit additions), and
- *   - setup_walk() + walk_row_c() and, in the NEON build, walk_row_neon() (src/setup.c, src/walk.h): the setup record, and
- *     the span of any scanline computed from it by multiplication.
- * Compared: whether the primitive is visible at all, the first / last scanline, the per-primitive constants (r->pc), and for
- * every scanline from first to last the validity and, for valid ones, every field of the span (lx, rx, unscrx, the eight
- * interpolants, majorx, minorx, invalyscan). The rows are computed twice, in ascending and in shuffled order, so a row
- * does not depend on the rows computed before it.
- *
- * The primitives range from ordinary triangles and rectangles to extreme ones: 14-bit vertices from -8192 to 8191
- * subscanlines (the sequential walk then has up to 12,000 subscanlines to accumulate over), full-range 28-bit edge
- * positions and 30-bit slopes (the products wrap around many times), and fully random records.
+ * foir-walkfuzz [-n iterations] [-s seed] [-v]: random primitives through the sequential walker of foir c73eb8e (walk_ref.inc, verbatim)
+ * and through setup_walk() + walk_row_c() / walk_row_neon(); compares visibility, first / last scanline, r->pc and every span field.
+ * Rows are computed in ascending and in shuffled order. Primitives range from ordinary to extreme (14-bit vertices, 28-bit edges, 30-bit slopes: the products wrap).
  *
  * Copyright (C) 2026 foir contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -25,8 +11,6 @@
 #include <string.h>
 #include "../src/rdp.h"
 #include "../src/walk.h"
-
-/* ---- the oracle ---------------------------------------------------------------------------------------------------- */
 
 static struct span g_rows[1100];           /* a primitive has at most 1025 scanlines */
 static struct span *walkref_rows(int nrows) { if (nrows > 1100) abort(); return g_rows; }
@@ -39,8 +23,6 @@ static void walkref_draw(struct rdp *r, struct span *rows, int jlo, int start, i
 #define raster_draw(r, rows, jlo, start, end) walkref_draw(r, rows, jlo, start, end)
 #include "walk_ref.inc"
 #undef raster_draw
-
-/* ---- random primitives --------------------------------------------------------------------------------------------- */
 
 static uint64_t g_rng = 88172645463325252ull;
 static uint32_t rnd(void)
@@ -55,15 +37,14 @@ static const int32_t extremes[] = { 0, 1, -1, 0x7fffffff, (int32_t)0x80000000, 0
                                     0x08000000, (int32_t)0xf8000000, 0x8000, (int32_t)0xffff8000, 0x7fff0000, (int32_t)0xffff0000 };
 #define NEXT (int)(sizeof(extremes) / sizeof(extremes[0]))
 
-/* a slope or coefficient of the given width (bits) in a mix of magnitudes */
 static int32_t coef(int bits)
 {
     uint32_t m = bits >= 32 ? 0xffffffffu : ((1u << bits) - 1);
     switch (rndn(10)) {
     case 0: return 0;
-    case 1: return (int32_t)(rnd() & m);                                          /* any */
+    case 1: return (int32_t)(rnd() & m);
     case 2: return extremes[rndn(NEXT)] & (int32_t)m;
-    case 3: case 4: return (int32_t)((int32_t)(rnd() & 0xfffff) - 0x80000) & (int32_t)m;     /* small */
+    case 3: case 4: return (int32_t)((int32_t)(rnd() & 0xfffff) - 0x80000) & (int32_t)m;
     case 5: case 6: return (int32_t)((int32_t)(rnd() & 0x3fffff) - 0x200000) & (int32_t)m;
     case 7: return (int32_t)((int32_t)(rnd() & 0x3ffffff) - 0x2000000) & (int32_t)m;
     default: return (int32_t)(rnd() & m) >> (rndn(bits));
@@ -85,15 +66,15 @@ static void gen_prim(int32_t ew[44], int style)
     memset(ew, 0, 44 * sizeof(int32_t));
     const int flip = rndn(2);
     int yh, ym, yl;
-    if (style == 0) {                      /* ordinary: on screen, sorted vertices */
+    if (style == 0) {
         yh = rndr(-60, 800) * 4 + (int)rndn(4);
         ym = yh + rndr(0, 500) * 4 + (int)rndn(4);
         yl = ym + rndr(0, 500) * 4 + (int)rndn(4);
-        if (rndn(8) == 0) { yh &= ~3; ym &= ~3; yl |= 3; }          /* rectangles */
-    } else if (style == 1) {               /* anywhere in the 14-bit range, any order */
+        if (rndn(8) == 0) { yh &= ~3; ym &= ~3; yl |= 3; }
+    } else if (style == 1) {
         yh = rndr(-8192, 8191); ym = rndr(-8192, 8191); yl = rndr(-8192, 8191);
         if (rndn(2)) { int t[3] = { yh, ym, yl }; for (int i = 0; i < 2; i++) for (int j = 0; j < 2 - i; j++) if (t[j] > t[j + 1]) { int x = t[j]; t[j] = t[j + 1]; t[j + 1] = x; } yh = t[0]; ym = t[1]; yl = t[2]; }
-    } else {                               /* far above the screen: long walks before the first visible row */
+    } else {
         yh = rndr(-8192, -200); ym = rndr(yh, 1500); yl = rndr(ym, 4095);
     }
     ew[0] = ((int32_t)rndn(64) << 24) | (flip << 23) | ((int32_t)rndn(8) << 19) | ((int32_t)rndn(8) << 16) | (yl & 0x3fff);
@@ -104,24 +85,22 @@ static void gen_prim(int32_t ew[44], int style)
     for (int e = 0; e < 3; e++) {
         int32_t x = mag ? coef(28) : (int32_t)((rndr(-40, 700) << 16) + (int)(rnd() & 0xffff));
         int32_t d = coef(30);
-        if (rndn(3) == 0) d = (int32_t)((int32_t)(rnd() & 0x3ffff) - 0x20000);       /* up to +-2 pixels per row */
+        if (rndn(3) == 0) d = (int32_t)((int32_t)(rnd() & 0x3ffff) - 0x20000);
         const uint32_t sign = rndn(10) ? ((uint32_t)d & 0x80000000u ? 0xc0000000u : 0) : (rnd() & 0xc0000000u);
         ew[2 + 2 * e] = x & 0xfffffff;
         ew[3 + 2 * e] = (int32_t)(((uint32_t)d & 0x3fffffffu) | sign);
     }
     if (rndn(12) == 0) for (int i = 2; i < 8; i++) ew[i] = word32();
     for (int i = 8; i < 44; i++) ew[i] = word32();
-    if (rndn(5) == 0) memset(&ew[8], 0, 32 * sizeof(int32_t));            /* no shade / texture, like a rectangle */
+    if (rndn(5) == 0) memset(&ew[8], 0, 32 * sizeof(int32_t));
     if (rndn(6) == 0) memset(&ew[40], 0, 4 * sizeof(int32_t));
 }
 
 #if defined(FOIR_NEON)
-#define NVAR 2          /* the portable walker and the NEON one */
+#define NVAR 2
 #else
 #define NVAR 1
 #endif
-
-/* ---- comparison ------------------------------------------------------------------------------------------------------ */
 
 static int span_same(const struct span *a, const struct span *b)
 {
@@ -166,7 +145,6 @@ int main(int argc, char **argv)
         gen_prim(ew, style);
         perstyle[style]++;
 
-        /* scissor and the rest of the state the walker reads */
         struct rdp *rs[2] = { ra, rb };
         const int x0 = rndn(3) ? 0 : (int)rndn(0x1000), y0 = rndn(3) ? 0 : (int)rndn(0x1000);
         int cxl = x0 + (int)rndn(0x1000), cyl = y0 + (int)rndn(0x1000);
@@ -208,7 +186,6 @@ int main(int argc, char **argv)
         if (vis) {
             visible++; vis_style[style]++;
             if (!bad) {
-                /* rows in ascending order, then in a shuffled order (a row must not depend on the ones before it) */
                 const int nr = end - start + 1;
                 int *order = nr > 0 ? malloc(sizeof(int) * (size_t)nr) : NULL;
                 for (int q = 0; q < nr; q++) order[q] = start + q;

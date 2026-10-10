@@ -1,16 +1,5 @@
 /*
  * mupen64plus-rdp-foir - raster.c
- * Span driver. Takes the scanlines produced by the edge walker, collects their
- * pixels (possibly from several consecutive scanlines) into struct-of-arrays
- * pixel batches and runs them through the kernel table (texture -> combine ->
- * zcmp -> blend -> store). FILL and COPY cycle types are dispatched to
- * dedicated kernels.
- *
- * Two span builders produce the batches: render_span_ref (portable C, with the
- * per-scanline coverage buffer of compute_cvg; the scalar renderer, and the
- * reference of the NEON builder in tools/kfuzz.c -m 64) and render_span_cycle
- * (NEON: vector stores for whole 16-lane blocks, coverage computed for the
- * edge pixels only). They must produce identical batches.
  *
  * Copyright (C) 2026 foir contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -25,8 +14,7 @@
 
 static struct { uint8_t cvg, cvbit, xoff, yoff; } cvarray[256];
 #if defined(FOIR_NEON)
-/* edge coverage of one subscanline at a pixel, indexed by subscanline * 8 + (x & 7): leftcvghex / rightcvghex already
- * shifted to the subscanline's place in the 8-bit mask */
+/* indexed by subscanline * 8 + (x & 7) */
 static uint8_t cvg_ltab[32] ALIGN16, cvg_rtab[32] ALIGN16;
 #endif
 
@@ -80,8 +68,6 @@ void raster_init_tables(void)
     done = true;
 }
 
-/* ---- coverage mask for one scanline: the reference (scalar renderer, and the test of the NEON builder) ---- */
-
 static void compute_cvg(struct rdp *r, const struct span *sp, int flip)
 {
     uint8_t *cvg = r->cvgbuf;
@@ -126,11 +112,7 @@ static void compute_cvg(struct rdp *r, const struct span *sp, int flip)
     }
 }
 
-/* ---- batch building --------------------------------------------------------- */
-
 #ifdef FOIR_STAGETIME
-/* per-stage timing build (-DFOIR_STAGETIME, aarch64 only): generic timer ticks per batch stage, the combine stage split
- * by kind of kernel; printed by foir-replay (inline rendering, -t 0) */
 static inline uint64_t stage_tick(void)
 {
     uint64_t v;
@@ -181,11 +163,7 @@ static void batch_flush(struct rdp *r, struct px_batch *b)
     b->fbmin = ~0u; b->fbmax = 0;
 }
 
-/* ---- portable span builder: the reference ------------------------------------------------------------------------------
- * Plain C, used by the scalar renderer and, in the NEON build, by the batch-builder test of tools/kfuzz.c that checks
- * the NEON builder against it (raster_render_job_ref). */
-
-/* interpolant lanes: dst[k] = base + step * k for k in [0, n) */
+/* portable span builder: the reference of the NEON builder (tools/kfuzz.c checks the two produce identical batches) */
 static void fill_ramp_c(int32_t *dst, int32_t base, int32_t step, int n)
 {
     for (int i = 0; i < n; i++) dst[i] = base + step * i;
@@ -228,8 +206,7 @@ static void render_span_ref(struct rdp *r, int y, const struct span *sp)
     if (length < 0) return;
     compute_cvg(r, sp, flip);
 
-    /* hardware iterates from xendsc (right end when !flip); we store pixels in ascending
-     * x order, so every interpolant advances by +d per pixel from the left end */
+    /* the hardware iterates from xendsc; pixels are stored in ascending x, so every interpolant advances by +d from the left end */
     int32_t rr = sp->r, gg = sp->g, bb = sp->b, aa = sp->a;
     int32_t zz = r->om.z_source_sel ? (int32_t)r->primitive_z : sp->z;
     int32_t ss = sp->s, tt = sp->t, ww = sp->w;
@@ -288,15 +265,11 @@ static void render_span_ref(struct rdp *r, int y, const struct span *sp)
     }
 }
 
-/* ---- NEON span builder ------------------------------------------------------------------------------------------------ */
-
 #if defined(FOIR_NEON)
 
-/* The colour buffer, Z buffer and hidden-bit lines of a run of pixels are touched by the zcmp / store stages a whole texture +
- * combiner pass later. Asking for them as soon as the run is known hides the cache misses of the first access (the Cortex-A55
- * does not reorder): 0.5-2 % of the replay time on one thread (3 % in Donkey Kong 64). Prefetches never fault. */
+/* zcmp / store touch these lines a whole texture + combine pass later; prefetching early hides the misses (the Cortex-A55 does not reorder) */
 #ifndef FOIR_PREFETCH
-#define FOIR_PREFETCH 3       /* locality hint of the prefetches; 0 = no prefetching */
+#define FOIR_PREFETCH 3
 #endif
 
 #if FOIR_PREFETCH
@@ -318,7 +291,6 @@ static void prefetch_piece(const struct rdp *r, uint32_t idx0, int take)
 }
 #endif
 
-/* ramps of the eight interpolants: dI = d * {0,1,2,3}, d4 = 4 * d */
 struct span_vec { int32x4_t dI[8], d4[8]; };
 
 static void span_vec_init(struct span_vec *sv, const struct prim_ctx *pc)
@@ -332,20 +304,11 @@ static void span_vec_init(struct span_vec *sv, const struct prim_ctx *pc)
     }
 }
 
-/* Coverage of a span without the per-pixel coverage buffer of the portable builder (compute_cvg).
- *
- * Subscanline i (0..3) covers pixels le_i < x < re_i completely, le_i and re_i partially (leftcvghex / rightcvghex
- * of the edge position) and nothing else; le / re are minorx / majorx, swapped when the primitive is flipped. As a
- * mask of pixel x that is  A_i(x) & B_i(x)  with
- *     A_i = x > le_i ? F_i : x == le_i ? L_i : 0      B_i = x < re_i ? F_i : x == re_i ? R_i : 0
- * (F_i: the subscanline's bits of the 8-bit mask) -- which also gives the right answer for le_i == re_i (L & R) and
- * for le_i > re_i (nothing). Invalid subscanlines have no bits. The span runs from the smallest valid le_i to the
- * largest valid re_i, so every pixel right of all le_i and left of all re_i has the same mask (v: all bits of the
- * valid subscanlines, 0xff when all four are valid): only the pixels of the "edge zones" (up to the largest le_i, from
- * the smallest re_i) need evaluating, which is a vector operation across the four subscanlines. minorx / majorx are
- * the 13-bit values of the edge walker. */
+/* Subscanline i covers pixels le_i < x < re_i fully and le_i, re_i partially (leftcvghex / rightcvghex); le / re are minorx / majorx, swapped when flipped.
+ * Mask of pixel x = A_i(x) & B_i(x), A_i = x > le_i ? F_i : x == le_i ? L_i : 0, B_i likewise with re_i / R_i (F_i: the subscanline's bits of the 8-bit mask);
+ * right for le_i == re_i (L & R) and le_i > re_i (nothing). Pixels right of all le_i and left of all re_i share one mask, so only the edge zones are evaluated. */
 struct cvg_edges {
-    int32x4_t lei, rei;           /* integer pixel of the edges, per subscanline */
+    int32x4_t lei, rei;
     uint32x4_t fm, lh, rh;        /* F_i, L_i, R_i of the edge pixels (0 for invalid subscanlines) */
     uint32_t v;                   /* mask of the pixels between the edge zones */
     int nl, rs;                   /* span-relative: left zone [0, nl), right zone [rs, ...), interior in between (nl <= rs) */
@@ -356,7 +319,7 @@ FOIR_INLINE void cvg_edges_init(struct cvg_edges *e, const struct span *sp, int 
     const int32_t *lp = flip ? sp->majorx : sp->minorx, *rp = flip ? sp->minorx : sp->majorx;
     const uint32x4_t lx = vreinterpretq_u32_s32(vld1q_s32(lp)), rx = vreinterpretq_u32_s32(vld1q_s32(rp));
     const uint32x4_t iv = vreinterpretq_u32_s32(vld1q_s32(sp->invalyscan));
-    const uint32x4_t inv = vtstq_u32(iv, iv);                                  /* all ones in invalid subscanlines */
+    const uint32x4_t inv = vtstq_u32(iv, iv);
     static const uint32_t lane8[4] = { 0, 8, 16, 24 }, fmv[4] = { 0xa0, 0x50, 0x0a, 0x05 };
     const uint32x4_t seven = vdupq_n_u32(7);
     const uint32x4_t ho = vorrq_u32(vdupq_n_u32(0xffffff00u), inv);            /* table index: byte 0 = (x & 7) + lane * 8, 0xff = none */
@@ -375,7 +338,6 @@ FOIR_INLINE void cvg_edges_init(struct cvg_edges *e, const struct span *sp, int 
     e->rs = rs < nl ? nl : rs;
 }
 
-/* the 8-bit coverage mask of pixel x */
 FOIR_INLINE uint32_t cvg_mask_at(const struct cvg_edges *e, int x)
 {
     const int32x4_t xv = vdupq_n_s32(x);
@@ -384,7 +346,6 @@ FOIR_INLINE uint32_t cvg_mask_at(const struct cvg_edges *e, int x)
     return vaddvq_u32(vandq_u32(a, bm));
 }
 
-/* coverage of the pixel at span-relative position p into lane `lane` of the batch; returns the "full" bit */
 FOIR_INLINE int cvg_patch(struct px_batch *b, const struct cvg_edges *e, int lo, int p, int lane)
 {
     const uint32_t m = cvg_mask_at(e, lo + p);
@@ -395,10 +356,8 @@ FOIR_INLINE int cvg_patch(struct px_batch *b, const struct cvg_edges *e, int lo,
     return m == 0xff;
 }
 
-/* The vector stores of one piece of a span (take pixels; the batch arrays have 16 lanes of slack and the lanes past the piece
- * are ignored, so the ramps run in groups of four lanes and the byte arrays are stored as whole 16-lane vectors): batch
- * geometry, the interpolant ramps of the channels the pipeline reads and the constant coverage of the interior. M selects the channels (1 shade rgb + alpha, 2 shade alpha only, 4 Z, 8 texture
- * coordinates); it is a constant, so each instance is straight-line code with no per-channel branches. */
+/* The batch arrays have 16 lanes of slack and lanes past the piece are ignored, so ramps run in groups of four lanes and byte arrays are stored as whole
+ * 16-lane vectors. M is a constant selecting the channels (1 shade rgb + alpha, 2 shade alpha only, 4 Z, 8 texture coordinates): straight-line code per instance. */
 struct cv_const { uint8x16_t cvg, cvbit, offx, offy; };
 
 FOIR_INLINE void piece_fill(struct px_batch *b, int pos, int take, uint32_t idx0, int x0, uint8_t dity, const struct span_vec *sv,
@@ -426,7 +385,6 @@ FOIR_INLINE void piece_fill(struct px_batch *b, int pos, int take, uint32_t idx0
         vt = vaddq_s32(vdupq_laneq_s32(c_hi, 1), sv->dI[5]);
         vw = vaddq_s32(vdupq_laneq_s32(c_hi, 2), sv->dI[6]);
     }
-    /* four lanes of every channel (they advance together), then on to the next four */
 #define PF_STEP() do { \
         vst1q_u32(&b->fbidx[q], iv); \
         if (RGB) { vst1q_s32(&b->cr[q], vr); vst1q_s32(&b->cg[q], vg); vst1q_s32(&b->cb[q], vbl); } \
@@ -472,8 +430,7 @@ static void render_span_cycle(struct rdp *r, int y, const struct span *sp, const
     else       { length = xstart - xendsc; scdiff = xendsc - xend; }
     if (length < 0) return;
 
-    /* hardware iterates from xendsc (right end when !flip); pixels are stored in ascending x order,
-     * so every interpolant advances by +d per pixel from the left end */
+    /* the hardware iterates from xendsc; pixels are stored in ascending x, so every interpolant advances by +d from the left end */
     int32x4_t b_lo = vld1q_s32(&sp->r), b_hi = vld1q_s32(&sp->s);       /* r g b a | s t w z */
     if (r->om.z_source_sel) b_hi = vsetq_lane_s32((int32_t)r->primitive_z, b_hi, 3);
     if (scdiff) {
@@ -497,7 +454,7 @@ static void render_span_cycle(struct rdp *r, int y, const struct span *sp, const
 
     struct cvg_edges e;
     cvg_edges_init(&e, sp, flip, xlow);
-    const uint8x16x4_t kc4 = vld4q_dup_u8(&cvarray[e.v].cvg);             /* the table entry of the interior mask, splatted */
+    const uint8x16x4_t kc4 = vld4q_dup_u8(&cvarray[e.v].cvg);
     const struct cv_const kcv = { kc4.val[0], kc4.val[1], kc4.val[2], kc4.val[3] };
 
     int done = 0;
@@ -527,7 +484,6 @@ static void render_span_cycle(struct rdp *r, int y, const struct span *sp, const
             }
         }
         {
-            /* the pixels of the edge zones that fall into this piece have their own coverage */
             const int pe = done + take;
             int full = e.v == 0xff;
             int pa = done, pb = e.nl < pe ? e.nl : pe;
@@ -541,9 +497,7 @@ static void render_span_cycle(struct rdp *r, int y, const struct span *sp, const
         if (b->n >= FOIR_BATCH) batch_flush(r, b);
     }
 }
-#endif /* FOIR_NEON */
-
-/* ---- entry ------------------------------------------------------------------ */
+#endif
 
 static void prim_prepare(struct rdp *r)
 {
@@ -560,7 +514,6 @@ static void prim_prepare(struct rdp *r)
     pc->dwinc = f ? pc->dw : -pc->dw; pc->dzinc = f ? pc->dz : -pc->dz;
 }
 
-/* the first row >= y that belongs to stripe class `wid` of `nw` */
 static inline int row_first_owned(int y, int nw, int wid)
 {
     int s = y >> FOIR_STRIPE_SHIFT, m = s % nw;
@@ -570,8 +523,7 @@ static inline int row_first_owned(int y, int nw, int wid)
     return (s + ds) << FOIR_STRIPE_SHIFT;
 }
 
-/* Render the rows start..end of a job that this context owns. The spans come from the setup record `pw` (computed here, one
- * row at a time, by walk_row) or, for the tests, from the ready-made array `rows` (pw == NULL). */
+/* spans come from the setup record `pw`, or for the tests from the ready-made `rows` (pw == NULL) */
 FOIR_INLINE void render_job(struct rdp *r, const struct span *rows, int jlo, const struct prim_walk *pw, int start, int end, int ref)
 {
     const struct foir_kernels *k = r->k;
@@ -582,8 +534,7 @@ FOIR_INLINE void render_job(struct rdp *r, const struct span *rows, int jlo, con
     const int wid = nw > 1 ? r->worker_id : 0;
     struct span row;
 
-    /* The rows this context renders: stripes (y >> FOIR_STRIPE_SHIFT) with stripe % nw == wid, in ascending order. Whole
-     * stripes the context does not own are jumped over (a class of the worker pool is 1 / nw of the stripes). */
+    /* stripes (y >> FOIR_STRIPE_SHIFT) with stripe % nw == wid; whole stripes owned by others are jumped over */
 #define FIRST_ROW(y) ((nw == 1) ? (y) : row_first_owned((y), nw, wid))
 #define NEXT_ROW_IDX(y) ((nw == 1 || (((y) + 1) & ((1 << FOIR_STRIPE_SHIFT) - 1))) ? (y) + 1 : (y) + 1 + (nw - 1) * (1 << FOIR_STRIPE_SHIFT))
 #define NEXT_ROW() \
@@ -646,7 +597,6 @@ void raster_render_job(struct rdp *r, const struct span *rows, int jlo, int star
     render_job(r, rows, jlo, NULL, start, end, 0);
 }
 
-/* the same with the portable span builder (tools/kfuzz.c compares the two) */
 void raster_render_job_ref(struct rdp *r, const struct span *rows, int jlo, int start, int end)
 {
     render_job(r, rows, jlo, NULL, start, end, 1);

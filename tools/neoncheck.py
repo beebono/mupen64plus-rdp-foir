@@ -1,27 +1,11 @@
 #!/usr/bin/env python3
-"""neoncheck.py: automated bit-exactness check of the optimised renderer against the scalar reference.
+"""neoncheck.py: bit-exactness of the optimised renderer against the scalar reference: foir-replay final RDRAM images are compared byte for byte.
 
-For every scene it replays the recorded RDP commands with foir-replay
-
-    reference:  --scalar            (scalar C kernels, parser thread only)
-    candidates: default kernels     (NEON on aarch64) with 0, 1, 2 and 3 worker threads
-                pool settings       with the max thread count: no helper, 4 classes per worker
-                generic kernels     (--nospec: the per-state specialised variants off) inline and with 3 threads
-    and, on top of that, the plugin-default knobs (--fast: RelaxedPrecision on, which the scalar kernels do not
-    have): specialised against generic, inline and with 3 threads
-
-and requires the final RDRAM images to be byte-identical. Scenes are
-
-    * the captured frames in test-data/dumps/*.fdump(.xz)
-    * the synthetic regression scenes of regress.py (generated on the fly)
-    * any extra .fdump given on the command line
+Reference: --scalar. Candidates: default kernels with 0..3 worker threads, pool settings, generic kernels (--nospec), and with the plugin-default knobs
+(--fast; scalar has no RelaxedPrecision) specialised against generic. Scenes: test-data/dumps/*.fdump(.xz), the synthetic scenes of regress.py, extra files.
 
 usage: neoncheck.py [--replay path/to/foir-replay] [--runner "qemu-aarch64-static -L /usr/aarch64-linux-gnu"]
                     [--threads 0,1,2,3] [--no-synthetic] [--no-dumps] [extra.fdump ...]
-
-On an x86_64 host the "candidates" differ from the reference only by the thread count (there are no NEON
-kernels there); on aarch64 the check covers NEON, NEON + threads and the scalar path. The script exits
-non-zero on the first difference after printing all of them.
 """
 import argparse
 import hashlib
@@ -120,8 +104,6 @@ def main():
                 if not cov and 'specialised pixels' in info:
                     cov = info.split('specialised pixels:')[1].strip().split('\n')[0]
             if max(threads) > 0:
-                # the worker pool's settings: the emulation thread as a helper at its barriers (default, above), no helper, 3 / 4 stripe
-                # classes per worker
                 for tag, e in (('nohelper', {'FOIR_HELPER': '0'}), ('g4', {'FOIR_MT_CLASSES': '4'})):
                     out = os.path.join(tmp, 'cand.rdram')
                     replay(args, path, out, ['-t', str(max(threads))], env=e)
@@ -131,8 +113,6 @@ def main():
                         bad += 1
                     os.remove(out)
             if kern == 'neon':
-                # the combiner dispatch: shape kernels only (FOIR_SPEC_COMB=shape: exact variants off, shape kernels where
-                # one exists, else generic), exact variants only, generic only
                 for mode in ('shape', 'exact', 'generic'):
                     for t in sorted(set([0, max(threads)])):
                         out = os.path.join(tmp, 'cand.rdram')
@@ -141,7 +121,6 @@ def main():
                         line.append('comb=%s%s:%s' % (mode, '+%dt' % t if t else '', 'ok' if ok else 'DIFF'))
                         bad += not ok
                         os.remove(out)
-                # the same for the texture unit: "any format" kernels only, exact variants only, generic kernel only
                 for mode in ('shape', 'exact', 'generic'):
                     for t in sorted(set([0, max(threads)])):
                         out = os.path.join(tmp, 'cand.rdram')
@@ -150,7 +129,6 @@ def main():
                         line.append('tex=%s%s:%s' % (mode, '+%dt' % t if t else '', 'ok' if ok else 'DIFF'))
                         bad += not ok
                         os.remove(out)
-                # generic kernels (variants off) must give the same bytes as the reference too
                 for t in sorted(set([0, max(threads)])):
                     out = os.path.join(tmp, 'cand.rdram')
                     replay(args, path, out, ['--nospec'] + (['-t', str(t)] if t else []))
@@ -158,7 +136,7 @@ def main():
                     line.append('generic%s:%s' % ('+%dt' % t if t else '', 'ok' if ok else 'DIFF'))
                     bad += not ok
                     os.remove(out)
-                # plugin-default knobs: variants vs generic kernels (no scalar equivalent of RelaxedPrecision)
+                # no scalar equivalent of RelaxedPrecision
                 out = os.path.join(tmp, 'cand.rdram')
                 replay(args, path, out, ['--fast', '--nospec'])
                 hfast = sha(out)

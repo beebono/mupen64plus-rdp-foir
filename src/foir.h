@@ -1,6 +1,5 @@
 /*
  * mupen64plus-rdp-foir - foir.h
- * Common definitions shared by every foir module.
  *
  * Copyright (C) 2026 foir contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -13,7 +12,7 @@
 #include <stddef.h>
 #include <string.h>
 
-#define FOIR_VERSION        0x000100  /* 0.1.0 (M1) */
+#define FOIR_VERSION        0x000100
 #define FOIR_NAME           "foir RDP"
 
 #if defined(__GNUC__)
@@ -39,7 +38,7 @@
 #define FOIR_HALF_XOR   1
 #endif
 
-/* log levels match M64MSG_* in m64p_types.h */
+/* = M64MSG_* */
 enum { FOIR_LOG_ERROR = 1, FOIR_LOG_WARNING = 2, FOIR_LOG_INFO = 3, FOIR_LOG_STATUS = 4, FOIR_LOG_VERBOSE = 5 };
 void foir_log(int level, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 void foir_log_set_callback(void (*cb)(void *ctx, int level, const char *msg), void *ctx);

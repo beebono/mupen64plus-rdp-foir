@@ -1,14 +1,12 @@
 /*
  * mupen64plus-rdp-foir - kspec_mem.inc (included by kneon_mem.c)
- * Specialised Z compare / colour buffer read and FB / Z store variants: zcmp_body() and store_body() with a
- * literal state. The variants are listed in spec_zcmp.def and spec_store.def. ANTIALIAS_EN and FORCE_BLEND are read
- * from the render state by every zcmp variant (they are not part of its key).
  *
  * Copyright (C) 2026 foir contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include "spec.h"
 
+/* ANTIALIAS_EN and FORCE_BLEND are read from the render state by every zcmp variant (not part of its key) */
 #define ZCMP(fbsz, rd, fbfmt, zc, zmode, shifts, relaxed) \
     ZCMP_NAMED(zcmp_##fbsz##rd##fbfmt##_##zc##zmode##_##shifts##relaxed, fbsz, rd, fbfmt, zc, zmode, shifts, relaxed)
 #define ZCMP_NAMED(nm, fbsz, rd, fbfmt, zc, zmode, shifts, relaxed) \

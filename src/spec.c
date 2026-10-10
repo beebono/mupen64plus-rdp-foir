@@ -1,8 +1,5 @@
 /*
  * mupen64plus-rdp-foir - spec.c
- * Variant selection for the specialised pixel kernels: stage keys derived from the render state, the
- * lookup of the compiled variants and the helpers the tests use (key -> render state, key -> source text).
- * See spec.h; the variants themselves are in kspec_*.inc, included by the kneon_*.c files.
  *
  * Copyright (C) 2026 foir contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -22,7 +19,7 @@ extern const struct spec_ent foir_spec_ents_shape[];
 extern const int foir_spec_n_tex, foir_spec_n_comb, foir_spec_n_zcmp, foir_spec_n_blend, foir_spec_n_store, foir_spec_n_shape;
 #endif
 
-#define HASH_SLOTS 1024    /* per stage, power of two (more than twice the number of variants) */
+#define HASH_SLOTS 1024    /* per stage, power of two */
 static uint16_t hash_tab[SPEC_NSTAGES + 1][HASH_SLOTS];
 static bool spec_ready, spec_off, spec_verify;
 static int spec_comb_mode = COMB_AUTO, spec_tex_mode = COMB_AUTO;
@@ -104,9 +101,6 @@ const struct spec_ent *foir_spec_find(int stage, const union spec_key *k)
     return NULL;
 }
 
-/* the "any option" form of a state key: the options that only steer branches of the code are read at run time (combine,
- * blend); for the texture unit the "any format" form, which keeps the structure of the texture unit (cycles, filter,
- * TLUT use, perspective, LOD) and reads the tile formats from the state */
 void foir_spec_any_key(int stage, union spec_key *k)
 {
     if (stage == SPEC_COMB) {
@@ -133,9 +127,7 @@ const struct spec_ent *foir_spec_lookup(int stage, const union spec_key *k)
     return foir_spec_find(stage, &a);
 }
 
-/* ---- keys ------------------------------------------------------------------------------------ */
-
-/* texel values can leave 0..255 (YUV tiles, BI_LERP = 0): the combiner extends texel operands (see kneon_comb.c) */
+/* texel values can leave 0..255 (YUV tiles, BI_LERP = 0) */
 static bool spec_tex_wide(const struct rdp *r)
 {
     const struct other_modes *om = &r->om;
@@ -161,7 +153,6 @@ void foir_spec_keys(const struct rdp *r, union spec_key keys[SPEC_NSTAGES], bool
     const struct tile *tl0 = &r->tile[tn], *tl1 = &r->tile[(tn + 1) & 7];
     memset(keys, 0, sizeof(union spec_key) * SPEC_NSTAGES);
 
-    /* texture */
     {
         struct tex_key *k = &keys[SPEC_TEX].tex;
         const int pointplain = !(om->sample_type || om->en_tlut);
@@ -182,7 +173,6 @@ void foir_spec_keys(const struct rdp *r, union spec_key keys[SPEC_NSTAGES], bool
         k->lod = (uint8_t)om->dolod;
         k->lodt = (uint8_t)om->tex_lod_en;
     }
-    /* combiner */
     {
         struct comb_key *k = &keys[SPEC_COMB].comb;
         ok[SPEC_COMB] = !om->key_en;
@@ -194,7 +184,6 @@ void foir_spec_keys(const struct rdp *r, union spec_key keys[SPEC_NSTAGES], bool
         k->shrgb = r->pf.shade_rgb; k->sha = (uint8_t)(r->pf.shade_a || r->pf.shade_rgb);
         k->wide = (uint8_t)spec_tex_wide(r);
     }
-    /* Z compare */
     {
         struct zcmp_key *k = &keys[SPEC_ZCMP].zcmp;
         ok[SPEC_ZCMP] = r->fb_size >= PIXEL_SIZE_16BIT;
@@ -207,7 +196,6 @@ void foir_spec_keys(const struct rdp *r, union spec_key keys[SPEC_NSTAGES], bool
         k->relaxed = (uint8_t)((om->z_compare_en && (om->z_mode == ZMODE_OPAQUE || om->z_mode == ZMODE_TRANSPARENT))
                                ? r->cfg.relaxed_precision : 0);
     }
-    /* blender */
     {
         struct blend_key *k = &keys[SPEC_BLEND].blend;
         ok[SPEC_BLEND] = true;
@@ -222,7 +210,6 @@ void foir_spec_keys(const struct rdp *r, union spec_key keys[SPEC_NSTAGES], bool
         k->cvgcol = (uint8_t)om->color_on_cvg;
         k->rgbd = (uint8_t)om->rgb_dither_sel;
     }
-    /* store */
     {
         struct store_key *k = &keys[SPEC_STORE].store;
         ok[SPEC_STORE] = r->fb_size >= PIXEL_SIZE_16BIT;
@@ -283,13 +270,10 @@ void foir_spec_select(struct rdp *r)
     }
 }
 
-/* ---- shape kernels: key and operand table ---------------------------------------------------------------- */
-
 #define SKO(field) offsetof(struct px_batch, field)
 #define SKROW ((unsigned)(FOIR_LANES * sizeof(int16_t)))
 
-/* letter of a combiner input register. COMBINED only exists in cycle 1 of a two-cycle state (cycle 0 and one-cycle
- * states read zero); an RGB equation can read COMBINED alpha too, which is not "its" channel: variable (c0a array) */
+/* COMBINED only exists in cycle 1 of a two-cycle state (else it reads zero); an RGB equation can read COMBINED alpha, which is not "its" channel: variable (c0a array) */
 static int sk_letter(int reg, int ch, bool combact)
 {
     if (reg == REG_ZERO) return SKL_Z;
@@ -332,10 +316,9 @@ struct sk_build {
     int kreg[SK_NKC];
     int nk;
     bool texv, lodfm;
-    uint8_t cm[2][2];          /* constant variable operands, bit per position */
+    uint8_t cm[2][2];
 };
 
-/* where the variable operand `reg` of position pos (0 A, 1 B, 2 multiply, 3 add) of cycle cy comes from, channel ch */
 static bool sk_slot(const struct rdp *r, struct sk_build *B, int cy, bool two, int pos, int ch, int reg, int half)
 {
     const bool c1 = two && cy == 1;
@@ -358,7 +341,7 @@ static bool sk_slot(const struct rdp *r, struct sk_build *B, int cy, bool two, i
         const int form = pos == 2;            /* multiply input: sign extended, else the A/B/D extension */
 #if FOIR_SK_SPLIT
         B->cm[cy][half] |= (uint8_t)(1 << pos);
-        B->t.off[cy][pos][ch] = (uint16_t)(form ? sk_sext9(v) : sk_ext9(v));      /* the value itself, known to be a constant */
+        B->t.off[cy][pos][ch] = (uint16_t)(form ? sk_sext9(v) : sk_ext9(v));
         return true;
 #endif
         int i;
@@ -418,7 +401,6 @@ bool foir_shape_resolve(const struct rdp *r, union spec_key *key, struct sk_tab 
     return true;
 }
 
-/* the shape kernel for the state of r, if there is one: builds its operand table and splats the constants */
 static const struct spec_ent *shape_pick(struct rdp *r)
 {
     if (!foir_spec_tabs[SPEC_SHAPE].n) return NULL;
@@ -438,8 +420,6 @@ void foir_shape_export(const struct rdp *r, struct px_batch *dst)
 {
     memcpy(dst->kc, r->batch.kc, sizeof(dst->kc));
 }
-
-/* ---- tests: key -> render state -------------------------------------------------------------------- */
 
 static void set_tile_fs(struct rdp *r, int t, int fmt, int siz)
 {
@@ -471,7 +451,6 @@ void foir_spec_apply(int stage, const union spec_key *key, struct rdp *r)
             if (k->two && k->t1) set_tile_fs(r, tn + 1, k->fmt1, k->siz1);
             else if (k->two && r->tile[(tn + 1) & 7].format == FORMAT_YUV) set_tile_fs(r, tn + 1, FORMAT_RGBA, r->tile[(tn + 1) & 7].size);
         }
-        /* a combiner that reads exactly the texels the key says (everything else zero) */
         int *c = r->comb.raw;
         for (int i = 0; i < 16; i++) c[i] = 0;
         for (int cy = 0; cy < 2; cy++) {
@@ -548,8 +527,6 @@ void foir_spec_apply(int stage, const union spec_key *key, struct rdp *r)
 }
 
 
-/* ---- tests: shape key -> render state ------------------------------------------------------------------------ */
-
 static uint32_t sk_rnd(uint64_t *s)
 {
     uint64_t x = *s;
@@ -558,7 +535,6 @@ static uint32_t sk_rnd(uint64_t *s)
     return (uint32_t)((x * 0x2545f4914f6cdd1dull) >> 33);
 }
 
-/* selector values of (half, pos) whose input has this letter (cycle with / without COMBINED) */
 static bool sk_isconst(int reg) { return reg == REG_K4 || reg == REG_K5 || reg == REG_PLODF || (reg >= REG_PRIM && reg < REG_PRIM + 4) ||
                                          (reg >= REG_ENV && reg < REG_ENV + 4) || (reg >= REG_KEYC && reg < REG_KEYC + 6); }
 
@@ -599,9 +575,8 @@ void foir_shape_apply(const union spec_key *key, struct rdp *r, uint64_t seed)
     om->cycle_type = two ? CYCLE_TYPE_2 : CYCLE_TYPE_1;
     om->key_en = 0;
     int *c = r->comb.raw;
-    /* the unused cycle 0 of a one-cycle state: any selectors */
     if (!two) for (int half = 0; half < 2; half++) for (int pos = 0; pos < 4; pos++) c[half * 4 + pos] = sk_pick_any(&rs, half, pos);
-    int mslot[2][2] = { { 0, 0 }, { 0, 0 } };       /* [cycle][half]: the multiply input is variable */
+    int mslot[2][2] = { { 0, 0 }, { 0, 0 } };
     int vany[2][2][4] = { { { 0 } } };
     for (int cy = two ? 0 : 1; cy < 2; cy++) {
         const bool combact = two && cy == 1;
@@ -635,11 +610,10 @@ void foir_shape_apply(const union spec_key *key, struct rdp *r, uint64_t seed)
             mslot[cy][half] = L[2] == SKL_V;
         }
     }
-    /* options that decide whether the variable operands can leave 0..255 */
     bool routed = false;
     if (k->ext) {
         /* either sharpened LOD fraction in a multiply input, or wide texels in some variable operand */
-        int cand[16][3], nc = 0;     /* [n] = cycle, half, pos */
+        int cand[16][3], nc = 0;
         for (int cy = two ? 0 : 1; cy < 2; cy++) for (int half = 0; half < 2; half++) for (int pos = 0; pos < 4; pos++)
             if (vany[cy][half][pos] && !(FOIR_SK_SPLIT && ((k->cm[cy][half] >> pos) & 1))) { cand[nc][0] = cy; cand[nc][1] = half; cand[nc][2] = pos; nc++; }
         for (int cy = two ? 0 : 1; cy < 2 && !routed; cy++) for (int half = 0; half < 2 && !routed; half++)
@@ -671,8 +645,6 @@ void foir_shape_apply(const union spec_key *key, struct rdp *r, uint64_t seed)
         if (!k->ext) om->sharpen_tex_en = 0;
     }
 }
-
-/* ---- key -> source text ------------------------------------------------------------------------------ */
 
 char *foir_spec_describe(int stage, const union spec_key *key, char *buf, size_t n)
 {

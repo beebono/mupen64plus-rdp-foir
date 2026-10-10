@@ -1,15 +1,12 @@
 /*
  * mupen64plus-rdp-foir - kspec_blend.inc (included by kneon_blend.c)
- * Specialised blender variants: blend_body() with a literal blender state (selectors, alpha compare, coverage,
- * dither). The variants are listed in spec_blend.def.
  *
  * Copyright (C) 2026 foir contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include "spec.h"
 
-/* BLEND: every option literal. BLENDX: the "any option" form of the same selectors (alpha compare, coverage, dither
- * options read from the render state). A state looks for BLEND first, then BLENDX. */
+/* BLENDX: alpha compare, coverage and dither options are read from the render state; a state looks for BLEND first, then BLENDX */
 #define BLEND(two, a0, b0, c0, d0, a1, b1, c1, d1, acmp, dal, aa, force, cvgcol, rgbd) \
     BLEND_NAMED(blend_##two##_##a0##b0##c0##d0##_##a1##b1##c1##d1##_##acmp##dal##aa##force##cvgcol##rgbd, \
                 two, a0, b0, c0, d0, a1, b1, c1, d1, acmp, dal, aa, force, cvgcol, rgbd)

@@ -1,4 +1,4 @@
-# sourced on the device. Private dev dir for the parallel-rsp VU work (never touches /storage/foir-dev).
+# sourced on the device; private dev dir (never touches /storage/foir-dev)
 . /etc/profile >/dev/null 2>&1
 export XDG_RUNTIME_DIR=/var/run/0-runtime-dir WAYLAND_DISPLAY=wayland-1 SDL_VIDEODRIVER=wayland SDL_AUDIODRIVER=dummy HOME=/storage
 D=/storage/prsp-dev
@@ -13,7 +13,6 @@ rsp_args() {
               RSPARGS="--rsp $D/plugins/mupen64plus-rsp-timing.so" ;;
   esac
 }
-# foreign_check: abort the session if somebody else is running an emulator
 foreign_check() {
   if pgrep -x mupen64plus >/dev/null 2>&1; then echo "FOREIGN mupen64plus running"; pgrep -a mupen64plus; return 1; fi
   return 0

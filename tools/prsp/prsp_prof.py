@@ -29,7 +29,6 @@ for f in sys.argv[1:]:
     vu=sum(n for k,n in c.items() if k in VU); ls=sum(n for k,n in c.items() if k in LW or k in SW)
     print("=====",f,"total instrs",tot,"VU %.1f%% LS %.1f%% blocks-enter %.2f%%"%(100*vu/tot,100*ls/tot,100*ent/tot))
     print(" top:", ", ".join("%s %.1f%%"%(k,100*n/tot) for k,n in c.most_common(32)))
-    # element dist among VU
     ez=sum(n for (k,x),n in e.items() if x==0); print(" VU with e==0: %.1f%% ; e 2..3(q): %.1f%% ; e 4-7(h) %.1f%% ; e 8-15 (w) %.1f%%"%tuple(100*sum(n for (k,x),n in e.items() if a<=x<=b)/max(vu,1) for a,b in ((0,1),(2,3),(4,7),(8,15))))
     def runstats(r):
         tot_instr=sum(k*n for k,n in r.items()); runs=sum(r.values())

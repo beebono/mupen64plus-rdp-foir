@@ -1,5 +1,4 @@
-/* specialised Z compare / colour buffer read variants: ZCMP(fbsz, rd,fbfmt, zc,zmode, shifts, relaxed); see kspec_mem.inc */
-/* every combination for a 16-bit colour buffer (tools/specmatrix.py zcmp); ANTIALIAS_EN / FORCE_BLEND are read at run time */
+/* ZCMP(fbsz, rd,fbfmt, zc,zmode, shifts, relaxed) */
 ZCMP(2, 0,0, 0,0, 0, 0)
 ZCMP(2, 0,0, 1,0, 0, 0)
 ZCMP(2, 0,0, 1,0, 0, 1)

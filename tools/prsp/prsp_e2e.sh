@@ -1,10 +1,7 @@
 #!/bin/sh
-# on device. Deterministic end-to-end run for bit-exactness checks of the RSP plugin:
-#   prsp_e2e.sh ROMFILE MODE RSPSO TAG TMO [FRAMES]
-#   MODE hle (rsp-hle + RspFallback=RSPSO, as in the pairing) | parallel (RSPSO as the RSP plugin; LLE audio, dumped when AUDIO=1)
-# Core[RandomizeInterrupt]=False; foir screenshots at FRAMES (default 300,900,1500,2100,2700, FOIR_SHOT_FRAMES), one
-# FNV hash per DoRspCycles call over DMEM+IMEM+return value (RSPT_HASH, see rspt.c) and, with AUDIO=1, the raw AI DMA stream.
-# Stops as soon as the last screenshot exists (or after TMO s). Results: $D/e2e/TAG/{shots.md5,rsp.hash.md5,rsp.hash.lines,audio.raw}
+# on device. prsp_e2e.sh ROMFILE MODE RSPSO TAG TMO [FRAMES]: deterministic run for RSP bit-exactness
+#   MODE hle (rsp-hle + RspFallback=RSPSO) | parallel (RSPSO as the RSP plugin)
+# per-DoRspCycles FNV hash (RSPT_HASH, see rspt.c), screenshots at FRAMES (FOIR_SHOT_FRAMES), AI DMA stream with AUDIO=1; results in $D/e2e/TAG/{shots.md5,rsp.hash.md5,rsp.hash.lines,audio.raw}
 D=/storage/prsp-dev; . $D/prsp_common.sh
 ROM="/storage/roms/n64/$1"; rsp_args $2 $3; TAG=$4; TMO=${5:-70}; FR=${6:-300,900,1500,2100,2700}
 LAST=$(echo $FR | tr ',' '\n' | tail -1)

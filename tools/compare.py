@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""compare.py: decode the framebuffer out of two RDRAM dumps (foir vs angrylion)
-and report / visualise the differences.
-
-usage: compare.py dump.fdump foir.rdram angry.rdram out_prefix
-Writes out_prefix_foir.png, _angry.png, _diff.png and prints statistics.
-"""
+"""compare.py dump.fdump foir.rdram angry.rdram out_prefix: decodes both framebuffers, writes out_prefix_{foir,angry,diff}.png and prints statistics"""
 import struct
 import sys
 

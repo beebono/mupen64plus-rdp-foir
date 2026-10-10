@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""rdpgen: tiny RDP command assembler used to build synthetic foir dumps.
-
-Commands are lists of 32-bit words (big-endian values, as the RDP sees them).
-A Scene collects commands plus an RDRAM image and writes an .fdump file in the
-format described in fdump.h.
-"""
+"""rdpgen: tiny RDP command assembler for synthetic foir dumps (fdump.h format); commands are lists of big-endian 32-bit words"""
 import math
 import struct
 
@@ -14,8 +9,6 @@ RDRAM_SIZE = 0x800000
 def w(*words):
     return [x & 0xFFFFFFFF for x in words]
 
-
-# ---- state commands ---------------------------------------------------------
 
 def set_color_image(fmt, size, width, addr):
     return w((0x3F << 24) | (fmt << 21) | (size << 19) | (width - 1), addr)
@@ -64,7 +57,6 @@ def set_convert(k0, k1, k2, k3, k4, k5):
 
 
 def set_combine(a0, b0, c0, d0, A0, B0, C0, D0, a1, b1, c1, d1, A1, B1, C1, D1):
-    """rgb (a-b)*c+d, alpha (A-B)*C+D for cycle 0 and cycle 1 (raw field values)."""
     w0 = (a0 << 20) | (c0 << 15) | (A0 << 12) | (C0 << 9) | (a1 << 5) | c1
     w1 = (b0 << 28) | (b1 << 24) | (A1 << 21) | (C1 << 18) | (d0 << 15) | (B0 << 12) | \
          (D0 << 9) | (d1 << 6) | (B1 << 3) | D1
@@ -116,8 +108,6 @@ def sync_full():
 def sync_pipe():
     return w(0x27 << 24, 0)
 
-
-# ---- primitives ---------------------------------------------------------------
 
 def fill_rect(x0, y0, x1, y1):
     xl, yl, xh, yh = int(x1 * 4), int(y1 * 4), int(x0 * 4), int(y0 * 4)
@@ -186,8 +176,7 @@ def triangle(verts, shade=None, tex=None, zs=None, tile=0, level=0):
         return dadx, dady
 
     def attr_block(vals):
-        """vals: list of 3-vertex arrays -> 8 words (int hi/lo pairs) laid out as the RDP wants
-        for pairs of attributes. Returns (base, dx, de, dy) lists"""
+        """vals: list of 3-vertex arrays -> 8 words (int hi/lo pairs) as the RDP wants them for pairs of attributes; returns (base, dx, de, dy)"""
         base, dx, de, dy = [], [], [], []
         for a in vals:
             dadx, dady = grads(a)
@@ -228,8 +217,6 @@ def triangle(verts, shade=None, tex=None, zs=None, tile=0, level=0):
     words[0] = (words[0] & 0x00FFFFFF) | (cmd << 24)
     return [x & 0xFFFFFFFF for x in words]
 
-
-# ---- scene container ------------------------------------------------------------
 
 class Scene:
     def __init__(self):

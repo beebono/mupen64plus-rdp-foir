@@ -1,7 +1,5 @@
 /*
  * mupen64plus-rdp-foir - parser.c
- * RDP command stream reader, command dispatch and the state-setting commands
- * (set_tile, set_other_modes, set_combine, syncs, ...).
  *
  * Copyright (C) 2026 foir contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -13,14 +11,11 @@
 #include "combreg.h"
 #include "spec.h"
 
-/* FOIR_FRAMELOG builds count the texture loads for the per-frame record */
 #ifdef FOIR_FRAMELOG
 #define FL_LOAD(r) ((r)->stat_loads++)
 #else
 #define FL_LOAD(r) ((void)0)
 #endif
-
-/* ---- command lengths (bytes) ------------------------------------------ */
 
 static uint8_t cmd_length_bytes[64];
 
@@ -42,16 +37,12 @@ static void init_cmd_lengths(void)
     done = true;
 }
 
-/* ---- derived state ----------------------------------------------------- */
-
 static int reg_in_group(int idx, int base) { return idx >= base && idx < base + 4; }
 
 static void combiner_resolve(struct rdp *r)
 {
     const int *c = r->comb.raw;
-    /* raw layout: [0]=suba_rgb0 [1]=subb_rgb0 [2]=mul_rgb0 [3]=add_rgb0
-     *             [4]=suba_a0   [5]=subb_a0   [6]=mul_a0   [7]=add_a0
-     *             [8..15] same for cycle 1 (the selector -> register mapping is in combreg.h) */
+    /* raw: [0..3] suba, subb, mul, add of rgb0; [4..7] same for alpha0; [8..15] cycle 1 (selector -> register mapping: combreg.h) */
     for (int cy = 0; cy < 2; cy++) {
         for (int ch = 0; ch < 3; ch++)
             for (int i = 0; i < 4; i++)
@@ -66,7 +57,6 @@ void rdp_update_derived(struct rdp *r)
     struct other_modes *om = &r->om;
     combiner_resolve(r);
 
-    /* which texels / lod fraction does the active combiner reference? */
     int first = (om->cycle_type == CYCLE_TYPE_2) ? 0 : 1;
     int t0 = 0, t1 = 0, lodf = 0, noise = 0;
     for (int cy = first; cy < 2; cy++) {
@@ -94,11 +84,10 @@ void rdp_update_derived(struct rdp *r)
     om->real_blendshifts = (om->cycle_type == CYCLE_TYPE_1) ? (om->blend_m2b[0] == 1)
                          : (om->cycle_type == CYCLE_TYPE_2) ? (om->blend_m2b[0] == 1 || om->blend_m2b[1] == 1) : 0;
 
-    /* flags for the pixel stages */
     struct pipe_flags *pf = &r->pf;
     int two = om->cycle_type == CYCLE_TYPE_2;
     int sh_rgb = 0, sh_a = 0, c1t1 = 0;
-    int refs0[2] = { 0, 0 }, refs1[2] = { 0, 0 };     /* [cycle]: TEXEL0 / TEXEL1 referenced */
+    int refs0[2] = { 0, 0 }, refs1[2] = { 0, 0 };
     for (int cy = first; cy < 2; cy++) {
         for (int i = 0; i < 4; i++) {
             for (int ch = 0; ch < 3; ch++) {
@@ -122,8 +111,7 @@ void rdp_update_derived(struct rdp *r)
     pf->shade_a = (uint8_t)(sh_a | bl_sha);
     pf->need_tex = (uint8_t)(t0 || t1 || om->dolod);
     pf->next_texel = (uint8_t)(c1t1 && pf->need_tex);
-    /* two-cycle: cycle 1 sees TEXEL0 = the second texture cycle and TEXEL1 = TEXEL0 of the next pixel;
-     * one-cycle: only the (single) combiner cycle's TEXEL0 / next-pixel TEXEL1 exist */
+    /* two-cycle: cycle 1 sees TEXEL0 = the second texture cycle, TEXEL1 = TEXEL0 of the next pixel; one-cycle: only TEXEL0 / next-pixel TEXEL1 of the single cycle */
     pf->need_t0 = (uint8_t)(two ? refs0[0] : refs0[1]);
     pf->need_t1 = (uint8_t)(two && (refs1[0] || refs0[1]));
     pf->need_z = (uint8_t)(om->z_compare_en || om->z_update_en);
@@ -133,8 +121,6 @@ void rdp_update_derived(struct rdp *r)
     r->rs_dirty = true;
     r->spec_dirty = true;
 }
-
-/* ---- state-setting commands -------------------------------------------- */
 
 static void cmd_set_other_modes(struct rdp *r, const uint32_t *a)
 {
@@ -181,22 +167,22 @@ static void cmd_set_other_modes(struct rdp *r, const uint32_t *a)
 static void cmd_set_combine(struct rdp *r, const uint32_t *a)
 {
     int *c = r->comb.raw;
-    c[0]  = (a[0] >> 20) & 0xf;   /* sub_a_rgb0 */
-    c[2]  = (a[0] >> 15) & 0x1f;  /* mul_rgb0 */
-    c[4]  = (a[0] >> 12) & 0x7;   /* sub_a_a0 */
-    c[6]  = (a[0] >>  9) & 0x7;   /* mul_a0 */
-    c[8]  = (a[0] >>  5) & 0xf;   /* sub_a_rgb1 */
-    c[10] = (a[0] >>  0) & 0x1f;  /* mul_rgb1 */
-    c[1]  = (a[1] >> 28) & 0xf;   /* sub_b_rgb0 */
-    c[9]  = (a[1] >> 24) & 0xf;   /* sub_b_rgb1 */
-    c[12] = (a[1] >> 21) & 0x7;   /* sub_a_a1 */
-    c[14] = (a[1] >> 18) & 0x7;   /* mul_a1 */
-    c[3]  = (a[1] >> 15) & 0x7;   /* add_rgb0 */
-    c[5]  = (a[1] >> 12) & 0x7;   /* sub_b_a0 */
-    c[7]  = (a[1] >>  9) & 0x7;   /* add_a0 */
-    c[11] = (a[1] >>  6) & 0x7;   /* add_rgb1 */
-    c[13] = (a[1] >>  3) & 0x7;   /* sub_b_a1 */
-    c[15] = (a[1] >>  0) & 0x7;   /* add_a1 */
+    c[0]  = (a[0] >> 20) & 0xf;
+    c[2]  = (a[0] >> 15) & 0x1f;
+    c[4]  = (a[0] >> 12) & 0x7;
+    c[6]  = (a[0] >>  9) & 0x7;
+    c[8]  = (a[0] >>  5) & 0xf;
+    c[10] = (a[0] >>  0) & 0x1f;
+    c[1]  = (a[1] >> 28) & 0xf;
+    c[9]  = (a[1] >> 24) & 0xf;
+    c[12] = (a[1] >> 21) & 0x7;
+    c[14] = (a[1] >> 18) & 0x7;
+    c[3]  = (a[1] >> 15) & 0x7;
+    c[5]  = (a[1] >> 12) & 0x7;
+    c[7]  = (a[1] >>  9) & 0x7;
+    c[11] = (a[1] >>  6) & 0x7;
+    c[13] = (a[1] >>  3) & 0x7;
+    c[15] = (a[1] >>  0) & 0x7;
     r->state_dirty = true;
 }
 
@@ -247,8 +233,6 @@ static void cmd_set_convert(struct rdp *r, const uint32_t *a)
     r->k4 = (a[1] >> 9) & 0x1ff;
     r->k5 = a[1] & 0x1ff;
 }
-
-/* ---- dispatch ----------------------------------------------------------- */
 
 uint32_t rdp_command_words(uint32_t first_word)
 {
@@ -352,18 +336,16 @@ void rdp_run_command(struct rdp *r, const uint32_t *a)
         r->fb_address = a[1] & 0x0ffffff;
         break;
     default:
-        break; /* invalid / unknown: ignore */
+        break;
     }
 }
-
-/* ---- command list reader ------------------------------------------------ */
 
 void rdp_process_list(struct rdp *r)
 {
     init_cmd_lengths();
     if (r->crashed || !r->dp_current || !r->dp_end) return;
 
-    uint32_t cur = (*r->dp_current & ~7u) >> 2;   /* word index */
+    uint32_t cur = (*r->dp_current & ~7u) >> 2;
     uint32_t end = (*r->dp_end & ~7u) >> 2;
     if (end <= cur) return;
 
@@ -393,8 +375,6 @@ void rdp_process_list(struct rdp *r)
     *r->dp_start = *r->dp_current = *r->dp_end;
 }
 
-/* ---- lifecycle ------------------------------------------------------------ */
-
 void rdp_init(struct rdp *r, const struct foir_config *cfg)
 {
     memset(r, 0, sizeof(*r));
@@ -410,7 +390,6 @@ void rdp_init(struct rdp *r, const struct foir_config *cfg)
         if (nk) {
             r->kbase = *nk;
             r->spec_ok_mask = foir_kernels_neon_mask() & 0x1f;
-            /* FastCombiner off: the exact scalar combiner and blender */
             if (!cfg->fast_combiner) {
                 r->kbase.combine = foir_kernels_scalar.combine;
                 r->kbase.blend = foir_kernels_scalar.blend;

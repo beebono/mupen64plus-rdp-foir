@@ -1,7 +1,5 @@
 #!/bin/sh
 # on device. prsp_cmp.sh ROMFILE MODE REFSO NEWSO TAG TMO [reuse]   (ROM file name has spaces replaced by _ in TAG by the caller)
-# Runs REFSO (unless "reuse" and results exist) and NEWSO in deterministic mode and compares screenshots (common frames) and
-# the per-task DMEM/IMEM hash stream (common prefix). Prints one result line.
 D=/storage/prsp-dev
 ROM="$1"; MODE=$2; REF=$3; NEW=$4; TAG=$5; TMO=$6; REUSE=$7
 [ "$REUSE" = "reuse" ] && [ -f $D/e2e/ref_$TAG/rsp.hash.lines ] || $D/prsp_e2e.sh "$ROM" $MODE $REF ref_$TAG $TMO

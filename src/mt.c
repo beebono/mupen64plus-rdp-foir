@@ -1,29 +1,5 @@
 /*
  * mupen64plus-rdp-foir - mt.c
- * Band-split worker pool.
- *
- * The parser thread decodes commands, runs primitive setup and publishes each
- * primitive as a job: the per-primitive constants, the edge walker's setup
- * record (struct prim_walk: the edge and interpolant coefficients) and, when
- * changed since the previous job, a snapshot of the RDP render state and of
- * TMEM. Worker threads compute the span of each row they own from the setup
- * record (walk.h) and run the pixel pipeline for it -- row y belongs to worker
- * (y >> FOIR_STRIPE_SHIFT) % nworkers -- so the hot loop shares nothing between
- * threads and needs no locks: framebuffer, Z and "hidden bit" rows are private
- * to their owner, and no span records travel between cores.
- *
- * The stripes are split into K "classes" (stripe % K; K = workers * 2 when the
- * emulation thread helps, else K = workers). A class is the unit of ordering:
- * its tasks (one per job that has rows in the class) are applied strictly in job
- * order, one at a time, by whichever thread claims the class -- normally its home
- * worker (class % workers), but the parser thread claims idle classes while it
- * waits at a barrier. The jobs of a class are listed in a per-class queue by the
- * parser, the class state word (tasks completed, busy flag) is the lock.
- *
- * All workers stop together only when the parser needs a consistent RDRAM:
- * SYNC_FULL, VI scan-out, CPU framebuffer reads, a texture load from memory the
- * queued primitives may still write, or a change of render-target geometry
- * that would break the row ownership of memory still being written.
  *
  * Copyright (C) 2026 foir contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -37,15 +13,19 @@
 #include "rdp.h"
 #include "mt.h"
 
+/* Stripe class c (stripe % K) is the unit of ordering: its tasks run in job order, one at a time, on whichever thread claims it
+ * (home worker c % nw, or the parser as helper while it waits). The state word cls[c].st = (tasks done << 1) | busy is the lock:
+ * claim by CAS to set busy, release by storing (n + 1) << 1. Rows are private to their class, so the pixel loop needs no locks. */
+
 #define MT_MAXW      8
-#define MT_MAXK      32             /* stripe classes */
+#define MT_MAXK      32
 #define MT_JOBS      8192           /* power of two */
 #define MT_JM        (MT_JOBS - 1)
 #define MT_SNAPS     1024
 #define MT_TMEMS     256
 #define MT_MAXREG    8
 #ifndef MT_SPIN_US
-#define MT_SPIN_US   400            /* idle workers spin this long before sleeping */
+#define MT_SPIN_US   400
 #endif
 #define RS_MAX       2048
 
@@ -53,7 +33,7 @@ struct mt_job {
     int start, end;
     uint32_t state_gen, tmem_gen;
     uint16_t state_slot, tmem_slot;
-    uint32_t cmask;                   /* classes that have rows in start..end */
+    uint32_t cmask;
     struct prim_ctx pc;
     struct prim_walk pw;
 };
@@ -70,47 +50,46 @@ struct mt_worker {
     pthread_t thr;
     uint32_t state_gen, tmem_gen;
 #ifdef FOIR_FRAMELOG
-    _Atomic uint64_t busy_ns;         /* time spent in run_task */
+    _Atomic uint64_t busy_ns;
 #endif
 };
 
 struct mt_class {
-    _Atomic uint64_t st;              /* (tasks completed << 1) | busy: the lock and the position of the class */
+    _Atomic uint64_t st;              /* (tasks completed << 1) | busy */
     char pad[56];
 };
 
-struct mt_stats { unsigned long jobs, region_syncs, range_syncs, full_syncs, alloc_waits, snap_waits, tmem_waits, help_tasks; };   /* alloc_waits: job ring full */
+struct mt_stats { unsigned long jobs, region_syncs, range_syncs, full_syncs, alloc_waits, snap_waits, tmem_waits, help_tasks; };
 
 struct rdp_mt {
     struct mt_stats st;
-    int nw, K;                        /* workers, stripe classes (a multiple of nw) */
-    bool helper;                      /* the parser thread renders idle classes while it waits */
+    int nw, K;
+    bool helper;
     struct mt_worker w[MT_MAXW];
-    struct mt_worker hw;              /* the helper's context (parser thread) */
+    struct mt_worker hw;
     struct mt_job *jobs;
-    _Atomic uint64_t head;            /* jobs published */
+    _Atomic uint64_t head;
     struct mt_snap *snaps;
     struct mt_tmem *tmems;
     uint32_t gen_counter, cur_state_gen, cur_tmem_gen;
     int cur_state_slot, cur_tmem_slot;
-    uint64_t snap_last_job[MT_SNAPS], tmem_last_job[MT_TMEMS];   /* last job index using a slot */
+    uint64_t snap_last_job[MT_SNAPS], tmem_last_job[MT_TMEMS];   /* slot reusable once floor passes it */
     int next_snap, next_tmem;
     struct mt_region reg[MT_MAXREG];
     int nreg;
-    uint64_t floor_cache;             /* every job below this index is complete in every class (parser thread) */
+    uint64_t floor_cache;             /* every job below it is complete in all classes (parser thread only) */
     pthread_mutex_t lock;
     pthread_cond_t cond;
     _Atomic int sleepers;
     _Atomic int stop;
-    /* per-class job queues: the parser appends the index of every job to the queue of each class it has rows in */
     uint32_t *cq[MT_MAXK];            /* [MT_JOBS] job indices (low 32 bits) */
-    uint64_t tail_local[MT_MAXK];     /* parser's copy of ctail */
-    _Alignas(64) _Atomic uint64_t ctail[MT_MAXK];   /* tasks published per class */
+    uint64_t tail_local[MT_MAXK];
+    _Alignas(64) _Atomic uint64_t ctail[MT_MAXK];   /* release-stored after the cq entry */
     _Alignas(64) struct mt_class cls[MT_MAXK];
 #ifdef FOIR_FRAMELOG
-    _Atomic int prof;                 /* time the jobs and the syncs (off unless the log is open: one load per batch) */
-    uint64_t sync_ns;                 /* ... time the parser spent inside mt_sync */
-    uint64_t help_ns;                 /* ... of which it spent rendering tasks as the helper */
+    _Atomic int prof;
+    uint64_t sync_ns;
+    uint64_t help_ns;
 #endif
 };
 
@@ -123,7 +102,7 @@ static inline void cpu_relax(void)
 #endif
 }
 
-/* the oldest incomplete job over all classes (parser thread; the result only grows) */
+/* monotonic: the result only grows */
 static uint64_t mt_floor(struct rdp_mt *mt)
 {
     uint64_t h = atomic_load_explicit(&mt->head, memory_order_relaxed), f = h;
@@ -145,8 +124,6 @@ static bool mt_all_done(struct rdp_mt *mt)
     return true;
 }
 
-/* ---- task execution ---------------------------------------------------------------------- */
-
 static void run_task(struct mt_worker *wk, const struct mt_job *job, int c)
 {
     struct rdp_mt *mt = wk->mt;
@@ -161,12 +138,11 @@ static void run_task(struct mt_worker *wk, const struct mt_job *job, int c)
         wk->tmem_gen = job->tmem_gen;
     }
     w->pc = job->pc;
-    w->nworkers = mt->K; w->worker_id = c;           /* the rows of stripe class c */
+    w->nworkers = mt->K; w->worker_id = c;           /* the raster code sees class c as worker c of K */
     raster_render_walk(w, &job->pw, job->start, job->end);
 }
 
-/* Claim the oldest pending task of the classes c0, c0 + step, ...  (a class is claimable when it is idle and has a queued job).
- * Returns the class, its position n (the state word to release is (n + 1) << 1) and the job index (low 32 bits). */
+/* j is the job index (low 32 bits); release the class with (n + 1) << 1 */
 static bool claim_task(struct rdp_mt *mt, int c0, int step, int *pc, uint64_t *pn, uint32_t *pj)
 {
     for (;;) {
@@ -207,8 +183,6 @@ static void *worker_main(void *arg)
         uint32_t j;
         uint64_t seen = atomic_load_explicit(&mt->head, memory_order_acquire);
         if (!claim_task(mt, wk->id, mt->nw, &c, &n, &j)) {
-            /* idle: spin for a while (a new primitive usually follows within microseconds; sleeping and being
-             * woken costs a futex round trip on both threads), then block */
             struct timespec t0;
             clock_gettime(CLOCK_MONOTONIC, &t0);
             unsigned spins = 0;
@@ -243,8 +217,6 @@ static void *worker_main(void *arg)
     }
 }
 
-/* ---- parser side ---------------------------------------------------------------------------- */
-
 static void wake_workers(struct rdp_mt *mt)
 {
     if (atomic_load(&mt->sleepers) > 0) {
@@ -254,7 +226,6 @@ static void wake_workers(struct rdp_mt *mt)
     }
 }
 
-/* the parser thread renders one pending task of any idle class (the helper); false when there is none */
 static bool help_one(struct rdp_mt *mt)
 {
     int c;
@@ -300,7 +271,7 @@ static struct rdp *new_ctx(const struct rdp *r, int nworkers, int id)
     if (!c) return NULL;
     c->rdram = r->rdram; c->rdram_size = r->rdram_size; c->hidden = r->hidden;
     c->cfg = r->cfg;
-    c->kbase = r->kbase; c->ktab = r->kbase; c->k = &c->ktab;       /* each worker selects its own variants */
+    c->kbase = r->kbase; c->ktab = r->kbase; c->k = &c->ktab;
     c->spec_ok_mask = r->spec_ok_mask; c->spec_dirty = true;
     c->nworkers = nworkers; c->worker_id = id;
     return c;
@@ -321,7 +292,7 @@ bool mt_start(struct rdp *r, int nworkers)
     memset(mt, 0, sizeof(*mt));
     if (RSTATE_BYTES > RS_MAX) { free(mt); return false; }
     mt->helper = env_int("FOIR_HELPER", r->cfg.mt_helper ? 1 : 0) != 0;
-    int g = env_int("FOIR_MT_CLASSES", mt->helper ? 2 : 1);     /* stripe classes per worker */
+    int g = env_int("FOIR_MT_CLASSES", mt->helper ? 2 : 1);
     if (g < 1) g = 1;
     if (g * nworkers > MT_MAXK) g = MT_MAXK / nworkers;
     mt->K = g * nworkers;
@@ -333,7 +304,7 @@ bool mt_start(struct rdp *r, int nworkers)
         mt->cq[c] = (uint32_t *)calloc(MT_JOBS, sizeof(uint32_t));
         if (!mt->cq[c]) goto fail;
     }
-    memset(mt->jobs, 0, MT_JOBS * sizeof(struct mt_job));   /* fault the pages in now, not during the first frame */
+    memset(mt->jobs, 0, MT_JOBS * sizeof(struct mt_job));
     pthread_mutex_init(&mt->lock, NULL);
     pthread_cond_init(&mt->cond, NULL);
     mt->nw = nworkers;
@@ -422,7 +393,6 @@ void mt_prof_enable(struct rdp *r)
     if (r->mt) atomic_store(&r->mt->prof, 1);
 }
 
-/* cumulative: per-worker busy ns, jobs published, parser time in mt_sync (and rendering as the helper); returns the number of workers */
 int mt_prof_read(struct rdp *r, uint64_t busy[8], uint64_t *jobs, uint64_t *sync_ns, uint64_t *help_ns)
 {
     struct rdp_mt *mt = r->mt;
@@ -471,19 +441,16 @@ static void make_region(struct mt_job_region *g, uint32_t addr, int width, int b
     g->hi = addr + (uint32_t)((y1 + 1) * width * bpp);
 }
 
-/* true when the region cannot join the queued work without a barrier: it overlaps memory a queued primitive
- * writes with a different row mapping */
 static bool region_conflict(const struct rdp_mt *mt, const struct mt_job_region *g)
 {
     for (int i = 0; i < mt->nreg; i++) {
         const struct mt_region *p = &mt->reg[i];
         if (p->addr == g->addr && p->width == g->width && p->bpp == g->bpp) continue;
-        if (g->lo < p->hi && p->lo < g->hi) return true;     /* overlaps work with a different row mapping */
+        if (g->lo < p->hi && p->lo < g->hi) return true;
     }
     return false;
 }
 
-/* the region of the same key, if any */
 static struct mt_region *region_find(struct rdp_mt *mt, const struct mt_job_region *g)
 {
     for (int i = 0; i < mt->nreg; i++) {
@@ -501,7 +468,7 @@ static void region_add(struct rdp_mt *mt, const struct mt_job_region *g)
         if (g->hi > p->hi) p->hi = g->hi;
         return;
     }
-    p = &mt->reg[mt->nreg++];     /* (mt_submit made room) */
+    p = &mt->reg[mt->nreg++];
     p->addr = g->addr; p->width = g->width; p->bpp = g->bpp; p->lo = g->lo; p->hi = g->hi;
 }
 
@@ -518,8 +485,7 @@ void mt_submit(struct rdp *r, const struct prim_walk *pw, int start, int end)
     struct rdp_mt *mt = r->mt;
     if (end < start) return;
 
-    /* row-ownership hazards on the memory this primitive renders to. All the regions of the job are checked
-     * first: a barrier clears the list, so the regions are registered only after it. */
+    /* check every region before registering any: a barrier clears the list */
     int ct = r->om.cycle_type;
     int fbbpp = bytes_per_px(r->fb_size);
     struct mt_job_region regs[2];
@@ -529,7 +495,7 @@ void mt_submit(struct rdp *r, const struct prim_walk *pw, int start, int end)
         make_region(&regs[nregs++], r->zb_address, r->fb_width, 2, start, end);
     bool barrier = false;
     for (int i = 0; i < nregs; i++) barrier |= region_conflict(mt, &regs[i]);
-    if (!barrier) {          /* room for the new keys (the list is small; a full one is a barrier) */
+    if (!barrier) {
         int need = 0;
         for (int i = 0; i < nregs; i++) need += region_find(mt, &regs[i]) == NULL;
         barrier = mt->nreg + need > MT_MAXREG;
@@ -541,7 +507,6 @@ void mt_submit(struct rdp *r, const struct prim_walk *pw, int start, int end)
     struct mt_job *job = &mt->jobs[head & MT_JM];
     int spins = 0;
 
-    /* a free slot in the job ring */
     while (head - mt->floor_cache >= MT_JOBS - 1) {
         if (head - mt_floor(mt) < MT_JOBS - 1) break;
         if (spins == 0) mt->st.alloc_waits++;
@@ -584,7 +549,6 @@ void mt_submit(struct rdp *r, const struct prim_walk *pw, int start, int end)
     mt->snap_last_job[mt->cur_state_slot] = head + 1;
     mt->tmem_last_job[mt->cur_tmem_slot] = head + 1;
 
-    /* the stripe classes that have rows in this job */
     uint32_t cmask;
     {
         int s0 = start >> FOIR_STRIPE_SHIFT, s1 = end >> FOIR_STRIPE_SHIFT, K = mt->K;

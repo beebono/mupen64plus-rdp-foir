@@ -26,7 +26,6 @@ def res(tag,n):
     return fr[n][1],fr[n][2],(c(t1)-c(t0))/120.0
 games={"Super_Mario_64":600,"Star_Fox_64":1080,"Donkey_Kong_64":1080,"Banjo-Kazooie":600,"Pokemon_Snap":600}
 if __name__=="__main__":
-    # tags: <game>_<mode>_<build>_<run>
     tags=sorted(os.path.basename(p)[2:-6] for p in glob.glob(D+"/T_*.foirt"))
     groups=collections.defaultdict(list)
     for t in tags:

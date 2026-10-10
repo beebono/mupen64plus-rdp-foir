@@ -1,4 +1,3 @@
-/* RDRAM access helpers with bounds checks and "hidden bit" tracking. */
 #ifndef FOIR_RDRAM_H
 #define FOIR_RDRAM_H
 
@@ -14,7 +13,6 @@ FOIR_INLINE void rdram_wr8(struct rdp *r, uint32_t a, uint8_t v)
     a &= RDRAM_MASK;
     if (a < r->rdram_size) r->rdram[a ^ FOIR_BYTE_XOR] = v;
 }
-/* halfword index (address >> 1) */
 FOIR_INLINE uint16_t rdram_rd16(const struct rdp *r, uint32_t i)
 {
     i &= RDRAM_MASK >> 1;
@@ -25,7 +23,6 @@ FOIR_INLINE void rdram_wr16(struct rdp *r, uint32_t i, uint16_t v)
     i &= RDRAM_MASK >> 1;
     if ((i << 1) < r->rdram_size) ((uint16_t *)r->rdram)[i ^ FOIR_HALF_XOR] = v;
 }
-/* word index (address >> 2) */
 FOIR_INLINE uint32_t rdram_rd32(const struct rdp *r, uint32_t i)
 {
     i &= RDRAM_MASK >> 2;
@@ -37,9 +34,7 @@ FOIR_INLINE void rdram_wr32(struct rdp *r, uint32_t i, uint32_t v)
     if ((i << 2) < r->rdram_size) ((uint32_t *)r->rdram)[i] = v;
 }
 
-/* 16-bit pixel plus its two hidden bits (coverage low bits / dz low bits). The
- * hidden byte remembers the pixel LSB it was written with; if the CPU has since
- * rewritten the pixel we fall back to the RDRAM "lsb replicated" convention. */
+/* hidden byte holds the pixel LSB it was written with; if the CPU rewrote the pixel, fall back to the "lsb replicated" convention */
 FOIR_INLINE void rdram_rd_pair16(const struct rdp *r, uint32_t i, uint16_t *px, uint8_t *hv)
 {
     i &= RDRAM_MASK >> 1;

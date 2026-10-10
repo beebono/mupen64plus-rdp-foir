@@ -1,35 +1,9 @@
 /*
- * kfuzz: randomised equivalence test of the NEON pixel kernels against the scalar
- * reference kernels.
- *
- *   kfuzz [-n iterations] [-s seed] [-m stage mask] [-v]
- *
- * Every iteration draws a random RDP render state (through the real command
- * parser: set_other_modes, set_combine, set_tile, colours, framebuffer / Z image,
- * ...), random TMEM / framebuffer / Z-buffer contents and a random pixel batch
- * (several scanline runs, random interpolants and coverage). The batch is run
- * through the scalar stages (the reference chain); each NEON stage is then run
- * on the reference input of that stage and its outputs (and, for the store
- * stage, the RDRAM it wrote) are compared with the reference.
- *
- * Stages: 1 texture, 2 combine, 4 zcmp, 8 blend, 16 store, 32 copy (the COPY-cycle span kernel: random tile / TLUT / mask /
- * shift state, random spans including ones that touch the row ends, compared on the whole colour buffer and its hidden bits),
- * 64 batch builder (raster.c, not one of the pixel stages: random rows of edge-walker spans -- four subscanlines with edge positions,
- * invalid subscanlines, both directions, spans past the row end, 1-4 workers -- through raster_render_job and through its portable
- * reference raster_render_job_ref with the pixel stages replaced by a recorder; every batch must be identical. Not part of the default
- * mask: -m 64. The offline replays cannot see this one: the "scalar" replay uses the same batch builder).
- *
- * -S also walks through the shape-specialised combiner kernels (the sixth table, spec.h "Shape kernels"): the state
- * is the random one with random combiner selectors / operands of the kernel's shape written over it
- * (foir_shape_apply), the selection is forced to the shape kernels (FOIR_SPEC_COMB=shape semantics) and must pick
- * exactly that kernel. -T n restricts the walk to table n (0 texture, 1 combine, 2 zcmp, 3 blend, 4 store, 5 shape).
- *
- * With -S the iterations walk through every specialised variant (spec.h): the render state is the random one
- * with the variant's key written over it (foir_spec_apply), the variant selection must pick exactly that
- * variant, and all five stages then run through the kernel table the selection produced (so the variants of the
- * other stages that the state happens to match are exercised too). The reference is the scalar chain, except for
- * a variant with RelaxedPrecision set, whose reference is the generic NEON chain run with the same knob (the
- * scalar kernels have no relaxed mode).
+ * kfuzz [-n iterations] [-s seed] [-m stage mask] [-v] [-S] [-T table] [-L]: NEON kernels against the scalar chain on random render states and batches.
+ * Mask bits: 1 texture, 2 combine, 4 zcmp, 8 blend, 16 store, 32 copy, 64 batch builder (raster.c vs raster_render_job_ref; not in the default mask,
+ * the offline replays cannot see it). -S walks every specialised variant (spec.h): its key is written over the random state and the selection must
+ * pick exactly it; the reference is the scalar chain, or the generic NEON chain for RelaxedPrecision variants (scalar has no relaxed mode).
+ * -T n: only table n (0 texture ... 4 store, 5 shape). -L: every iteration is a LOD scene (else one in four).
  *
  * Copyright (C) 2026 foir contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -70,30 +44,25 @@ static void cmd(struct rdp *r, uint32_t w0, uint32_t w1)
 
 static uint32_t rbits(int n) { return rnd() & (n >= 32 ? ~0u : ((1u << n) - 1)); }
 
-/* ---- random state ------------------------------------------------------------------ */
-
 struct fz_opts { int wide_modes; };
 
-/* -L: every iteration is a LOD / mipmap scene (see random_state, random_batch, shape_lod_chain); without it one iteration in four is */
 static int g_lod_mode;
-static int g_lod_scene;                 /* the current iteration is one */
-static int g_spec_mode;                 /* -S: walk through the specialised variants */
-static long g_lod_modes[256];           /* verified texture batches that computed a LOD, by mode (lod_mode_index) */
-static long g_lod_runs;                 /* batches with a linear-ramp LOD scene */
-static long g_lod_lf[5];                /* lanes by reference LOD fraction: 0xff, 0, 1..0xfe, >= 0x100 (sharpen), other */
+static int g_lod_scene;
+static int g_spec_mode;
+static long g_lod_modes[256];
+static long g_lod_runs;
+static long g_lod_lf[5];
 
 static void random_state(struct rdp *r)
 {
-    /* other modes: random bits, one or two cycle */
     uint32_t w0 = (0x2fu << 24) | (rbits(24) & ~(3u << 20));
-    w0 |= (rnd() & 1) << 20;                      /* cycle type 0 or 1 */
-    if (rndn(2)) w0 &= ~((1u << 18) | (1u << 17) | (1u << 16));   /* half the scenes: no detail / sharpen / lod */
-    if (rndn(3)) w0 &= ~(1u << 8);                /* key_en rarely */
-    if (rndn(5) == 0) w0 &= ~(3u << 6), w0 |= 2u << 6;           /* random rgb dither sometimes */
+    w0 |= (rnd() & 1) << 20;
+    if (rndn(2)) w0 &= ~((1u << 18) | (1u << 17) | (1u << 16));
+    if (rndn(3)) w0 &= ~(1u << 8);
+    if (rndn(5) == 0) w0 &= ~(3u << 6), w0 |= 2u << 6;
     uint32_t w1 = rnd();
-    g_lod_scene = !g_spec_mode && (g_lod_mode || rndn(4) == 0);       /* (-S: the variant walk keeps the state its key asks for; LOD variants set the scene up after the key is applied) */
+    g_lod_scene = !g_spec_mode && (g_lod_mode || rndn(4) == 0);       /* -S keeps the state its key asks for; LOD variants set the scene up after the key is applied */
     if (g_lod_scene) {
-        /* TEX_LOD_EN (bit 16) usually, detail (18) and sharpen (17) now and then, perspective (19) mostly; the cycle type is as drawn */
         w0 &= ~((1u << 16) | (1u << 17) | (1u << 18) | (1u << 19));
         if (rndn(5)) w0 |= 1u << 16;
         if (rndn(3) == 0) w0 |= 1u << 18;
@@ -101,17 +70,15 @@ static void random_state(struct rdp *r)
         if (rndn(3)) w0 |= 1u << 19;
         if (rndn(2)) w0 &= ~((1u << 11) | (1u << 10));        /* BI_LERP 0 selects the colour conversion (scalar fallback): rarely */
         else w0 |= (1u << 11) | (1u << 10);
-        if (rndn(4) == 0) w0 &= ~(1u << 13);                 /* point sampling */
+        if (rndn(4) == 0) w0 &= ~(1u << 13);
         else w0 |= 1u << 13;
         w0 &= ~(1u << 9);                                    /* no convert-one feedback */
     }
     cmd(r, w0, w1);
 
-    /* combiner */
     {
         uint32_t c0 = rbits(24), c1 = rnd();
         if (g_lod_scene) {
-            /* read the texels: TEXEL0 in both cycles (sub A), now and then the LOD fraction, TEXEL1 or the alpha LOD fraction as a multiplier */
             if (rndn(4)) c0 = (c0 & ~(0xfu << 20)) | (1u << 20);
             c0 = (c0 & ~0x1fu) | (rndn(3) == 0 ? 2u : rndn(2) ? 13u : rbits(4)), c0 = (c0 & ~(0xfu << 5)) | ((rndn(5) ? 1u : rbits(4)) << 5);
             if (rndn(3) == 0) c0 &= ~(7u << 9);              /* alpha multiplier 0: LOD fraction */
@@ -121,7 +88,6 @@ static void random_state(struct rdp *r)
         cmd(r, (0x3cu << 24) | c0, c1);
     }
 
-    /* tiles */
     for (int t = 0; t < 8; t++) {
         uint32_t fmt = rndn(5), size = rndn(4);
         if (rndn(6)) { fmt = rndn(5); if (fmt == FORMAT_YUV) fmt = FORMAT_RGBA; }
@@ -136,7 +102,6 @@ static void random_state(struct rdp *r)
         cmd(r, (0x32u << 24) | (sl << 12) | tl, ((uint32_t)t << 24) | (sh << 12) | th);
     }
 
-    /* colours and constants */
     cmd(r, 0x38u << 24, rnd());                    /* fog */
     cmd(r, 0x39u << 24, rnd());                    /* blend */
     cmd(r, (0x3au << 24) | (rbits(5) << 8) | rbits(8), rnd());   /* prim colour + lod */
@@ -146,7 +111,6 @@ static void random_state(struct rdp *r)
     cmd(r, (0x2au << 24) | rbits(24), rnd());      /* key gb */
     cmd(r, (0x2bu << 24), rnd());                  /* key r */
 
-    /* colour image + Z image */
     uint32_t fsize = rndn(8) ? 2 + rndn(2) : rndn(2);
     uint32_t ffmt = rndn(4) ? FORMAT_RGBA : FORMAT_IA;
     uint32_t fw = 16 + rndn(305);
@@ -154,8 +118,6 @@ static void random_state(struct rdp *r)
     cmd(r, 0x3eu << 24, Z_BASE + (rndn(8) << 1) * 2);
     cmd(r, (0x2du << 24), (320u << 14) | (240u << 2));      /* scissor (unused by kernels) */
 }
-
-/* ---- random memory --------------------------------------------------------------------- */
 
 static void random_memory(struct rdp *r, int zbias)
 {
@@ -169,7 +131,6 @@ static void random_memory(struct rdp *r, int zbias)
         w[(FB_BASE >> 2) + i] = v;
         w[(Z_BASE >> 2) + i] = zbias ? (v & 0xfffcfffc) : v;
     }
-    /* the first and last 32 KB too (buffers placed at the edges of RDRAM, see edge_placement) */
     for (uint32_t i = 0; i < 0x8000 / 4; i++) { w[i] = rnd(); w[(RDRAM_BYTES - 0x8000) / 4 + i] = rnd(); }
     for (uint32_t i = 0; i < 0x8000 / 2; i++) { r->hidden[i] = (uint8_t)rnd() & 0xf; r->hidden[(RDRAM_BYTES - 0x8000) / 2 + i] = (uint8_t)rnd() & 0xf; }
     for (uint32_t i = 0; i < 0x40000 / 2; i++) {
@@ -178,8 +139,6 @@ static void random_memory(struct rdp *r, int zbias)
         if (rndn(2)) { r->hidden[(FB_BASE >> 1) + i] &= 0x7; r->hidden[(Z_BASE >> 1) + i] &= 0xf; }
     }
 }
-
-/* ---- random batch ---------------------------------------------------------------------------- */
 
 static int32_t rnd_coord(void)
 {
@@ -192,7 +151,7 @@ static int32_t rnd_coord(void)
     }
 }
 
-/* a texture coordinate step per pixel in s16.16 of S10.5 texels: from sub-texel (LOD 0, magnified) up to the largest the 14-bit LOD can hold */
+/* texture coordinate step per pixel (s16.16 of S10.5 texels): sub-texel up to the largest the 14-bit LOD can hold */
 static int32_t rnd_slope(void)
 {
     int32_t v;
@@ -234,7 +193,7 @@ static void random_batch(struct rdp *r, struct px_batch *b, int tilenum)
     b->n = n;
     int pos = 0;
     int width = r->fb_width;
-    int runs[FOIR_BATCH + 1], nruns = 0;          /* start lane of every scanline run (+ n) */
+    int runs[FOIR_BATCH + 1], nruns = 0;
     while (pos < n) {
         int len = 1 + (int)rndn(rndn(2) ? 24 : 70);
         if (len > n - pos) len = n - pos;
@@ -251,8 +210,7 @@ static void random_batch(struct rdp *r, struct px_batch *b, int tilenum)
     }
     runs[nruns] = n;
     int cvgmode = (int)rndn(3);
-    /* LOD scene: every run is a linear ramp of s, t, w (what the rasteriser hands over), steps from tiny to huge, the row below at
-     * dsdy ..., the odd ramp with a broken lane (the "next pixel" shortcut of the LOD pass has to notice) */
+    /* LOD scene: every run a linear ramp of s, t, w, the odd one with a broken lane (the LOD pass's "next pixel" shortcut has to notice) */
     const int lodscene = g_lod_scene && r->om.dolod && rndn(8) != 0;
     if (lodscene) {
         int32_t ds = rnd_slope(), dt = rnd_slope(), dw;
@@ -272,7 +230,7 @@ static void random_batch(struct rdp *r, struct px_batch *b, int tilenum)
                 uint32_t k = (uint32_t)(i - runs[q]);
                 b->s[i] = (int32_t)(s0 + k * (uint32_t)ds); b->t[i] = (int32_t)(t0 + k * (uint32_t)dt); b->w[i] = (int32_t)(w0 + k * (uint32_t)dw);
             }
-            if (rndn(8) == 0) {                                     /* a lane off the ramp */
+            if (rndn(8) == 0) {
                 int i = runs[q] + (int)rndn((uint32_t)(runs[q + 1] - runs[q]));
                 int32_t d = (int32_t)rndn(5) - 2;
                 switch (rndn(3)) { case 0: b->s[i] += d; break; case 1: b->t[i] += d; break; default: b->w[i] += d << rndn(17); break; }
@@ -289,7 +247,6 @@ static void random_batch(struct rdp *r, struct px_batch *b, int tilenum)
         b->cz[i] = (int32_t)(rnd() >> (rndn(3) ? 2 : 0)) & (rndn(2) ? ~0 : 0x3fffffff);
         uint8_t m = cvgmode == 0 ? 0xff : (uint8_t)rnd();
         if (cvgmode == 1 && rndn(4)) m = 0xff;
-        /* derive coverage fields the way the rasteriser does (cvg count + offsets) */
         int cnt = 0;
         for (int k = 0; k < 8; k++) cnt += (m >> k) & 1;
         b->cvg[i] = (uint8_t)cnt;
@@ -302,9 +259,7 @@ static void random_batch(struct rdp *r, struct px_batch *b, int tilenum)
 }
 
 
-/* LOD scene: the tiles the LOD can select (tilenum .. tilenum + max_level, one more with detail textures) usually all get the texel
- * format and size of the primitive's tile -- what a mip chain looks like, and what the specialised variants require --, and the tiles
- * beyond them get arbitrary ones (any format, YUV included): a variant that looks at too few or too many tiles shows up as a difference. */
+/* LOD scene: the tiles the LOD can select usually all get the primitive tile's format and size (what a mip chain looks like, and what the variants require); the tiles beyond get arbitrary ones, so a variant that looks at too few or too many tiles shows up */
 static void shape_lod_chain(struct rdp *r)
 {
     if (!g_lod_scene || !r->om.tex_lod_en || rndn(4) == 0) return;
@@ -320,8 +275,7 @@ static void shape_lod_chain(struct rdp *r)
         }
         tile_update_derived(t);
     }
-    /* one time in four a tile of the chain itself disagrees (the last one half of the time): a specialised variant has to notice and hand
-     * the batch to a generic kernel; one that looks at too few tiles runs on and gets the lanes that select that tile wrong */
+    /* one time in four a tile of the chain itself disagrees: a variant has to notice and hand the batch to a generic kernel */
     if (rndn(4) == 0 && last >= 1) {
         int k = rndn(2) ? last : 1 + (int)rndn((uint32_t)last);
         if (k > 7) k = 7;
@@ -333,8 +287,7 @@ static void shape_lod_chain(struct rdp *r)
     }
 }
 
-/* one iteration in eight: the colour buffer or the Z buffer is moved to the first or last pixels of RDRAM so that the
- * vector windows of the memory kernels run over the edges (the bounds checks / per-lane fallbacks) */
+/* one iteration in eight: the colour or Z buffer sits at the first or last pixels of RDRAM, so the vector windows run over the edges */
 static int g_edge;
 static void edge_placement(struct rdp *r)
 {
@@ -347,7 +300,6 @@ static void edge_placement(struct rdp *r)
     }
 }
 
-/* the edge regions of two contexts must agree too */
 static int cmp_edges(const struct rdp *ra, const struct rdp *rb)
 {
     int bad = 0;
@@ -369,8 +321,6 @@ static int cmp_edges(const struct rdp *ra, const struct rdp *rb)
     }
     return bad;
 }
-
-/* ---- comparison ----------------------------------------------------------------------------------- */
 
 static int g_bad;
 static long g_checks;
@@ -403,9 +353,9 @@ static void dump_state(const struct rdp *r)
     }
 }
 
-static int g_spec_only = -1;            /* -T: only this table */
+static int g_spec_only = -1;
 static long g_spec_hits[SPEC_NSTAGES + 1][512];
-static long g_spec_other;               /* iterations in which a stage other than the one under test ran a variant */
+static long g_spec_other;
 
 static int run_one(uint64_t seed, int mask, int verbose, long iter)
 {
@@ -448,7 +398,6 @@ static int run_one(uint64_t seed, int mask, int verbose, long iter)
         if (vstage == SPEC_SHAPE) foir_shape_apply(&foir_spec_tabs[vstage].ent[vidx].k, &ra, rnd64());
         else foir_spec_apply(vstage, &foir_spec_tabs[vstage].ent[vidx].k, &ra);
         if (vstage == SPEC_TEX && foir_spec_tabs[vstage].ent[vidx].k.tex.lod) {
-            /* a LOD variant: usually a ramp scene, with detail / sharpen (not part of the key) now and then */
             g_lod_scene = g_lod_mode || rndn(4) != 0;
             ra.om.detail_tex_en = rndn(3) == 0; ra.om.sharpen_tex_en = rndn(3) == 0;
         }
@@ -478,7 +427,6 @@ static int run_one(uint64_t seed, int mask, int verbose, long iter)
     shape_lod_chain(&ra);
     const struct foir_kernels *refk = &foir_kernels_scalar;
 
-    /* B context: identical render state and memory */
     memcpy(&rb, &ra, sizeof(rb));
     rb.rdram = mem_b; rb.hidden = calloc(1, (RDRAM_BYTES >> 1) + 16);
     memcpy(mem_b, mem_a, RDRAM_BYTES);
@@ -518,7 +466,6 @@ static int run_one(uint64_t seed, int mask, int verbose, long iter)
     int n = bref->n;
     const char *stage = "";
 
-    /* texture */
     if (ra.pf.need_tex) {
         memcpy(pre, bref, sizeof(*pre));
         refk->texture(&ra, bref);
@@ -542,13 +489,11 @@ static int run_one(uint64_t seed, int mask, int verbose, long iter)
                             (ra.om.sample_type << 5) | (ra.om.en_tlut << 6)]++;
             if (g_bad != bad_before) { fprintf(stderr, "seed %llu: %s\n", (unsigned long long)seed, stage); dump_state(&ra); goto done; }
         }
-        /* keep the reference output as input for the next stage */
     } else {
         memset(bref->tex0, 0, sizeof(bref->tex0)); memset(bref->tex1, 0, sizeof(bref->tex1)); memset(bref->tex0n, 0, sizeof(bref->tex0n));
         memset(bref->lodfrac, 0, sizeof(bref->lodfrac));
     }
 
-    /* combine */
     memcpy(pre, bref, sizeof(*pre));
     refk->combine(&ra, bref);
     if (mask & 2) {
@@ -567,7 +512,6 @@ static int run_one(uint64_t seed, int mask, int verbose, long iter)
         if (g_bad != bad_before) { fprintf(stderr, "seed %llu: %s\n", (unsigned long long)seed, stage); dump_state(&ra); goto done; }
     }
 
-    /* zcmp */
     memcpy(pre, bref, sizeof(*pre));
     refk->zcmp(&ra, bref);
     if (mask & 4) {
@@ -590,7 +534,6 @@ static int run_one(uint64_t seed, int mask, int verbose, long iter)
         if (g_bad != bad_before) { fprintf(stderr, "seed %llu: %s\n", (unsigned long long)seed, stage); dump_state(&ra); goto done; }
     }
 
-    /* blend */
     memcpy(pre, bref, sizeof(*pre));
     refk->blend(&ra, bref);
     if (mask & 8) {
@@ -605,7 +548,6 @@ static int run_one(uint64_t seed, int mask, int verbose, long iter)
         if (g_bad != bad_before) { fprintf(stderr, "seed %llu: %s\n", (unsigned long long)seed, stage); dump_state(&ra); goto done; }
     }
 
-    /* store */
     refk->store(&ra, bref);
     if (mask & 16) {
         stage = "store";
@@ -639,11 +581,8 @@ done:
 }
 
 
-/* ---- COPY-cycle span kernel ---------------------------------------------------------------------- */
-
 static long g_copy_kind[8], g_copy_wrote;
 
-/* compare the framebuffer region of two contexts (RDRAM words and hidden bytes); returns the number of differences found */
 static int cmp_fb(const struct rdp *ra, const struct rdp *rb, const char *what)
 {
     int bad = 0;
@@ -676,7 +615,7 @@ static int run_copy(uint64_t seed, int verbose)
     const struct foir_kernels *nk = foir_kernels_neon();
     random_state(&ra);
     random_memory(&ra, 0);
-    /* colour buffer: mostly 16 bit (the case the vector kernel takes), sometimes 8 / 4 bit; sometimes an odd halfword address */
+    /* colour buffer: mostly 16 bit (the vector kernel's case), sometimes 8 / 4 bit or an odd halfword address */
     uint32_t fsize = rndn(10) ? PIXEL_SIZE_16BIT : (rndn(2) ? PIXEL_SIZE_8BIT : PIXEL_SIZE_4BIT);
     uint32_t fw = 16 + rndn(305);
     if (rndn(4) == 0) fw = 8 * (2 + rndn(38));
@@ -684,7 +623,6 @@ static int run_copy(uint64_t seed, int verbose)
     cmd(&ra, 0x2fu << 24 | (2u << 20) | (rndn(2) ? 1u << 15 : 0) | (rndn(4) == 0 ? 1u << 19 : 0), rndn(2));   /* COPY cycle, TLUT, perspective, alpha compare */
     cmd(&ra, 0x27u << 24, 0);
     edge_placement(&ra);
-    /* the primitive's tile: the common copy formats (RGBA16, CI8 / CI4 with TLUT) most of the time */
     int tn = (int)rndn(8);
     for (int k = 0; k < 8 && rndn(4); k++) {
         const struct tile *t = &ra.tile[(tn + k) & 7];
@@ -737,13 +675,7 @@ static int run_copy(uint64_t seed, int verbose)
     return bad != 0;
 }
 
-/* ---- batch builder ------------------------------------------------------------------------------- */
-
-/* The span driver (raster.c: raster_render_job) against its portable reference (raster_render_job_ref). Random
- * primitives and rows of spans the way the edge walker makes them (four subscanlines with edge positions, invalid
- * subscanlines, both directions, spans that run off the row end), random pipe flags and interpolant steps. The pixel
- * stages are replaced by a recorder; every batch that would be handed to them must be the same in both builders. */
-
+/* raster_render_job against raster_render_job_ref on random primitives and rows of edge-walker-style spans; the pixel stages are replaced by a recorder and every batch must be identical */
 #define CAP_MAXB 160
 struct cap_batch {
     int n, all_full, fbrange;
@@ -813,12 +745,10 @@ static int run_builder(uint64_t seed, int verbose)
     r.fb_width = 16 + (int)rndn(rndn(3) ? 305 : 1000);
     if (rndn(2)) r.scfield = (int)rndn(2);
     r.primitive_z = rnd() & 0x7fff0000u;
-    /* pipe flags */
     struct pipe_flags *pf = &r.pf;
     memset(pf, 0, sizeof(*pf));
     pf->shade_rgb = (uint8_t)rndn(2); pf->shade_a = (uint8_t)rndn(2); pf->need_cz = (uint8_t)rndn(2); pf->need_tex = (uint8_t)rndn(2);
     pf->need_z = (uint8_t)rndn(2);
-    /* primitive */
     struct prim_ctx *pc = &r.pc;
     memset(pc, 0, sizeof(*pc));
     pc->flip = (int)rndn(2);
@@ -835,7 +765,6 @@ static int run_builder(uint64_t seed, int verbose)
     r.nworkers = 1 + (int)rndn(4); r.worker_id = (int)rndn((uint32_t)r.nworkers);
     if (rndn(2)) r.nworkers = 1, r.worker_id = 0;
 
-    /* rows */
     static struct span rows[8];
     const int nrows = 1 + (int)rndn(6), jlo = (int)rndn(40);
     const int shape = (int)rndn(6);                   /* 0: steep edges, 1: shallow, 2: wide, 3: thin, 4: tiny, 5: anything */
@@ -859,7 +788,7 @@ static int run_builder(uint64_t seed, int verbose)
         for (int i = 0; i < 4; i++) {
             int le = base + slope * i + (int)rndn(4) - 2, re = le + w8 + (int)rndn(5) - 2 + (shape == 5 ? (int)rndn(30) - 15 : 0);
             if (le < 0) le = 0;
-            if (re < le && rndn(8)) re = le + (int)rndn(2);           /* mostly consistent; the rest crosses */
+            if (re < le && rndn(8)) re = le + (int)rndn(2);
             if (re < 0) re = 0;
             if (le > 0x1fff) le = 0x1fff;
             if (re > 0x1fff) re = 0x1fff;

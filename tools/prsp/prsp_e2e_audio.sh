@@ -1,6 +1,5 @@
 #!/bin/sh
-# on device. LLE audio dump for a fixed number of AI buffers' worth of time: prsp_e2e_audio.sh ROMFILE RSPSO TAG SECONDS
-# (parallel-rsp as the RSP plugin runs the audio ucode in LLE; the stream is dumped by mupen64plus-audio-adump.so).
+# on device. prsp_e2e_audio.sh ROMFILE RSPSO TAG SECONDS: LLE audio dump (parallel-rsp as the RSP plugin, stream dumped by mupen64plus-audio-adump.so)
 D=/storage/prsp-dev; . $D/prsp_common.sh
 ROM="/storage/roms/n64/$1"; rsp_args parallel $2; TAG=$3; SEC=${4:-40}
 OUT=$D/e2e/$TAG; rm -rf $OUT; mkdir -p $OUT

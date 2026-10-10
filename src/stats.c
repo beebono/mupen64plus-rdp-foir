@@ -1,8 +1,5 @@
 /*
  * mupen64plus-rdp-foir - stats.c
- * Debug statistics (build with -DFOIR_STATS, enable with FOIR_STATE_STATS=1):
- * how many pixels are rendered under each distinct pipeline state. Used to judge
- * how much a static specialisation of the common states (M3) could cover.
  *
  * Copyright (C) 2026 foir contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -19,13 +16,12 @@ struct stat_ent { uint64_t key; uint64_t pixels, batches; int cycle, tex, z; cha
 static struct stat_ent tab[2048];
 static int nent, enabled = -1;
 
-/* per-stage specialisation keys: pixels per distinct stage key and whether a variant exists for it */
-struct skey_ent { union spec_key k; uint64_t pixels; bool covered; bool exact, shape; };   /* exact / shape: the combine stage has an exact variant / a shape kernel for it */
+struct skey_ent { union spec_key k; uint64_t pixels; bool covered; bool exact, shape; };
 static struct skey_ent stab[SPEC_NSTAGES][512];
 static int sn[SPEC_NSTAGES];
 static uint64_t spix[SPEC_NSTAGES], scov[SPEC_NSTAGES];
 static uint64_t cpix_exact, cpix_shape, cpix_shape_only;
-static uint64_t tpix_exact, tpix_any, tpix_any_only;       /* texture pixels with an exact variant / an "any format" variant / an any-format variant but no exact one */     /* combine pixels with an exact variant / a shape kernel / a shape kernel but no exact variant */
+static uint64_t tpix_exact, tpix_any, tpix_any_only;
 
 static int scmp(const void *a, const void *b)
 {
@@ -100,7 +96,7 @@ void foir_stats_batch(const struct rdp *r, int npix)
         if (enabled) atexit(dump);
     }
     if (!enabled) return;
-    pthread_mutex_lock(&stats_lock);       /* worker threads call this concurrently */
+    pthread_mutex_lock(&stats_lock);
     {
         union spec_key keys[SPEC_NSTAGES];
         bool ok[SPEC_NSTAGES];
@@ -108,14 +104,14 @@ void foir_stats_batch(const struct rdp *r, int npix)
         for (int s = 0; s < SPEC_NSTAGES; s++) {
             if (s == SPEC_TEX && !r->pf.need_tex) continue;
             spix[s] += (uint64_t)npix;
-            if (!ok[s]) {      /* a state the stage cannot be specialised for (generic only): one bucket per reason */
+            if (!ok[s]) {
                 const struct other_modes *om = &r->om;
                 const struct tile *t0 = &r->tile[r->pc.tilenum & 7];
                 int why = 0;
                 if (s == SPEC_TEX) why = om->tex_lod_en ? 1 : om->dolod ? 2 : t0->format == FORMAT_YUV ? 3 : (!om->bi_lerp0 && (om->sample_type || om->en_tlut)) ? 4 :
                                          om->cycle_type == CYCLE_TYPE_2 ? 5 : 6;
-                else if (s == SPEC_COMB) why = 7;       /* chroma key */
-                else why = 8;                           /* 4 / 8-bit colour buffer */
+                else if (s == SPEC_COMB) why = 7;
+                else why = 8;
                 memset(&keys[s], 0xff, sizeof keys[s]);
                 keys[s].raw[1] = (uint8_t)why;
             }

@@ -1,10 +1,5 @@
 /*
  * mupen64plus-rdp-foir - kernels_scalar.c
- * Scalar C11 reference kernels: colour combiner, framebuffer read, Z compare,
- * blender, dither, FB / Z store, FILL and COPY spans.
- *
- * The arithmetic follows the hardware formulas documented by angrylion-rdp-plus
- * (bit widths, rounding, special 9-bit tables), organised as batch kernels.
  *
  * Copyright (C) 2026 foir contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -22,9 +17,7 @@ uint8_t k_bldiv[0x8000];
 static const uint8_t bayer_matrix[16] = { 0, 4, 1, 5, 4, 0, 5, 1, 3, 7, 2, 6, 7, 3, 6, 2 };
 static const uint8_t magic_matrix[16] = { 0, 6, 1, 7, 4, 2, 5, 3, 3, 5, 2, 4, 7, 1, 6, 0 };
 
-/* Pseudo random numbers for noise / random dither / dithered alpha compare. The value is a hash of the
- * pixel's framebuffer index and a per-primitive seed, so it does not depend on batching or on which
- * thread renders the pixel (the hardware's LFSR is not reproduced). */
+/* hash of the framebuffer index and a per-primitive seed: independent of batching and thread (the hardware LFSR is not reproduced) */
 static inline uint32_t prand(uint32_t idx, uint32_t seed, uint32_t salt)
 {
     uint32_t h = idx * 0x9e3779b1u ^ seed ^ (salt * 0x85ebca77u);
@@ -93,8 +86,6 @@ void kernels_scalar_init_tables(void)
     done = true;
 }
 
-/* ---- dither ------------------------------------------------------------------ */
-
 static void get_dither_noise(struct rdp *r, int idx, uint32_t fbidx, int32_t noise, int *cdith, int *adith)
 {
     switch (r->om.rgb_alpha_dither) {
@@ -134,8 +125,6 @@ static void rgb_dither(int sel, int32_t *r, int32_t *g, int32_t *b, int dith)
     *b += (newb - *b) & replace;
 }
 
-/* ---- combiner ------------------------------------------------------------------ */
-
 static inline int32_t ccomb(int32_t a, int32_t b, int32_t c, int32_t d)
 {
     a = k_ext9[a & 0x1ff];
@@ -168,7 +157,7 @@ static int32_t chroma_key_min(const struct rdp *r, const int32_t rgb[3])
     return foir_clamp(ka, 0, 0xff);
 }
 
-/* evaluate one combiner cycle: rgb gets 17-bit results, alpha 9-bit */
+/* rgb gets 17-bit results, alpha 9-bit */
 static void comb_eval(const struct rdp *r, const int32_t *R, int cy, int32_t rgb[3], int32_t *alpha)
 {
     for (int ch = 0; ch < 3; ch++) {
@@ -189,7 +178,6 @@ static void comb_eval(const struct rdp *r, const int32_t *R, int cy, int32_t rgb
         *alpha = k_ext9[R[id] & 0x1ff] & 0x1ff;
 }
 
-/* second half of the combiner (cycle `cy` result in rgb17/a9 -> pixel colour) */
 static void comb_finish(const struct rdp *r, const int32_t *R, int cy, int adseed,
                         int32_t rgb[3], int32_t a9, uint8_t *cvg, struct color *pix, int32_t *comb_rgb9)
 {
@@ -257,7 +245,6 @@ static void scalar_combine(struct rdp *r, struct px_batch *b)
         uint8_t cvg = b->cvg[i];
         int offx = b->offx[i], offy = b->offy[i];
 
-        /* shade colour with sub-pixel coverage correction */
         struct color shade = { 0, 0, 0, 0 };
         if (use_shade_rgb || use_shade_a) {
             int32_t sr = b->cr[i] >> 14, sg = b->cg[i] >> 14, sb = b->cb[i] >> 14, sa = b->ca[i] >> 14;
@@ -292,8 +279,7 @@ static void scalar_combine(struct rdp *r, struct px_batch *b)
         int32_t rgb[3], a9, comb9[3];
         int32_t acalpha = 0;
         if (two) {
-            /* COMBINED has no defined value in the first cycle (the hardware feeds back whatever the previous
-             * pixel left); use 0 so the result does not depend on pixel order */
+            /* COMBINED is undefined in the first cycle (the hardware feeds back the previous pixel's); 0 keeps the result independent of pixel order */
             R[REG_COMB + 0] = R[REG_COMB + 1] = R[REG_COMB + 2] = R[REG_COMB + 3] = 0;
             comb_eval(r, R, 0, rgb, &a9);
             if (om->alpha_compare_en) {
@@ -328,8 +314,6 @@ static void scalar_combine(struct rdp *r, struct px_batch *b)
         (void)comb9;
     }
 }
-
-/* ---- framebuffer read + Z compare ------------------------------------------------ */
 
 static void fb_read(const struct rdp *r, int32_t idx, struct color *mem, uint8_t *memcvg)
 {
@@ -389,7 +373,6 @@ static void scalar_zcmp(struct rdp *r, struct px_batch *b)
         b->mem[CH_B][i] = (int16_t)mem.b; b->mem[CH_A][i] = (int16_t)mem.a;
         uint32_t memcvg = b->memcvg[i];
 
-        /* Z interpolant correction */
         int32_t sz = (b->cz[i] >> 10) & 0x3fffff;
         if (cvg == 8) sz >>= 3;
         else sz = ((sz << 2) + offx * pc->cdz + offy * pc->dzdy) >> 5;
@@ -457,7 +440,7 @@ static void scalar_zcmp(struct rdp *r, struct px_batch *b)
             case ZMODE_TRANSPARENT:
                 wen = infront || max;
                 break;
-            default: /* DECAL */
+            default:
                 wen = farther && nearer && !max;
                 break;
             }
@@ -475,8 +458,6 @@ static void scalar_zcmp(struct rdp *r, struct px_batch *b)
         b->wen[i] = (uint8_t)wen;
     }
 }
-
-/* ---- blender ----------------------------------------------------------------------- */
 
 static inline void bl_color_sel(const struct rdp *r, const struct px_batch *b, int i, int sel,
                                 const struct color *pix, int32_t out[3])
@@ -509,7 +490,7 @@ static inline int32_t bl_m2b(const struct px_batch *b, int i, int sel, int32_t i
     }
 }
 
-/* the blend equation; `divide` selects the exact division table (final cycle) */
+/* `divide` selects the exact division table (final cycle) */
 static void blend_equation(const struct rdp *r, const struct px_batch *b, int i, int cyc,
                            const struct color *pix, int divide, int32_t out[3])
 {
@@ -561,12 +542,11 @@ static void scalar_blend(struct rdp *r, struct px_batch *b)
             if (!(om->antialias_en ? b->cvg[i] : b->cvbit[i])) { b->wen[i] = 0; continue; }
         } else {
             if (!(om->antialias_en ? b->cvg[i] : b->cvbit[i])) { b->wen[i] = 0; continue; }
-            /* cycle 0 blend feeds cycle 1 as the "pixel" colour */
             int32_t c0[3];
             blend_equation(r, b, i, 0, &pix, 0, c0);
             if (!alpha_compare(r, b->acalpha[i], b->fbidx[i])) { b->wen[i] = 0; continue; }
             pix.r = c0[0]; pix.g = c0[1]; pix.b = c0[2];
-            /* pix.a stays the combiner alpha: m1b/inv alpha come from it */
+            /* pix.a stays the combiner alpha: m1b / inverse alpha come from it */
         }
 
         if (!om->color_on_cvg || b->prewrap[i]) {
@@ -590,8 +570,6 @@ static void scalar_blend(struct rdp *r, struct px_batch *b)
         b->fcol[0][i] = (int16_t)rgb[0]; b->fcol[1][i] = (int16_t)rgb[1]; b->fcol[2][i] = (int16_t)rgb[2];
     }
 }
-
-/* ---- store ----------------------------------------------------------------------------- */
 
 static int finalize_spanalpha(int cvg_dest, uint32_t blend_en, uint32_t cvg, uint32_t memcvg)
 {
@@ -654,8 +632,6 @@ static void scalar_store(struct rdp *r, struct px_batch *b)
     }
 }
 
-/* ---- FILL ---------------------------------------------------------------------------------- */
-
 static void scalar_fill(struct rdp *r, int y, int x0, int x1)
 {
     uint32_t base = (uint32_t)(r->fb_width * y);
@@ -680,13 +656,10 @@ static void scalar_fill(struct rdp *r, int y, int x0, int x1)
     }
 }
 
-/* ---- COPY ----------------------------------------------------------------------------------- */
-
 static void copy_texel16(const struct rdp *r, const struct tile *tl, int s, int tt, uint16_t *out, bool *opaque)
 {
     struct color c;
     if (r->om.en_tlut) {
-        /* TLUT lookup returns the raw 16-bit palette entry */
         uint32_t idx;
         if (tl->size == PIXEL_SIZE_4BIT || tl->size == PIXEL_SIZE_8BIT) {
             struct tile tmp = *tl; tmp.format = FORMAT_CI;
@@ -728,7 +701,6 @@ static void scalar_copy(struct rdp *r, int y, const struct span *sp, int flip)
         tc_clamp17(&sss, &sst);
         const struct tile *tl = &r->tile[tilenum];
 
-        /* shift + relative + integer part of the first texel; following texels are consecutive */
         int32_t cs = SIGN16(sss), ct = SIGN16(sst);
         int sh = tl->shift_s, th = tl->shift_t;
         cs = sh < 11 ? (cs >> sh) : SIGN16(cs << (16 - sh));
@@ -754,8 +726,6 @@ static void scalar_copy(struct rdp *r, int y, const struct span *sp, int flip)
         s += dsinc; t += dtinc; w += dwinc;
     }
 }
-
-/* ---- table -------------------------------------------------------------------------------------- */
 
 const struct foir_kernels foir_kernels_scalar = {
     .name = "scalar",

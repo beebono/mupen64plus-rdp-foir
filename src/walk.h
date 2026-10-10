@@ -1,16 +1,5 @@
 /*
  * mupen64plus-rdp-foir - walk.h
- * The edge walker, one scanline at a time.
- *
- * The RDP walks a primitive subscanline by subscanline (four per scanline), advancing the edge positions and the
- * interpolants by constant steps. Everything it keeps from one subscanline to the next is linear in the subscanline
- * number (the left edge restarts from the lower edge at the middle vertex), and the per-scanline state (the min / max
- * of the edge positions, the "all over / under / invalid" flags) is reset at every scanline. So the span of scanline j
- * is a pure function of j and of the primitive's setup record (struct prim_walk): the edge positions of subscanline k are
- * start + (k - k0) * step in 32-bit wrapping arithmetic -- exactly what k0 - k repeated additions produce, since
- * unsigned addition and multiplication are ring operations modulo 2^32 -- and the interpolants of scanline j are
- * a0 + (j - j0) * de. The worker that renders a row computes its span here, instead of the parser thread walking
- * every row and handing the spans over (setup.c used to). tools/walkfuzz.c checks it against the sequential walker.
  *
  * Copyright (C) 2026 foir contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -23,9 +12,9 @@
 #include <arm_neon.h>
 #endif
 
-/* Span of scanline j (yhlimit / 4 <= j <= yllimit / 4, as setup_walk guarantees for the rows it returns). Returns
- * sp->validline. For an invalid scanline only validline is meaningful (the sequential walker also wrote the edge
- * arrays of such lines; no consumer reads them). */
+/* The state the RDP keeps from one subscanline to the next is linear in the subscanline number, so the span of scanline j is a pure function of j
+ * and the setup record: edge positions are start + (k - k0) * step in 32-bit wrapping arithmetic, identical to k0 - k repeated additions
+ * (unsigned + and * are ring operations modulo 2^32). Only validline is meaningful for an invalid scanline. */
 FOIR_INLINE int walk_row_c(const struct prim_walk *pw, int j, struct span *sp)
 {
     const int flip = pw->flip;
@@ -43,7 +32,7 @@ FOIR_INLINE int walk_row_c(const struct prim_walk *pw, int j, struct span *sp)
     if (flip) { maxxmx = 0; minxhx = 0xfff; }
     else      { maxxhx = 0; minxmx = 0xfff; }
     int allover = 1, allunder = 1, allinval = 1;
-    int32_t xld = 0;                       /* right edge at the subscanline that adjusts the interpolants */
+    int32_t xld = 0;
     int32_t xrsc, xlsc, stickybit;
 
     for (int spix = 0; spix < 4; spix++) {
@@ -120,16 +109,13 @@ FOIR_INLINE int walk_row_c(const struct prim_walk *pw, int j, struct span *sp)
 }
 
 #if defined(FOIR_NEON)
-/* The same with the four subscanlines of the row in the four lanes of a vector: the edge positions of the lanes are the
- * position of the first plus lane * step, the clipping and the crossing test are lane-wise, and the validity flags and the
- * min / max of the valid lanes are horizontal reductions. The interpolants are two vectors of four. */
+/* the four subscanlines of the row in the four lanes of a vector */
 
-/* clip one edge position: the clipped value xsc; *under / *over: all ones in the lanes that were clipped to the left / right */
 FOIR_INLINE int32x4_t walk_clip(int32x4_t x, int32x4_t clipxh, int32x4_t clipxl, uint32x4_t *under, uint32x4_t *over)
 {
     const int32x4_t m1fff = vdupq_n_s32(0x1fff);
     const uint32x4_t nz = vtstq_s32(vandq_s32(vshrq_n_s32(x, 1), m1fff), m1fff);
-    const int32x4_t sticky = vreinterpretq_s32_u32(vshrq_n_u32(nz, 31));                     /* 0 or 1 */
+    const int32x4_t sticky = vreinterpretq_s32_u32(vshrq_n_u32(nz, 31));
     const int32x4_t sh = vshrq_n_s32(x, 13);
     const int32x4_t lo = vorrq_s32(vandq_s32(sh, vdupq_n_s32(0x1ffe)), sticky);
     const int32x4_t hi = vorrq_s32(vandq_s32(sh, vdupq_n_s32(0x3ffe)), sticky);
@@ -151,7 +137,6 @@ FOIR_INLINE int walk_row_neon(const struct prim_walk *pw, int j, struct span *sp
     const uint32_t n0 = (uint32_t)(k0 - pw->ycur);
     const int32x4_t kv = vreinterpretq_s32_u32(vaddq_u32(vdupq_n_u32((uint32_t)k0), iota));
 
-    /* edge positions of the four subscanlines (the left edge switches to xl at subscanline ysw) */
     const uint32x4_t xr = vmlaq_n_u32(vdupq_n_u32(pw->xr0 + n0 * pw->xri), iota, pw->xri);
     const uint32x4_t xm = vmlaq_n_u32(vdupq_n_u32(pw->xm0 + n0 * pw->xmi), iota, pw->xmi);
     const uint32x4_t xl = vmlaq_n_u32(vdupq_n_u32(pw->xl0 + (uint32_t)(k0 - pw->ysw) * pw->xli), iota, pw->xli);
@@ -166,7 +151,6 @@ FOIR_INLINE int walk_row_neon(const struct prim_walk *pw, int j, struct span *sp
     vst1q_s32(sp->majorx, vandq_s32(xrsc, m1fff));
     vst1q_s32(sp->minorx, vandq_s32(xlsc, m1fff));
 
-    /* crossed edges, and subscanlines outside the clipped y range */
     const int32x4_t flipbit = vdupq_n_s32(1 << 27), cm = vdupq_n_s32(0x3fff << 14);
     const uint32x4_t cl = vreinterpretq_u32_s32(vandq_s32(veorq_s32(xleft, flipbit), cm));
     const uint32x4_t cr = vreinterpretq_u32_s32(vandq_s32(veorq_s32(xright, flipbit), cm));
@@ -181,7 +165,6 @@ FOIR_INLINE int walk_row_neon(const struct prim_walk *pw, int j, struct span *sp
     sp->validline = valid;
     if (!valid) return 0;
 
-    /* extent of the valid subscanlines */
     const int32x4_t m0fff = vdupq_n_s32(0xfff);
     const int32x4_t lv = vandq_s32(vshrq_n_s32(xlsc, 3), m0fff), rv = vandq_s32(vshrq_n_s32(xrsc, 3), m0fff);
     if (pw->flip) {
@@ -192,7 +175,6 @@ FOIR_INLINE int walk_row_neon(const struct prim_walk *pw, int j, struct span *sp
         sp->rx = (int)vmaxvq_u32(vbicq_u32(vreinterpretq_u32_s32(rv), inv));
     }
 
-    /* the interpolants, at the right edge of the subscanline ldflag */
     const int32_t xld = (int32_t)(pw->xr0 + (n0 + (uint32_t)pw->ldflag) * pw->xri);
     sp->unscrx = SIGN(xld >> 16, 12);
     const uint32_t xfrac = (uint32_t)((xld >> 8) & 0xff);
@@ -208,7 +190,6 @@ FOIR_INLINE int walk_row_neon(const struct prim_walk *pw, int j, struct span *sp
 }
 #endif
 
-/* the walker the renderer uses */
 #if defined(FOIR_NEON)
 #define walk_row walk_row_neon
 #else

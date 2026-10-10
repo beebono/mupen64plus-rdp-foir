@@ -1,13 +1,4 @@
-/*
- * walk_ref.inc -- the sequential edge walker, kept as the oracle of tools/walkfuzz.c.
- *
- * This is walk_edges() of src/setup.c exactly as it was at foir commit c73eb8e (before the rows were computed one at a
- * time by walk_row, src/walk.h): decode of the 44-word record, then the loop over every subscanline that fills one
- * struct span per scanline. Two differences from the original text, both marked WALKREF: the function is called
- * walk_edges_ref, and the row storage comes from walkref_rows() of the including file (the original took it from the
- * worker pool or from the context's scratch array). raster_draw() is redirected by a macro in walkfuzz.c. It needs
- * -fwrapv (the Makefile has it), as the original did. Do not "fix" or modernise this file: it is the specification.
- */
+/* The sequential edge walker, verbatim from foir c73eb8e: the oracle of walkfuzz.c. Do not modernise. Differences are marked WALKREF; needs -fwrapv. */
 static int32_t normalize_dzpix(int32_t sum)
 {
     if (sum & 0xc000) return 0x8000;
@@ -18,8 +9,6 @@ static int32_t normalize_dzpix(int32_t sum)
     return 0;
 }
 
-/* Walk the edges. `ew` is the canonical 44-word record (see setup_*): words
- * 0-7 edges, 8-23 shade, 24-39 texture, 40-43 depth. */
 static void walk_edges_ref(struct rdp *r, const int32_t *ew)
 {
     struct prim_ctx *pc = &r->pc;
@@ -78,7 +67,6 @@ static void walk_edges_ref(struct rdp *r, const int32_t *ew)
     dzde = ew[42];
     dzdy = ew[43];
 
-    /* per-pixel increments handed to the rasteriser */
     pc->flip = flip;
     pc->tilenum = tilenum;
     pc->ds = dsdx & ~0x1f;
@@ -190,12 +178,11 @@ static void walk_edges_ref(struct rdp *r, const int32_t *ew)
     else yhlimit = (yh >= r->clip.yh);
     yhlimit = yhlimit ? yh : r->clip.yh;
 
-    /* scanlines this primitive can produce: yhlimit >> 2 .. (yllimit >> 2) + 1 */
     jlo = yhlimit >> 2;
     {
         int jhi = (yllimit >> 2) + 1;
         if (jlo < 0) jlo = 0;
-        if (jhi < jlo || (yllimit >> 2) < 0) return;      /* nothing visible */
+        if (jhi < jlo || (yllimit >> 2) < 0) return;
         int nrows = jhi - jlo + 1;
         rows = walkref_rows(nrows);                       /* WALKREF: was r->mt ? mt_alloc_rows(r, nrows) : r->span_scratch */
         for (int q = 0; q < nrows; q++) rows[q].validline = 0;

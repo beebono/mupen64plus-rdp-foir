@@ -1,8 +1,5 @@
 /*
  * mupen64plus-rdp-foir - kneon_blend.c
- * NEON blender: alpha compare, coverage test, the blend equation (with the
- * exact division table for the final cycle), colour dithering. Random alpha
- * compare dithering falls back to the scalar kernel.
  *
  * Copyright (C) 2026 foir contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -21,19 +18,17 @@ FOIR_INLINE int16x8_t colsel(int sel, int16x8_t pix, int16x8_t mem, int16_t bl, 
 }
 
 struct bl_eq {
-    int16x8_t out[3];      /* result when the equation does not use the division table */
-    uint16x8_t idx[3];     /* division table index when it does */
+    int16x8_t out[3];
+    uint16x8_t idx[3];
 };
 
-/* The blender state the kernel depends on. The generic kernel fills it from the render state at run time, a specialised
- * variant (kspec_blend.inc) passes a literal one, so the same body serves both. */
 struct bs {
     int two;
     int m1a[2], m1b[2], m2a[2], m2b[2];
     int acmp, dal, aa, force, cvgcol, rgbd;
 };
 
-/* the blend equation; pix[3] = alpha used for the m1b = pixel alpha / inverse selections */
+/* pix[3] = alpha for the m1b = pixel alpha / inverse selections */
 FOIR_INLINE void blend_eq(const struct rdp *r, const struct bs *S, int cyc, const int16x8_t pix[4], const int16x8_t mem[4],
                           int16x8_t shade_a, int16x8_t sha_shift, int16x8_t shb_shift, struct bl_eq *e)
 {
@@ -105,7 +100,6 @@ FOIR_INLINE void blend_body(struct rdp *r, struct px_batch *b, const struct bs S
         const int16x8_t sha_shift = vmovl_s8(vld1_s8(&b->blshifta[o]));
         const int16x8_t shb_shift = vmovl_s8(vld1_s8(&b->blshiftb[o]));
 
-        /* coverage test */
         int16x8_t cv = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(S.aa ? &b->cvg[o] : &b->cvbit[o])));
         wen = vandq_u16(wen, vcgtq_s16(cv, vdupq_n_s16(0)));
 
@@ -119,8 +113,7 @@ FOIR_INLINE void blend_body(struct rdp *r, struct px_batch *b, const struct bs S
             cur[0] = e0.out[0]; cur[1] = e0.out[1]; cur[2] = e0.out[2];
         }
 
-        /* final colour */
-        uint16x8_t pathA;       /* lanes that go through the m1a / equation branch */
+        uint16x8_t pathA;
         if (!S.cvgcol) pathA = vdupq_n_u16(0xffff);
         else pathA = k_widen_mask8(vld1_u8(&b->prewrap[o]));
 
@@ -142,7 +135,6 @@ FOIR_INLINE void blend_body(struct rdp *r, struct px_batch *b, const struct bs S
             if (S.force) {
                 for (int c = 0; c < 3; c++) res[c] = vbslq_s16(eqm, e.out[c], res[c]);
             } else {
-                /* exact division table: per lane lookups */
                 uint16_t idx[3][8] ALIGN16;
                 int16_t outv[3][8] ALIGN16;
                 uint16_t em[8] ALIGN16;

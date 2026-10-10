@@ -1,8 +1,5 @@
 /*
  * mupen64plus-rdp-foir - vi.c
- * Minimal video interface: no VI filters (anti-aliasing, divot, gamma, dither),
- * just crop to the active region and expand to RGBA8888. Scaling to the window
- * is left to the GL output.
  *
  * Copyright (C) 2026 foir contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -12,7 +9,7 @@
 #include <arm_neon.h>
 #endif
 
-/* One scanline of 16-bit (RGBA5551) pixels -> RGBA8888 bytes (R,G,B,A in memory order). */
+/* no VI filters (anti-aliasing, divot, gamma, dither): crop to the active region and expand to RGBA8888 */
 static void row16(const struct rdp *r, uint32_t base, int w, uint32_t *dst)
 {
     int x = 0;
@@ -49,7 +46,6 @@ static void row16(const struct rdp *r, uint32_t base, int w, uint32_t *dst)
     }
 }
 
-/* One scanline of 16-bit pixels passed through unchanged (halfword pairs un-swapped). */
 static void row16_raw(const struct rdp *r, uint32_t base, int w, uint16_t *dst)
 {
     int x = 0;
@@ -64,7 +60,6 @@ static void row16_raw(const struct rdp *r, uint32_t base, int w, uint16_t *dst)
     for (; x < w; x++) dst[x] = rdram_rd16(r, base + (uint32_t)x);
 }
 
-/* One scanline of 32-bit (RGBA8888) pixels. */
 static void row32(const struct rdp *r, uint32_t base, int w, uint32_t *dst)
 {
     int x = 0;
@@ -110,7 +105,6 @@ void vi_render_ex(const struct rdp *r, const struct vi_regs *regs, struct vi_fra
     int h = (((vend - vstart) >> 1) * yscale) >> 10;
     if (w <= 0 || h <= 0) return;
     {
-        /* how much of the nominal screen does the active area span? */
         int hscr = hend - hstart, vlines = (vend - vstart) >> 1;
         float fw = hscr / 640.0f, fh = vlines / (vlines > 250 ? 288.0f : 240.0f);
         out->screen_w = fw >= 0.94f ? 1.0f : (fw < 0.25f ? 0.25f : fw);
@@ -120,8 +114,7 @@ void vi_render_ex(const struct rdp *r, const struct vi_regs *regs, struct vi_fra
     if (h > VI_MAX_H) h = VI_MAX_H;
 
     uint32_t origin = regs->origin & 0xffffff;
-    /* InterlaceHack: the RDP rendered only one field (odd or even rows) of this frame; scanning out the whole
-     * buffer would weave it with the previous field. Show the fresh rows twice instead. */
+    /* InterlaceHack: the buffer holds one fresh field; weaving it would mix in the previous one, so show its rows twice */
     bool fieldhack = r->cfg.interlace_hack && (regs->status & 0x40) && r->scfield && h >= 2;
     int field = r->sckeepodd & 1;
     const bool raw = allow_raw16 && type == 2;

@@ -1,4 +1,4 @@
-/* specialised blender variants: BLEND(two, m1a0,m1b0,m2a0,m2b0, m1a1,m1b1,m2a1,m2b1, acmp, dal, aa, force, cvgcol, rgbd); see kspec_blend.inc */
+/* BLEND(two, m1a0,m1b0,m2a0,m2b0, m1a1,m1b1,m2a1,m2b1, acmp, dal, aa, force, cvgcol, rgbd); BLENDX: the "any option" form */
 BLENDX(0, 0,0,1,0, 0,0,0,0)  /* 28.85% mean */
 BLENDX(0, 0,0,1,1, 0,0,0,0)  /* 23.80% mean */
 BLENDX(0, 0,3,0,2, 0,0,0,0)  /* 15.48% mean */

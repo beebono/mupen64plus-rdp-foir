@@ -1,7 +1,5 @@
 /*
  * mupen64plus-rdp-foir - kneon.h
- * Shared helpers for the NEON kernel set. Everything here operates on 8 pixels
- * in 16-bit lanes (int32 only where a multiply needs the headroom).
  *
  * Copyright (C) 2026 foir contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -12,10 +10,8 @@
 #include "kernels_priv.h"
 #include <arm_neon.h>
 
-/* the scalar kernel table entries, used as fallbacks for configurations a NEON kernel does not handle */
 extern const struct foir_kernels foir_kernels_scalar;
 
-/* NEON kernel entry points (one translation unit each) */
 void neon_texture(struct rdp *r, struct px_batch *b);
 void neon_combine(struct rdp *r, struct px_batch *b);
 void neon_zcmp(struct rdp *r, struct px_batch *b);
@@ -26,7 +22,6 @@ void neon_copy(struct rdp *r, int y, const struct span *sp, int flip);
 
 void neon_tables_init(void);
 
-/* debug counters of scalar fallbacks and handled batches (build with -DFOIR_STATS) */
 #ifdef FOIR_STATS
 extern unsigned long neon_stat_fb[9], neon_stat_ok[9];     /* 0..4 stages, 5 fill, 6 / 7 zcmp fast path / dead Z groups, 8 copy */
 #define NEON_FALLBACK(i) (neon_stat_fb[i]++)
@@ -38,11 +33,9 @@ extern unsigned long neon_stat_fb[9], neon_stat_ok[9];     /* 0..4 stages, 5 fil
 
 #define NGROUPS(n) (((n) + 7) >> 3)
 
-/* sign-extend the low 9 bits of every lane */
 FOIR_INLINE int16x8_t k_sext9(int16x8_t x) { return vshrq_n_s16(vshlq_n_s16(x, 7), 7); }
 
-/* k_ext9[] of the RDP (combiner A, B, D inputs): 9-bit values where 0x180..0x1ff are negative but
- * 0x100..0x17f stay positive (range -128..383) */
+/* k_ext9[] of the RDP: 0x180..0x1ff are negative but 0x100..0x17f stay positive (range -128..383) */
 FOIR_INLINE int16x8_t k_ext9v(int16x8_t x)
 {
     int16x8_t v = vandq_s16(x, vdupq_n_s16(0x1ff));
@@ -60,7 +53,7 @@ FOIR_INLINE int16x8_t k_clamp9v(int16x8_t v)
     return vbslq_s16(lt256, v, vreinterpretq_s16_u16(vandq_u16(lt384, vdupq_n_u16(255))));
 }
 
-/* 8 lanes of (((a - b) * c + (d << 8) + 0x80) >> 8) & 0x1ff with 9-bit sign extended operands */
+/* (((a - b) * c + (d << 8) + 0x80) >> 8) & 0x1ff on 9-bit sign-extended operands */
 FOIR_INLINE int16x8_t k_comb9(int16x8_t a, int16x8_t b, int16x8_t c, int16x8_t d)
 {
     a = k_ext9v(a); b = k_ext9v(b); c = k_sext9(c); d = k_ext9v(d);
@@ -72,7 +65,7 @@ FOIR_INLINE int16x8_t k_comb9(int16x8_t a, int16x8_t b, int16x8_t c, int16x8_t d
     return vandq_s16(res, vdupq_n_s16(0x1ff));
 }
 
-/* same hash as prand() in kernels_scalar.c, four lanes */
+/* same hash as prand() in kernels_scalar.c */
 FOIR_INLINE uint32x4_t k_prand4(uint32x4_t idx, uint32_t seed, uint32_t salt)
 {
     uint32x4_t h = veorq_u32(vmulq_n_u32(idx, 0x9e3779b1u), vdupq_n_u32(seed ^ (salt * 0x85ebca77u)));
@@ -81,7 +74,7 @@ FOIR_INLINE uint32x4_t k_prand4(uint32x4_t idx, uint32_t seed, uint32_t salt)
     return veorq_u32(h, vshrq_n_u32(h, 16));
 }
 
-FOIR_INLINE uint16x8_t k_widen_mask8(uint8x8_t m)    /* 0/non-0 bytes -> 0/0xffff lanes */
+FOIR_INLINE uint16x8_t k_widen_mask8(uint8x8_t m)
 {
     return vreinterpretq_u16_s16(vmovl_s8(vreinterpret_s8_u8(vcgt_u8(m, vdup_n_u8(0)))));
 }

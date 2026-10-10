@@ -1,12 +1,4 @@
-/*
- * ref-angrylion: runs a foir dump through the angrylion-rdp-plus core so the
- * two renderers can be diffed (see compare.py). Development tool, x86 only.
- *
- *   ref-angrylion dump.fdump -o out.rdram [-p out.ppm]
- *
- * angrylion-rdp-plus is MAME-licensed code kept out of the plugin itself; this
- * tool just links its n64video core from the sibling checkout.
- */
+/* ref-angrylion dump.fdump -o out.rdram [-p out.ppm]: runs a dump through the angrylion-rdp-plus n64video core (MAME-licensed, linked from the sibling checkout, kept out of the plugin) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -74,7 +66,6 @@ int main(int argc, char **argv)
 
     const uint32_t *p = cmds, *end = cmds + nbytes / 4;
     while (p < end) {
-        /* pack as many whole commands as fit into the scratch area */
         uint32_t *dst = (uint32_t *)(rdram + SCRATCH);
         size_t used = 0;
         while (p < end) {

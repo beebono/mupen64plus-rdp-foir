@@ -1,9 +1,5 @@
 /*
  * mupen64plus-rdp-foir - kernels_neon.c
- * Composition of the NEON kernel set. Built only with NEON=1 (FOIR_NEON).
- * Entries can be switched back to the scalar reference individually with the
- * environment variable FOIR_NEON_MASK (bit0 texture, 1 combine, 2 zcmp, 3 blend,
- * 4 store, 5 fill, 6 copy); the default enables everything.
  *
  * Copyright (C) 2026 foir contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -15,8 +11,6 @@
 #include <stdio.h>
 #include "kneon.h"
 #include "spec.h"
-
-/* ---- FOIR_NEON_VERIFY=1: run each NEON stage next to the scalar reference and report differences ---- */
 
 static unsigned long vfy_count[8], vfy_bad[8];
 
@@ -38,7 +32,7 @@ static void vfy_report(const char *stage, const struct rdp *r, const char *field
 #define VCMP1(name, arr, idx, T) do { if ((long)(T)b->arr[idx] != (long)(T)ref.arr[idx]) { bad++; vfy_report(stage, r, name, idx, (long)b->arr[idx], (long)ref.arr[idx]); } } while (0)
 #define VCMP4(name, arr, idx) do { for (int c_ = 0; c_ < 4; c_++) if (b->arr[c_][idx] != ref.arr[c_][idx]) { bad++; vfy_report(stage, r, name "[c]", idx, b->arr[c_][idx], ref.arr[c_][idx]); } } while (0)
 
-static __thread struct px_batch vfy_ref;      /* per thread: the workers verify concurrently */
+static __thread struct px_batch vfy_ref;      /* the workers verify concurrently */
 
 static void vfy_texture(struct rdp *r, struct px_batch *b)
 {
@@ -140,16 +134,14 @@ static void vfy_blend(struct rdp *r, struct px_batch *b)
     __atomic_fetch_add(&vfy_count[3], 1, __ATOMIC_RELAXED); if (bad) __atomic_fetch_add(&vfy_bad[3], 1, __ATOMIC_RELAXED);
 }
 
-/* the store stage writes the colour buffer (and the Z buffer) pixels of the lanes with wen set: save those pixels (raw RDRAM
- * halfword / word and hidden byte), run the scalar kernel and keep its result, restore, run the NEON kernel, compare. Only the
- * pixels of the lanes are touched, so this is safe with several workers (rows are owned). */
+/* save the lanes' pixels, run scalar and keep its result, restore, run NEON, compare; only those pixels are touched, so this is safe with several workers */
 struct vfy_px { uint32_t v; uint8_t h; };
 
 static void vfy_px_get(const struct rdp *r, int kind, uint32_t idx, struct vfy_px *o)
 {
-    if (kind == 2) {                                  /* 32-bit colour pixel */
+    if (kind == 2) {
         o->v = rdram_rd32(r, idx); o->h = 0;
-    } else {                                          /* 16-bit pixel (colour or Z) */
+    } else {
         const uint32_t i = idx & (RDRAM_MASK >> 1);
         o->v = rdram_rd16(r, i);
         o->h = (i << 1) < r->rdram_size ? r->hidden[i] : 0;
@@ -174,7 +166,7 @@ static void vfy_store(struct rdp *r, struct px_batch *b)
     const uint32_t fbase = fk == 2 ? r->fb_address >> 2 : r->fb_address >> 1, zbase = r->zb_address >> 1;
     struct vfy_px before[2][FOIR_BATCH], want[2][FOIR_BATCH];
     const int n = b->n < FOIR_BATCH ? b->n : FOIR_BATCH;
-    if (r->fb_size < PIXEL_SIZE_16BIT) {                 /* 4 / 8-bit colour buffers: not checked here (scalar kernel in both) */
+    if (r->fb_size < PIXEL_SIZE_16BIT) {                 /* 4 / 8-bit colour buffers are not checked */
         r->spec_cur[SPEC_STORE] ? r->spec_cur[SPEC_STORE](r, b) : neon_store(r, b);
         return;
     }
@@ -207,8 +199,7 @@ static void vfy_store(struct rdp *r, struct px_batch *b)
     __atomic_fetch_add(&vfy_count[4], 1, __ATOMIC_RELAXED); if (bad) __atomic_fetch_add(&vfy_bad[4], 1, __ATOMIC_RELAXED);
 }
 
-/* COPY spans write into the row of the colour buffer only: save that row, run the scalar kernel and keep its result, restore
- * the row, run the NEON kernel and compare (per pixel / byte, never a whole word: a neighbouring row may belong to another worker) */
+/* same for a COPY span, on its colour buffer row; per pixel / byte, never a whole word (a neighbouring row may belong to another worker) */
 static void vfy_copy(struct rdp *r, int y, const struct span *sp, int flip)
 {
     const int px16 = r->fb_size == PIXEL_SIZE_16BIT;
@@ -230,7 +221,7 @@ static void vfy_copy(struct rdp *r, int y, const struct span *sp, int flip)
     for (int i = 0; i < npix; i++) VPUT(before, i);
     neon_copy(r, y, sp, flip);
     int bad = 0;
-    for (int i = 0; i < npix; i++) VGET(before, i);      /* (reuse: the pre-copy contents are no longer needed) */
+    for (int i = 0; i < npix; i++) VGET(before, i);
     for (int i = 0; i < npix; i++) {
         if (before[i].v != want[i].v || before[i].h != want[i].h) {
             bad++;
@@ -246,7 +237,6 @@ static void vfy_copy(struct rdp *r, int y, const struct span *sp, int flip)
 unsigned long neon_stat_fb[9], neon_stat_ok[9];
 #endif
 
-/* one line for the plugin's periodic log (FOIR_NEON_VERIFY=1): batches verified and mismatching per stage; empty without verify */
 void foir_neon_verify_report(char *buf, size_t n)
 {
     static const char *nm[] = { "texture", "combine", "zcmp", "blend", "store", "fill", "copy" };
@@ -279,6 +269,7 @@ const struct foir_kernels *foir_kernels_neon(void)
     static bool done;
     if (!done) {
         unsigned mask = 0x7f;
+        /* FOIR_NEON_MASK: bit per stage (0 texture, 1 combine, 2 zcmp, 3 blend, 4 store, 5 fill, 6 copy) enables its NEON kernel */
         const char *e = getenv("FOIR_NEON_MASK");
         if (e && *e) mask = (unsigned)strtoul(e, NULL, 0);
         l_neon_mask = mask;

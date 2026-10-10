@@ -1,7 +1,5 @@
 /*
  * mupen64plus-rdp-foir - plugin.c
- * Mupen64Plus video-plugin entry points. foir is an LLE software RDP: the real
- * work happens in ProcessRDPList(); UpdateScreen() scans out the framebuffer.
  *
  * Copyright (C) 2026 foir contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -48,7 +46,7 @@ static ptr_PluginGetVersion CoreGetVersion;
 
 static void *l_core;
 static bool l_initialized, l_rom_open, l_warned_hle;
-static pthread_t l_emu_thread;                /* the thread that opened the ROM = the one running ProcessRDPList/UpdateScreen */
+static pthread_t l_emu_thread;
 static GFX_INFO l_gfx;
 static void (*l_render_cb)(int);
 static m64p_handle l_cfg_general, l_cfg_foir;
@@ -58,26 +56,24 @@ static struct vi_frame l_frame;
 static int l_win_w = 640, l_win_h = 480;
 static bool l_fullscreen;
 static double l_rdp_ms, l_vi_ms, l_sync_ms, l_last_log_ms, l_present_ms, l_syncfull_base;
-/* frame skipping */
 static unsigned l_rdp_frames, l_skipped_frames;
-static int l_skip_level;                 /* auto mode: 0 none, 1 skip every other frame, 2 render one in three */
+static int l_skip_level;                 /* 0 none, 1 skip every other frame, 2 render one in three */
 static double l_win_start_ms, l_last_us_ms;
 static unsigned l_win_frames;
 static unsigned l_frames, l_lists;
 static uint64_t l_cmds_base;
 static uint32_t l_prims_base, l_pix_base;
 static uint64_t l_cov_base[COV_N], l_covtex_base;
-static double l_cpu_all_base, l_cpu_emu_base;      /* CPU time (user + system, ms) of the process / of the emulation thread */
+static double l_cpu_all_base, l_cpu_emu_base;
 
 #ifdef FOIR_FRAMELOG
-/* FOIR_FRAMELOG (framelog.h): per-frame record, accumulators of the interval since the previous UpdateScreen */
 static bool l_fl_on;
 static double l_fl_cb_ms, l_fl_cbmax_ms, l_fl_syncfull_base;
 static unsigned l_fl_lists, l_fl_loads_base;
 static uint64_t l_fl_cmds_base, l_fl_jobs_base, l_fl_mtsync_base, l_fl_help_base, l_fl_busy_base[8];
 static uint32_t l_fl_prims_base, l_fl_pix_base;
 static uint64_t l_fl_cpu;
-static struct rusage l_fl_ru;                    /* emulation thread's rusage at the previous record */
+static struct rusage l_fl_ru;
 #endif
 
 static double cpu_ms(int who)
@@ -96,7 +92,6 @@ static double now_ms(void)
 static void (*l_debug_cb)(void *, int, const char *);
 static void *l_debug_ctx;
 
-/* called by the RDP at every SYNC_FULL: decide whether the next frame is rendered */
 static void on_rdp_frame_end(void *ctx)
 {
     (void)ctx;
@@ -202,7 +197,6 @@ EXPORT int CALL InitiateGFX(GFX_INFO info)
     return 1;
 }
 
-/* the [Video-Foir] section -> c */
 static void read_foir_section(struct foir_config *c)
 {
     c->fast_combiner = ConfigGetParamBool(l_cfg_foir, "FastCombiner") != 0;
@@ -228,13 +222,11 @@ static void load_config(void)
     l_win_w = ConfigGetParamInt(l_cfg_general, "ScreenWidth");
     l_win_h = ConfigGetParamInt(l_cfg_general, "ScreenHeight");
     read_foir_section(&l_cfg);
-    suxty_apply_staged(&l_cfg);          /* values the suxty menu set for this launch (no-op unless it did) */
-    /* environment overrides for testing and benchmarking */
+    suxty_apply_staged(&l_cfg);
     const char *ne = getenv("FOIR_NEON");
     if (ne && *ne) l_cfg.neon = atoi(ne) != 0;
     const char *he = getenv("FOIR_HELPER");
     if (he && *he) l_cfg.mt_helper = atoi(he) != 0;
-    /* FOIR_KNOBS=exact (debug / testing): the accuracy-preserving setting of every speed knob */
     const char *ke = getenv("FOIR_KNOBS");
     if (ke && !strcmp(ke, "exact")) {
         l_cfg.relaxed_precision = false; l_cfg.frame_skip = 0; l_cfg.interlace_hack = false;
@@ -376,8 +368,6 @@ static void fl_record(double ts, double ts1, double t0, double t1, double t2, co
     r.jobs = (uint32_t)(jobs - l_fl_jobs_base);
     r.vi_res = ((uint32_t)l_frame.width << 16) | ((uint32_t)l_frame.height & 0xffff);
     {
-        /* what the emulation thread did itself: CPU time (user + system), page faults, context switches since the previous record.
-         * Wall time much larger than the CPU time = it was descheduled or blocked (I/O, futex, sleep), not computing. */
         struct rusage ru;
         struct timespec tc;
         if (getrusage(RUSAGE_THREAD, &ru) == 0 && clock_gettime(CLOCK_THREAD_CPUTIME_ID, &tc) == 0) {
@@ -417,7 +407,6 @@ EXPORT void CALL UpdateScreen(void)
 #ifdef FOIR_FRAMELOG
     if (l_fl_on) fl_record(ts, ts1, t0, t1, t2, &v);
 #endif
-    /* FrameSkip=auto: compare the achieved frame interval with the VI period every 60 frames */
     if (l_cfg.frame_skip == FOIR_FRAMESKIP_AUTO) {
         if (l_win_frames == 0) l_win_start_ms = t0;
         if (++l_win_frames >= 60) {
@@ -449,8 +438,6 @@ EXPORT void CALL UpdateScreen(void)
             l_cpu_all_base = all; l_cpu_emu_base = emu;
         }
         {
-            /* share of the window's pixels that ran through a specialised variant, per stage (the workers are idle here:
-             * UpdateScreen drained them above) */
             uint64_t cov[COV_N], texall;
             rdp_coverage(&l_rdp, cov, &texall);
             double all = (double)(cov[5] - l_cov_base[5]), ta = (double)(texall - l_covtex_base);
@@ -510,8 +497,6 @@ EXPORT void CALL FBRead(unsigned int addr) { (void)addr; if (l_rom_open) rdp_syn
 EXPORT void CALL FBWrite(unsigned int addr, unsigned int size) { (void)addr; (void)size; if (l_rom_open) rdp_sync(&l_rdp); }
 EXPORT void CALL FBGetFrameBufferInfo(void *p) { (void)p; }
 
-/* ---- suxty interface (foir_suxty.h) ------------------------------------------------------------------------------------ */
-
 static const char *const l_lbl_frameskip[] = { "Off", "Every 2nd", "2 of 3", "3 of 4", "Auto" };
 static const char *const l_lbl_threads[] = { "None", "Auto", "1", "2", "3", "4", "5", "6", "7" };
 
@@ -533,7 +518,6 @@ static const struct foir_suxty_option l_opts[OPT_COUNT] = {
     [OPT_RELAXED]    = { "RelaxedPrecision", "Relaxed Precision", "Lower-precision Z and texture math", FOIR_OPT_BOOL, 0, 0, 1, 1, NULL, 1 },
 };
 
-/* values set() was given; applied over [Video-Foir] by load_config() */
 static bool l_staged_set[OPT_COUNT];
 static int  l_staged[OPT_COUNT];
 
@@ -604,15 +588,13 @@ static int suxty_set(unsigned i, int value)
     l_staged[i] = value;
     if (!l_rom_open) return FOIR_SUXTY_APPLIED;       /* RomOpen reads it */
     if (!(l_opts[i].flags & FOIR_OPTF_LIVE)) return FOIR_SUXTY_NEXT_LAUNCH;
-    /* Live options.  The caller is on the emulation thread between frames (inside the buffer swap at the end of
-     * UpdateScreen): rdp_sync() has drained the RDP workers, nothing runs concurrently, and the workers' private
-     * config copies are not used by any of these. */
+    /* on the emulation thread between frames: rdp_sync() has drained the workers, so nothing runs concurrently */
     opt_store(&l_cfg, i, value);
     switch (i) {
-    case OPT_WIDESCREEN: gl_out_set_widescreen(value != 0); break;        /* read by gl_out_present() every frame */
-    case OPT_FILTER:     gl_out_set_filter(value != 0); break;            /* likewise */
-    case OPT_INTERLACE:  l_rdp.cfg.interlace_hack = value != 0; break;   /* read by vi_render on this thread only */
-    case OPT_FRAMESKIP:                                                    /* read by on_rdp_frame_end on this thread */
+    case OPT_WIDESCREEN: gl_out_set_widescreen(value != 0); break;
+    case OPT_FILTER:     gl_out_set_filter(value != 0); break;
+    case OPT_INTERLACE:  l_rdp.cfg.interlace_hack = value != 0; break;
+    case OPT_FRAMESKIP:
         l_skip_level = 0; l_win_frames = 0; l_rdp.skip_pixels = false; break;
     }
     return FOIR_SUXTY_APPLIED;

@@ -1,10 +1,5 @@
 /*
  * mupen64plus-rdp-foir - kspec_comb.inc (included by kneon_comb.c)
- * Specialised colour combiner variants. comb_body() is the generic kernel's algorithm with the combiner
- * selectors, the dither / alpha options and the shade needs as compile-time constants: operands are
- * resolved to a load, a splatted constant or a register at build time, the equation shapes are chosen at
- * build time, shade and the cycle-0 result never touch memory and there is no per-batch table setup.
- * The variants are listed in spec_comb.def.
  *
  * Copyright (C) 2026 foir contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -18,7 +13,6 @@ struct cs {
     int rgbd, ad, acmp, acs, cta, shrgb, sha, wide;
 };
 
-/* splatted per-draw constants (the generic kernel splats the used ones into per-batch arrays) */
 struct cconst {
     int16x8_t prim[4], env[4], keyc[3], keys[3], k4, k5, plodf;
 };
@@ -45,7 +39,6 @@ FOIR_INLINE int16x8_t cs_opnd(int idx, int tsel, const struct px_batch *b, int o
     }
 }
 
-/* one equation (((a - b) * c + (d << 8) + 0x80) >> 8) & 0x1ff, classified at build time like cop_make() */
 FOIR_INLINE int16x8_t cs_eval(int ia, int ib, int im, int id, bool tw, int tsel, const struct px_batch *b, int o,
                               const int16x8_t sh[4], const int16x8_t c0[4], int16x8_t noise, const struct cconst *K)
 {
@@ -130,7 +123,6 @@ FOIR_INLINE void comb_body(struct rdp *r, struct px_batch *b, const struct cs S)
         const uint8x8_t cvg8 = vld1_u8(&b->cvg[o]);
         const int16x8_t cvg = vreinterpretq_s16_u16(vmovl_u8(cvg8));
 
-        /* ---- noise / dither ---- */
         uint8x8_t pv = vdup_n_u8(0);
         if (need_pv) pv = vqtbl1_u8(ptab, vld1_u8(&b->ditidx[o]));
         int16x8_t cdv;
@@ -159,7 +151,6 @@ FOIR_INLINE void comb_body(struct rdp *r, struct px_batch *b, const struct cs S)
         vst1q_s16(&b->cdith[o], cdv);
         vst1_s8(&b->adith[o], vreinterpret_s8_u8(ad8));
 
-        /* ---- shade ---- */
         int16x8_t sh[4] = { vdupq_n_s16(0), vdupq_n_s16(0), vdupq_n_s16(0), vdupq_n_s16(0) };
         if (S.sha) {
             if (vminv_u8(cvg8) == 8) {
@@ -181,7 +172,6 @@ FOIR_INLINE void comb_body(struct rdp *r, struct px_batch *b, const struct cs S)
         }
         const int16x8_t shade_a = sh[3];
 
-        /* ---- cycles ---- */
         int16x8_t acalpha = vdupq_n_s16(0);
         int16x8_t c0r[4] = { vdupq_n_s16(0), vdupq_n_s16(0), vdupq_n_s16(0), vdupq_n_s16(0) };
         if (two) {
@@ -206,7 +196,6 @@ FOIR_INLINE void comb_body(struct rdp *r, struct px_batch *b, const struct cs S)
         for (int c = 0; c < 3; c++) cf[c] = cs_rgb(&S, 1, c, two, tw, b, o, sh, cprev, noise, &K);
         cf[3] = cs_alpha(&S, 1, two, tw, b, o, sh, cprev, noise, &K);
 
-        /* ---- finish ---- */
         int16x8_t pa = k_clamp9v(cf[3]);
         pa = vbslq_s16(vceqq_s16(pa, vdupq_n_s16(0xff)), vdupq_n_s16(0x100), pa);
         int16x8_t newcvg = cvg, temp = vdupq_n_s16(0);
@@ -234,19 +223,14 @@ FOIR_INLINE void comb_body(struct rdp *r, struct px_batch *b, const struct cs S)
     }
 }
 
-/* ---- the variants -------------------------------------------------------------------------------------- */
-
-/* selector fields of SET_COMBINE (w0 = low 24 bits of the first word, w1 = second word); the cycle-0 fields of a
- * one-cycle state are zero (as in the key) */
+/* SET_COMBINE selector fields; the cycle-0 fields of a one-cycle state are zero (as in the key) */
 #define CMB_SELS(two, w0, w1) { \
     (two) ? ((w0) >> 20) & 0xf : 0, (two) ? ((w1) >> 28) & 0xf : 0, (two) ? ((w0) >> 15) & 0x1f : 0, (two) ? ((w1) >> 15) & 7 : 0, \
     (two) ? ((w0) >> 12) & 7 : 0, (two) ? ((w1) >> 12) & 7 : 0, (two) ? ((w0) >> 9) & 7 : 0, (two) ? ((w1) >> 9) & 7 : 0, \
     ((w0) >> 5) & 0xf, ((w1) >> 24) & 0xf, (w0) & 0x1f, ((w1) >> 6) & 7, \
     ((w1) >> 21) & 7, ((w1) >> 3) & 7, ((w1) >> 18) & 7, (w1) & 7 }
 
-/* COMB: every option literal. COMBX: the "any option" form of the same selectors: dither, alpha compare, coverage
- * options and the blender's shade alpha need are read from the render state (cheap: loop invariants and well predicted
- * branches), so one variant serves every state with these selectors. A state looks for COMB first, then COMBX. */
+/* COMBX: dither, alpha compare, coverage and the blender's shade alpha need are read from the render state (loop invariants), so one variant serves every state with these selectors; a state looks for COMB first, then COMBX */
 #define COMB(two, w0, w1, rgbd, ad, acmp, acs, cta, shrgb, sha, wide) \
     COMB_NAMED(comb_##two##_##w0##_##w1##_##rgbd##ad##acmp##acs##cta##shrgb##sha##wide, two, w0, w1, rgbd, ad, acmp, acs, cta, shrgb, sha, wide)
 #define COMB_NAMED(nm, two, w0, w1, rgbd, ad, acmp, acs, cta, shrgb, sha, wide) \

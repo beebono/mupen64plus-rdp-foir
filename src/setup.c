@@ -1,11 +1,5 @@
 /*
  * mupen64plus-rdp-foir - setup.c
- * Primitive setup: decodes triangle / rectangle commands into the RDP's
- * canonical 44-word edge-walker record and runs the 4-subscanline edge walker,
- * producing one `struct span` per scanline for the rasteriser.
- *
- * The fixed-point formats and the subscanline/coverage clip logic follow the
- * hardware behaviour documented by angrylion-rdp-plus.
  *
  * Copyright (C) 2026 foir contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -23,10 +17,7 @@ static int32_t normalize_dzpix(int32_t sum)
     return 0;
 }
 
-/* Decode the canonical 44-word record `ew` (see setup_*): words 0-7 edges, 8-23 shade, 24-39 texture, 40-43 depth,
- * into the per-primitive constants (r->pc) and the setup record of the edge walker (walk.h), which the threads that
- * render the rows use to compute the spans (the sequential walk over all subscanlines that used to run here is
- * tools/walk_ref.inc). Returns false when no scanline of the primitive is visible. */
+/* ew: canonical 44-word record, words 0-7 edges, 8-23 shade, 24-39 texture, 40-43 depth; false when no scanline is visible */
 bool setup_walk(struct rdp *r, const int32_t *ew, struct prim_walk *pw, int *pstart, int *pend)
 {
     struct prim_ctx *pc = &r->pc;
@@ -85,7 +76,6 @@ bool setup_walk(struct rdp *r, const int32_t *ew, struct prim_walk *pw, int *pst
     dzde = ew[42];
     dzdy = ew[43];
 
-    /* per-pixel increments handed to the rasteriser */
     pc->flip = flip;
     pc->tilenum = tilenum;
     pc->ds = dsdx & ~0x1f;
@@ -168,10 +158,9 @@ bool setup_walk(struct rdp *r, const int32_t *ew, struct prim_walk *pw, int *pst
     else yhlimit = (yh >= r->clip.yh);
     yhlimit = yhlimit ? yh : r->clip.yh;
 
-    /* scanlines this primitive can produce: yhlimit >> 2 .. (yllimit >> 2) + 1 */
     int jlo = yhlimit >> 2;
     if (jlo < 0) jlo = 0;
-    if ((yllimit >> 2) + 1 < jlo || (yllimit >> 2) < 0) return false;      /* nothing visible */
+    if ((yllimit >> 2) + 1 < jlo || (yllimit >> 2) < 0) return false;
 
     /* the sequential walk resets the left edge to xl / dxldy when it reaches the subscanline ym (only if it starts above it) */
     pw->ycur = ycur;
@@ -214,8 +203,6 @@ static void walk_edges(struct rdp *r, const int32_t *ew)
     raster_draw(r, &pw, start, end);
 }
 
-/* ---- triangles ----------------------------------------------------------- */
-
 void setup_triangle(struct rdp *r, const uint32_t *a)
 {
     int32_t ew[44];
@@ -232,8 +219,6 @@ void setup_triangle(struct rdp *r, const uint32_t *a)
     if (has_z)     { memcpy(&ew[40], a + pos, 4 * sizeof(uint32_t)); }
     walk_edges(r, ew);
 }
-
-/* ---- rectangles ----------------------------------------------------------- */
 
 void setup_texrect(struct rdp *r, const uint32_t *a, bool flipped)
 {

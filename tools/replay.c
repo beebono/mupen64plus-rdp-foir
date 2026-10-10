@@ -1,11 +1,5 @@
 /*
- * foir-replay: offline driver for the foir renderer.
- *
- *   foir-replay dump.fdump [-o out.rdram] [-p out.ppm] [-n repeats] [-q]
- *
- * Loads an RDRAM snapshot and the recorded RDP commands (see fdump.h), runs
- * them through the scalar reference pipeline, and writes the final RDRAM and a
- * PPM of the VI output. With -n it repeats the replay and reports timing.
+ * foir-replay dump.fdump [-o out.rdram] [-p out.ppm] [-n repeats] [-q]
  *
  * Copyright (C) 2026 foir contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -84,7 +78,6 @@ int main(int argc, char **argv)
         rdp_attach_memory(&r, rdram, h.rdram_size);
         rdp_start_workers(&r, threads > 0 ? threads : 0);
         const uint32_t *p = cmds;
-        /* run prelude (state only) untimed, then time the frame commands */
         double t0 = now_ms();
         for (uint32_t i = 0; i < h.ncmds; i++) {
             if (i == h.nprelude) t0 = now_ms();
@@ -127,7 +120,6 @@ int main(int argc, char **argv)
     }
 #ifdef FOIR_STAGETIME
     if (repeats > 0) {
-        /* the cost of reading the timer itself, taken off every interval */
         uint64_t freq, a, b2, sum = 0;
         __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
         for (int i = 0; i < 200000; i++) {
@@ -160,8 +152,6 @@ int main(int argc, char **argv)
     if (repeats > 0 && threads > 0) {
         fprintf(stderr, "foir-replay: parser thread %.3f ms/run until the last primitive was queued, %.3f ms waiting for workers (%d workers)\n",
                 t_submit / repeats, (t_total - t_submit) / repeats, threads);
-        /* the parser thread's time in the RDP, as the plugin logs it: its own work (parse, setup, queueing; includes waits for
-         * ring space and barriers) plus the wait at SYNC_FULL */
         fprintf(stderr, "foir-replay: emulation thread %.3f ms/run: own work %.3f, waiting at SYNC_FULL %.3f\n",
                 t_submit / repeats, (t_submit - t_wait) / repeats, t_wait / repeats);
     }

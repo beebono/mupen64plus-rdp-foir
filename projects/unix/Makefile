@@ -1,21 +1,12 @@
 #/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
 # *   mupen64plus-rdp-foir - Makefile                                       *
-# *   Follows the layout of the other Mupen64Plus plugin Makefiles.         *
 # *                                                                         *
 # *   This program is free software; you can redistribute it and/or modify  *
 # *   it under the terms of the GNU General Public License as published by  *
 # *   the Free Software Foundation; either version 3 of the License, or     *
 # *   (at your option) any later version.                                   *
 # * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
-# Makefile for the foir software RDP video plugin.
-#
-#   make all                          native build (x86_64: scalar kernels)
-#   make all NEON=0                   scalar reference path only
-#   make all CROSS_COMPILE=aarch64-linux-gnu- HOST_CPU=aarch64
-#                                     cross build for aarch64 (NEON kernels = M2)
-#   make replay                       build the offline replay tool (no core needed)
 
-# detect operating system
 UNAME ?= $(shell uname -s)
 OS := NONE
 ifeq ("$(UNAME)","Linux")
@@ -32,7 +23,6 @@ ifeq ("$(OS)","NONE")
   $(error OS type "$(UNAME)" is not supported by this Makefile yet (Linux only).)
 endif
 
-# detect system architecture (override HOST_CPU when cross compiling)
 HOST_CPU ?= $(shell uname -m)
 CPU := NONE
 ifneq ("$(filter x86_64 amd64,$(HOST_CPU))","")
@@ -49,8 +39,6 @@ ifeq ("$(CPU)","NONE")
   $(error CPU type "$(HOST_CPU)" not supported (x86_64 and aarch64 only).)
 endif
 
-# kernel / compiler selection:
-#   NEON=1 builds the NEON kernel set and its precompiled per-state variants (M2 / M3)
 ifeq ("$(CPU)","AARCH")
   NEON ?= 1
 else
@@ -60,10 +48,8 @@ endif
 SRCDIR = ../../src
 TOOLDIR = ../../tools
 OBJDIR = _obj$(if $(CROSS_COMPILE),_cross_$(CPU),)$(POSTFIX)
-# cross builds put their products in _out_<cpu>/ so they never clobber the native ones
 OUTDIR = $(if $(CROSS_COMPILE),_out_$(CPU)/,)
 
-# base CFLAGS, LDLIBS, and LDFLAGS
 OPTFLAGS ?= -O3
 WARNFLAGS ?= -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare
 CFLAGS += -std=gnu11 $(OPTFLAGS) $(WARNFLAGS) -fwrapv -fno-strict-aliasing -fvisibility=hidden -I$(SRCDIR)
@@ -88,7 +74,6 @@ ifeq ($(OS), LINUX)
   LDLIBS += -ldl -lm -lpthread
 endif
 
-# set mupen64plus core API header path
 ifneq ("$(APIDIR)","")
   CFLAGS += "-I$(APIDIR)"
 else
@@ -110,7 +95,6 @@ else
   endif
 endif
 
-# reduced compile output when running make without V=1
 ifneq ($(findstring $(MAKEFLAGS),s),s)
 ifndef V
 	Q_CC  = @echo '    CC  '$@;
@@ -143,7 +127,6 @@ ifeq ($(PLUGINDIR),)
   PLUGINDIR := $(LIBDIR)/mupen64plus
 endif
 
-# renderer core (shared between the plugin and the replay tool)
 CORE_SOURCE = \
 	$(SRCDIR)/config.c \
 	$(SRCDIR)/log.c \
@@ -215,9 +198,6 @@ fuzz: $(KFUZZ)
 
 walkfuzz: $(WALKFUZZ)
 
-# bit-exactness of the optimised paths against the scalar reference (see tools/neoncheck.py, tools/mtfuzz.py and the
-# kernel fuzzer tools/kfuzz.c, whose -S mode walks through every specialised variant);
-# cross builds: make check CROSS_COMPILE=aarch64-linux-gnu- HOST_CPU=aarch64 RUNNER="qemu-aarch64-static -L /usr/aarch64-linux-gnu"
 RUNNER ?=
 check: replay walkfuzz $(if $(filter AARCH,$(CPU)),fuzz)
 	$(RUNNER) ./$(WALKFUZZ) -n 40000
@@ -250,7 +230,7 @@ clean:
 
 rebuild: clean all
 
-# angrylion reference tool (x86 development tool; needs the sibling angrylion-rdp-plus checkout)
+# needs the sibling angrylion-rdp-plus checkout
 ANGRYDIR ?= ../../../angrylion-rdp-plus/src/core
 ref: ref-angrylion
 
@@ -280,7 +260,7 @@ $(KFUZZ): $(CORE_OBJECTS) $(FUZZ_OBJECTS)
 $(WALKFUZZ): $(CORE_OBJECTS) $(WALKFUZZ_OBJECTS)
 	$(Q_LD)$(CC) $(CFLAGS) $^ -lm -lpthread -o $@
 
-# the replay tool is a plain executable: no export map, no -shared, no core dependency
+# plain executable: no export map, no -shared
 $(REPLAY): $(CORE_OBJECTS) $(REPLAY_OBJECTS)
 	$(Q_LD)$(CC) $(CFLAGS) $^ -lm -lpthread -o $@
 

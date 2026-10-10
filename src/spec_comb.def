@@ -1,4 +1,4 @@
-/* specialised combiner variants: COMB(two, w0, w1, rgbd, ad, acmp, acs, cta, shrgb, sha, wide); see kspec_comb.inc */
+/* COMB(two, w0, w1, rgbd, ad, acmp, acs, cta, shrgb, sha, wide); COMBX: the "any option" form */
 COMBX(0, 0x000024, 0x0ffc01f9, 1, 0)  /* 9.58% mean */
 COMBX(0, 0x0001ff, 0x0ffc0079, 0, 0)  /* 8.34% mean */
 COMBX(0, 0x0001ff, 0x0ffc00fb, 0, 0)  /* 7.15% mean */

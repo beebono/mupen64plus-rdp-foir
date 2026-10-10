@@ -1,11 +1,5 @@
 /*
  * mupen64plus-rdp-foir - tmem.c
- * TMEM model: LOAD_TILE / LOAD_BLOCK / LOAD_TLUT and texel readback.
- *
- * TMEM is stored as 4096 big-endian bytes. Odd texture rows are stored with
- * the two 32-bit halves of every 64-bit word swapped (byte address ^ 4, or
- * halfword index ^ 2), exactly like the hardware. RGBA32 and YUV textures use
- * both 2 KiB banks (low bank = RG / UV, high bank at +0x800 = BA / Y).
  *
  * Copyright (C) 2026 foir contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -15,6 +9,9 @@
 #if defined(FOIR_NEON)
 #include <arm_neon.h>
 #endif
+
+/* TMEM is 4096 big-endian bytes. Odd texture rows have the two 32-bit halves of every 64-bit word swapped (byte address ^ 4, halfword
+ * index ^ 2). RGBA32 and YUV use both 2 KiB banks (low RG / UV, high at +0x800 BA / Y). */
 
 static uint8_t replicated_rgba[32];
 
@@ -37,8 +34,6 @@ void tile_update_derived(struct tile *t)
     t->masktclamped = t->mask_t <= 10 ? t->mask_t : 10;
 }
 
-/* ---- raw access --------------------------------------------------------- */
-
 FOIR_INLINE uint8_t tm8(const struct rdp *r, uint32_t a) { return r->tmem[a & 0xfff]; }
 FOIR_INLINE uint16_t tm16(const struct rdp *r, uint32_t i)
 {
@@ -46,10 +41,8 @@ FOIR_INLINE uint16_t tm16(const struct rdp *r, uint32_t i)
     return (uint16_t)((r->tmem[i * 2] << 8) | r->tmem[i * 2 + 1]);
 }
 
-/* ---- texel readback ------------------------------------------------------ */
-
-#define BSWAP(t) (((t) & 1) ? 4 : 0)   /* byte address xor for odd rows */
-#define HSWAP(t) (((t) & 1) ? 2 : 0)   /* halfword index xor for odd rows */
+#define BSWAP(t) (((t) & 1) ? 4 : 0)
+#define HSWAP(t) (((t) & 1) ? 2 : 0)
 
 static inline void rgba16_to_color(uint16_t c, struct color *o)
 {
@@ -226,8 +219,6 @@ void tmem_fetch_tlut(const struct rdp *r, uint32_t idx, struct color *c)
     }
 }
 
-/* ---- loads ---------------------------------------------------------------- */
-
 enum { LOAD_RAW = 0, LOAD_RGBA32, LOAD_YUV };
 
 static int load_kind(const struct tile *t)
@@ -237,9 +228,7 @@ static int load_kind(const struct tile *t)
     return LOAD_RAW;
 }
 
-/* Fast path of LOAD_BLOCK / LOAD_TILE for plain texel data: copy n bytes from RDRAM to TMEM in whole
- * 32-bit words (RDRAM is held as host words, TMEM as big-endian bytes), applying the odd-row word swap.
- * Needs a 4-byte aligned source, an 8-byte aligned TMEM destination and no TMEM wrap-around. */
+/* whole 32-bit words from RDRAM to TMEM with the odd-row word swap; needs a 4-byte aligned source, an 8-byte aligned TMEM destination and no wrap-around */
 static bool load_raw_fast(struct rdp *r, uint32_t src, uint32_t dst, int odd, uint32_t n)
 {
     src &= RDRAM_MASK;
@@ -267,7 +256,6 @@ static bool load_raw_fast(struct rdp *r, uint32_t src, uint32_t dst, int odd, ui
     return true;
 }
 
-/* write n source bytes (already fetched into src[]) as part of row/qword layout */
 static void put_raw_bytes(struct rdp *r, uint32_t dst_byte_base, int odd, const uint8_t *src, int n)
 {
     for (int j = 0; j < n; j++) {
@@ -336,7 +324,7 @@ void tmem_load_tile(struct rdp *r, const uint32_t *a)
                 copy_src(r, src + (uint32_t)i * 4, buf, 4);
                 put_rgba32_texel(r, dstbase * 4 + (uint32_t)i, odd, buf);
             }
-        } else { /* YUV */
+        } else {
             if (bpp != 2) continue;
             for (int p = 0; p < (n + 1) / 2; p++) {
                 copy_src(r, src + (uint32_t)p * 4, buf, 4);
@@ -367,7 +355,6 @@ void tmem_load_block(struct rdp *r, const uint32_t *a)
 
     uint32_t kk = 0;
     if (kind == LOAD_RAW) {
-        /* runs of qwords sharing the odd-row flag go through the word copy */
         while (kk < nq) {
             uint32_t x = kk * dxt;
             int odd = (int)((x >> 11) & 1);

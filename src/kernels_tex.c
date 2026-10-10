@@ -1,7 +1,5 @@
 /*
  * mupen64plus-rdp-foir - kernels_tex.c
- * Scalar reference texture kernel: perspective divide, LOD, tile selection,
- * point / bilinear / mid-texel filtering, TLUT and YUV conversion.
  *
  * Copyright (C) 2026 foir contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -60,8 +58,6 @@ void kernels_tex_init_tables(void)
     for (int i = 1; i < 16; i++) k_maskbits[i] = ((uint16_t)0xffff >> (16 - i)) & 0x3ff;
     done = true;
 }
-
-/* ---- perspective divide -------------------------------------------------- */
 
 void tc_divide(const struct rdp *r, int32_t ss, int32_t st, int32_t sw, int32_t *sss, int32_t *sst)
 {
@@ -134,8 +130,6 @@ void tc_clamp17(int32_t *sss, int32_t *sst)
     clamp17_one(sst);
 }
 
-/* ---- LOD ------------------------------------------------------------------- */
-
 static void lod_4x17_to_15(int32_t scurr, int32_t snext, int32_t tcurr, int32_t tnext, int32_t previous, int32_t *lod)
 {
     int dels = SIGN(snext, 17) - SIGN(scurr, 17);
@@ -190,7 +184,6 @@ static void lodfrac_lodtile(const struct rdp *r, int lodclamp, int32_t lod,
     *distant = dis; *l_tile = ltil; *magnify = mag; *lfdst = lf;
 }
 
-/* Compute LOD fraction and the two tiles used by cycle 0 / cycle 1. */
 static void lod_select(const struct rdp *r, int32_t s, int32_t t, int32_t w,
                        int32_t inits, int32_t initt, int prim_tile,
                        int *t1, int *t2, int32_t *lf)
@@ -233,8 +226,6 @@ static void lod_select(const struct rdp *r, int32_t s, int32_t t, int32_t w,
         }
     }
 }
-
-/* ---- tile coordinate processing -------------------------------------------- */
 
 static void tcshift_cycle(const struct tile *tile, int32_t *S, int32_t *T, int32_t *maxs, int32_t *maxt)
 {
@@ -346,8 +337,6 @@ static void tcmask_coupled(const struct tile *tile, int32_t *S, int32_t *sdiff, 
     }
 }
 
-/* ---- texel fetch with optional TLUT ----------------------------------------- */
-
 static uint32_t tlut_index(const struct rdp *r, const struct tile *tl, int s, int tt)
 {
     struct color c;
@@ -388,8 +377,6 @@ static void fetch_quad(const struct rdp *r, const struct tile *tl, int s0, int s
     fetch_one(r, tl, s1, t1, c3);
 }
 
-/* ---- the texture pipeline stage -------------------------------------------- */
-
 static void texture_cycle(const struct rdp *r, struct color *TEX, const struct color *prev,
                           int32_t SSS, int32_t SST, int tilenum, int cycle)
 {
@@ -424,7 +411,6 @@ static void texture_cycle(const struct rdp *r, struct color *TEX, const struct c
 
         if (bilerp) {
             if (!om->sample_type) {
-                /* point sampled through the TLUT */
                 fetch_one(r, tl, sss1, sst1, &t0);
                 t1 = t2 = t3 = t0;
             } else {
@@ -537,7 +523,6 @@ static void texture_cycle(const struct rdp *r, struct color *TEX, const struct c
         }
         out.r &= 0x1ff; out.g &= 0x1ff; out.b &= 0x1ff; out.a &= 0x1ff;
     } else {
-        /* point sampling without TLUT */
         tcclamp_cycle_light(tl, &sss1, &sst1, maxs, maxt);
         tcmask(tl, &sss1, &sst1);
         if (bilerp) {
@@ -564,9 +549,6 @@ static void texture_cycle(const struct rdp *r, struct color *TEX, const struct c
     *TEX = out;
 }
 
-/* ---- kernel entry -------------------------------------------------------------- */
-
-/* Evaluate the texture unit at one pixel position. tex1 is only produced in two-cycle mode. */
 static void tex_pixel(const struct rdp *r, int32_t s, int32_t t, int32_t w, int two,
                       struct color *tex0, struct color *tex1, int32_t *lodfrac)
 {

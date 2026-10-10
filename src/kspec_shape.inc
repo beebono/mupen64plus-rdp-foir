@@ -1,44 +1,28 @@
 /*
  * mupen64plus-rdp-foir - kspec_shape.inc (included by kneon_comb.c)
- * Shape-specialised colour combiner kernels. A shape kernel has the *structure* of both cycles compiled in: for the
- * RGB and the alpha equation of each cycle ((A - B) * C + D), which of the four inputs is zero, the constant 1.0,
- * COMBINED (the cycle-0 result) or a variable operand. The operands themselves are not known at build time: every
- * variable input is read through the per-draw operand table r->sk, built by foir_spec_select() (spec.c) from the
- * combiner selectors, as a byte offset into the px_batch the kernel runs on: the batch's texel / LOD fraction arrays,
- * the scratch arrays of this kernel (shade, noise, COMBINED alpha) and the splatted constants (PRIM, ENV, K4, ...),
- * which are written once per state into b->kc[] already in the 9-bit extended form their use needs. Reading a
- * variable operand is therefore the same instruction sequence whatever the operand is: one offset (kept in a register
- * or reloaded from the table) and one 16-byte load.
- *
- * Everything else (dither selects, alpha compare, coverage options, which shade channels are needed) is read from the
- * render state, exactly like the "any option" (COMBX) exact variants. The shapes are listed in spec_shape.def.
- *
- * Operand extension: A, B and D operands are extended with k_ext9v, the multiply input with k_sext9 (see kneon.h).
- * Constants, noise and COMBINED alpha are stored extended; the per-pixel arrays (texels, shade, LOD fraction) are
- * 0..255 unless the key says `ext` (wide texels, or a sharpened LOD fraction in a multiply input), in which case
- * every variable operand is extended on load (idempotent for the ones stored extended).
  *
  * Copyright (C) 2026 foir contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
-
+/* Only the structure of both cycles is compiled in (per input: zero, 1.0, COMBINED or variable). A variable operand is read through the
+ * per-draw table r->sk (foir_spec_select()) as a byte offset into the px_batch: the same load sequence whatever the operand.
+ * Constants, noise and COMBINED alpha are stored 9-bit extended; the per-pixel arrays are 0..255 unless the key says `ext`, in which case
+ * every variable operand is extended on load (idempotent for the stored-extended ones). A, B, D use k_ext9v, the multiply input k_sext9. */
 struct ss {
     int two;
     int ext;
-    uint8_t sh[2][2];             /* [cycle][0 rgb, 1 alpha]: A | B << 2 | M << 4 | D << 6, letters SKL_* */
-    uint8_t cm[2][2];             /* FOIR_SK_SPLIT: constant variable operands (bit per position) */
+    uint8_t sh[2][2];             /* [cycle][rgb, alpha]: A | B << 2 | M << 4 | D << 6, letters SKL_* */
+    uint8_t cm[2][2];             /* constant variable operands (bit per position) */
 };
 
 #define SKL(sh, pos) (((sh) >> ((pos) * 2)) & 3)
 
-/* where a variable operand lives (byte offset into the batch) */
 FOIR_INLINE int16x8_t sk_load(const struct px_batch *b, unsigned off, int o)
 {
     return vld1q_s16((const int16_t *)((const char *)b + off) + o);
 }
 
-/* the value of input `pos` (0 A, 1 B, 2 multiply, 3 add) with letter `l`. isc (FOIR_SK_SPLIT, known at build time): the
- * variable operand is a constant and the table entry is its value (already extended) instead of an offset */
+/* isc (FOIR_SK_SPLIT): the operand is a constant and the table entry is its extended value instead of an offset */
 FOIR_INLINE int16x8_t sk_opnd(int l, int pos, bool ext, bool isc, const struct px_batch *b, unsigned off, int o, int16x8_t c0)
 {
     switch (l) {
@@ -54,12 +38,11 @@ FOIR_INLINE int16x8_t sk_opnd(int l, int pos, bool ext, bool isc, const struct p
     }
 }
 
-/* one equation ((A - B) * C + (D << 8) + 0x80) >> 8) & 0x1ff of the given shape, 8 pixels; off[] = operand offsets */
 FOIR_INLINE int16x8_t sk_eval(unsigned sh, unsigned cm, bool ext, const struct px_batch *b, int o, int16x8_t c0,
                               unsigned oa, unsigned ob, unsigned om_, unsigned od)
 {
     const int la = SKL(sh, 0), lb = SKL(sh, 1), lm = SKL(sh, 2), ld = SKL(sh, 3);
-    if (la == SKL_Z && lb == SKL_Z && lm == SKL_Z) {              /* D only */
+    if (la == SKL_Z && lb == SKL_Z && lm == SKL_Z) {
         switch (ld) {
         case SKL_Z: return vdupq_n_s16(0);
         case SKL_1: return vdupq_n_s16(0x100);
@@ -78,7 +61,7 @@ FOIR_INLINE int16x8_t sk_eval(unsigned sh, unsigned cm, bool ext, const struct p
         acc_lo = acc_hi = rnd;
     }
     int32x4_t lo, hi;
-    if (la == SKL_Z) {                                             /* -B * C */
+    if (la == SKL_Z) {
         int16x8_t bv = sk_opnd(lb, 1, ext, FOIR_SK_SPLIT && (cm & 2), b, ob, o, c0);
         lo = vmlsl_s16(acc_lo, vget_low_s16(bv), vget_low_s16(c));
         hi = vmlsl_high_s16(acc_hi, bv, c);
@@ -115,7 +98,6 @@ FOIR_INLINE void shape_body(struct rdp *r, struct px_batch *b, const struct ss S
         const uint8x8_t cvg8 = vld1_u8(&b->cvg[o]);
         const int16x8_t cvg = vreinterpretq_s16_u16(vmovl_u8(cvg8));
 
-        /* ---- noise / dither ---- */
         uint8x8_t pv = vdup_n_u8(0);
         if (need_pv) pv = vqtbl1_u8(ptab, vld1_u8(&b->ditidx[o]));
         int16x8_t cdv;
@@ -145,7 +127,7 @@ FOIR_INLINE void shape_body(struct rdp *r, struct px_batch *b, const struct ss S
         vst1q_s16(&b->cdith[o], cdv);
         vst1_s8(&b->adith[o], vreinterpret_s8_u8(ad8));
 
-        /* ---- shade (stored: the operand table can point at it) ---- */
+        /* stored: the operand table can point at it */
         int16x8_t shade_a = zero;
         if (sha) {
             int16x8_t sh[4];
@@ -170,7 +152,6 @@ FOIR_INLINE void shape_body(struct rdp *r, struct px_batch *b, const struct ss S
             shade_a = sh[3];
         }
 
-        /* ---- cycles ---- */
         int16x8_t acalpha = zero;
         int16x8_t c0r[4] = { zero, zero, zero, zero };
         if (two) {
@@ -197,7 +178,6 @@ FOIR_INLINE void shape_body(struct rdp *r, struct px_batch *b, const struct ss S
             cf[c] = sk_eval(S.sh[1][0], S.cm[1][0], ext, b, o, c0r[c], off[1][0][c], off[1][1][c], off[1][2][c], off[1][3][c]);
         cf[3] = sk_eval(S.sh[1][1], S.cm[1][1], ext, b, o, c0r[3], off[1][0][3], off[1][1][3], off[1][2][3], off[1][3][3]);
 
-        /* ---- finish ---- */
         int16x8_t pa = k_clamp9v(cf[3]);
         pa = vbslq_s16(vceqq_s16(pa, vdupq_n_s16(0xff)), vdupq_n_s16(0x100), pa);
         int16x8_t newcvg = cvg, temp = zero;
@@ -225,11 +205,7 @@ FOIR_INLINE void shape_body(struct rdp *r, struct px_batch *b, const struct ss S
     }
 }
 
-/* ---- the kernels -------------------------------------------------------------------------------------------- */
-
-/* The run-time options (dither, alpha compare, coverage, shade needs) are loop invariant: GCC would unswitch the group loop
- * over them and emit up to a dozen copies of it. The branches predict perfectly, so keep one loop: the kernels become
- * 30 % smaller at the same speed (measured on the RK3566). */
+/* the run-time options are loop invariant: keep one loop (GCC would unswitch it into up to a dozen copies) */
 #if defined(__GNUC__) && !defined(__clang__)
 #define SK_NOUNSWITCH __attribute__((optimize("no-unswitch-loops")))
 #else
@@ -241,7 +217,7 @@ FOIR_INLINE void shape_body(struct rdp *r, struct px_batch *b, const struct ss S
 #endif
 
 #if FOIR_SK_SPLIT
-/* SHAPEC: the shape plus which variable operands are constants (c0r, c0a, c1r, c1a: bit per position A, B, M, D) */
+/* SHAPEC: also which variable operands are constants (c0r, c0a, c1r, c1a: bit per position A, B, M, D) */
 #define SHAPE_DEF_FILE "spec_shape_cm.def"
 #define SHAPEC(two, r0, a0, r1, a1, ext, k0r, k0a, k1r, k1a) \
     SHAPE_NAMED(shp_##two##_##r0##_##a0##_##r1##_##a1##_##ext##_##k0r##k0a##k1r##k1a, two, r0, a0, r1, a1, ext, k0r, k0a, k1r, k1a)

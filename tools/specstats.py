@@ -1,23 +1,14 @@
 #!/usr/bin/env python3
-"""specstats.py: merge the per-stage key statistics of several runs into a ranked list of kernel variants.
+"""specstats.py: ranked kernel variants from the per-stage key statistics of several runs.
 
-A statistics build (`CFLAGS=-DFOIR_STATS make ...`) run with FOIR_STATE_STATS=1 FOIR_STATE_STATS_ALL=1 prints
-one `SPEC <stage> <pixels> <KEY(...)>` line per distinct stage key at exit (foir-replay) or, for the plugin,
-to $FOIR_STATE_STATS_FILE (rewritten every 120 frames). This script reads any number of such logs; every log
-counts equally (a game's share of a stage's pixels is normalised per log), and prints for each stage the keys
-ranked by the mean share, the cumulative coverage, and whether the key is already covered by src/spec_*.def.
-
-The combine and blend stages have two kinds of variants (see kspec_comb.inc): COMB / BLEND with every option
-literal, and COMBX / BLENDX ("any option") that serve every state with the same selectors. A key is covered when
-either exists. The texture stage likewise has exact variants (TEX / TEXL) and "any format" variants (TEXA / TEXAL, the
-structure of the texture unit only, see spec.h); the Z compare keys do not contain ANTIALIAS_EN / FORCE_BLEND (read at
-run time). Statistics of older builds (TEX with MID_TEXEL, ZCMP with AA / FORCE) are converted when they are read.
+Logs: a statistics build (`CFLAGS=-DFOIR_STATS make ...`) run with FOIR_STATE_STATS=1 FOIR_STATE_STATS_ALL=1 prints `SPEC <stage> <pixels> <KEY(...)>` per distinct
+key (foir-replay at exit; the plugin to $FOIR_STATE_STATS_FILE, rewritten every 120 frames). Every log counts equally (shares are normalised per log). A key is covered by
+src/spec_*.def if its exact variant or its "any" form (COMBX / BLENDX / TEXA / TEXAL) exists; older keys (TEX with MID_TEXEL, ZCMP with AA / FORCE) are converted on read.
 
 usage: specstats.py [-n top] [--def] [--stage comb] [--min-share 0.05] [--exact-share 2] [--loo N] log...
-  --def           print the keys to add to src/spec_<stage>.def: for combine / blend a COMBX / BLENDX line per selector
-                  set with a mean share >= --min-share percent, plus a COMB / BLEND line for every exact key with a mean
-                  share >= --exact-share percent; other stages: keys with a share >= --min-share
-  --loo N         leave-one-log-out coverage of a variant list built from the other logs (top N selector sets)
+  --def    print the lines to add to src/spec_<stage>.def: a COMBX / BLENDX per selector set with a mean share >= --min-share percent, a COMB / BLEND per exact key
+           >= --exact-share percent; other stages: keys >= --min-share
+  --loo N  leave-one-log-out coverage of a list built from the other logs (top N selector sets)
 """
 import argparse
 import collections
@@ -45,7 +36,6 @@ def legacy(k):
 
 
 def fmt_key(name, a):
-    """the grouped spelling of the .def files (spec.c foir_spec_describe prints the same)"""
     groups = {'TEX': (1, 3, 2, 2, 2, 2, 1, 2), 'TEXL': (1, 3, 2, 2, 2, 2, 1, 2, 1), 'ZCMP': (1, 2, 2, 1, 1)}.get(name)
     if not groups or sum(groups) != len(a):
         return '%s(%s)' % (name, ', '.join(a))
@@ -57,7 +47,6 @@ def fmt_key(name, a):
 
 
 def generic(k):
-    """the statistics' bucket of states a stage handles generically (no variant possible)"""
     return k.startswith('GENERIC(') or re.match(r'[A-Z]+\(255\b', k) is not None
 
 
@@ -71,16 +60,12 @@ def split_args(k):
 
 
 def xform(stage, k):
-    """the "any option" form of a combine / blend key (as text), or None"""
     name, a = split_args(k)
     if stage == 'comb' and name == 'COMB':
-        # COMB(two, w0, w1, rgbd, ad, acmp, acs, cta, shrgb, sha, wide)
         return 'COMBX(%s, %s, %s, %s, %s)' % (a[0], a[1], a[2], a[8], a[10])
     if stage == 'blend' and name == 'BLEND':
-        # BLEND(two, a0,b0,c0,d0, a1,b1,c1,d1, acmp, dal, aa, force, cvgcol, rgbd)
         return 'BLENDX(%s, %s, %s)' % (a[0], ','.join(a[1:5]), ','.join(a[5:9]))
     if stage == 'tex' and name == 'TEX':
-        # TEX(two, t0,t1,nx, fmt0,siz0, fmt1,siz1, smp,mid, tlut,tlt, persp, bl0,bl1) -> TEXA(two, t0,t1,nx, smp, tlut, persp, bl0,bl1)
         return 'TEXA(%s, %s, %s, %s, %s, %s)' % (a[0], ','.join(a[1:4]), a[8], a[10], a[12], ','.join(a[13:15]))
     if stage == 'tex' and name == 'TEXL':
         return 'TEXAL(%s, %s, %s, %s, %s, %s, %s)' % (a[0], ','.join(a[1:4]), a[8], a[10], a[12], ','.join(a[13:15]), a[15])
@@ -99,8 +84,7 @@ def load_def(stage):
 
 
 def load_fixed(stage):
-    """the lines of src/spec_<stage>.def without a comment: the cross-product (matrix) part of the list, which exists
-    whatever the statistics say (tools/specmatrix.py)"""
+    """lines without a trailing comment: the cross-product (matrix) part, which exists whatever the statistics say"""
     p = os.path.join(SRC, 'spec_%s.def' % stage)
     keys = set()
     if os.path.exists(p):
@@ -148,8 +132,7 @@ def shares(runs, proj=lambda k: k):
 
 
 def loo(stage, runs, top):
-    """leave-one-out: variants = the top `top` selector sets (x-forms where they exist) of the other logs, plus the cross-product
-    (matrix) variants of the lists"""
+    """leave-one-out: the top `top` selector sets (x-forms where they exist) of the other logs plus the cross-product variants"""
     proj = lambda k: xform(stage, k) or k
     fixed = load_fixed(stage)
     res = []
@@ -163,8 +146,7 @@ def loo(stage, runs, top):
 
 
 def loo_policy(stage, runs, min_share, exact_share):
-    """leave-one-out with the policy of --def: the variants built from the other logs (selector sets with a mean share >=
-    min_share, exact keys >= exact_share, every key for the other stages) plus the cross-product lines of the list"""
+    """leave-one-out with the policy of --def, plus the cross-product lines"""
     fixed = load_fixed(stage)
     res = []
     for i, (name, held) in enumerate(runs):
@@ -241,7 +223,6 @@ def main():
                         print('%s  /* %.2f%% mean, %d logs */' % (k, 100 * v, len(games[k])))
                         done[norm(k)] = k
                 if s == 'tex' and args.shapes:
-                    # the "any format" kernels: one per distinct structure seen in any log (every log counts, however small the share)
                     seen = collections.OrderedDict()
                     for k, v in ranked:
                         x = xform(s, k)

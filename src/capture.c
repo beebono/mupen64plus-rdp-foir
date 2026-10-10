@@ -1,10 +1,5 @@
 /*
  * mupen64plus-rdp-foir - capture.c
- * Optional frame capture. With FOIR_DUMP=/path/prefix in the environment the
- * plugin writes /path/prefix_<frame>.fdump after FOIR_DUMP_FRAMES frames,
- * containing an RDRAM snapshot taken at the start and every RDP command
- * executed since, so the frame can be replayed offline by foir-replay and by
- * the angrylion reference tool.
  *
  * Copyright (C) 2026 foir contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -14,13 +9,13 @@
 #include "capture.h"
 #include "../tools/fdump.h"
 
+/* FOIR_DUMP=/path/prefix writes prefix_<frame>.fdump (RDRAM snapshot + every RDP command since) after FOIR_DUMP_FRAMES frames */
 static struct {
     bool enabled, recording, done;
     char prefix[512];
     int frame, start_frame, nframes;
     uint8_t *snapshot;
     uint32_t snap_size;
-    /* last set_* command per (opcode, tile) */
     uint32_t last[64][8][2];
     bool have[64][8];
     uint32_t *cmds;
@@ -94,7 +89,6 @@ void capture_frame(struct rdp *r, const struct vi_regs *vi)
         c.snap_size = r->rdram_size;
         c.snapshot = (uint8_t *)malloc(c.snap_size);
         memcpy(c.snapshot, r->rdram, c.snap_size);
-        /* prelude: the latest value of every state-setting command */
         c.recording = true;
         c.ncmds = 0;
         for (int id = 0; id < 64; id++)

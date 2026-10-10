@@ -1,6 +1,4 @@
-/* Test-only timing shim: loads the RSP plugin named by $RSPT_TARGET, forwards the plugin API to it and
- * accumulates the wall time spent in DoRspCycles (CLOCK_MONOTONIC). Writes "<CLOCK_BOOTTIME s> <calls> <cumulative RSP ms>"
- * about once a second to $RSPT_LOG. */
+/* test-only timing shim: forwards the plugin API to the RSP plugin in $RSPT_TARGET; logs "<CLOCK_BOOTTIME s> <calls> <cumulative RSP ms>" about once a second to $RSPT_LOG */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>

@@ -1,9 +1,5 @@
 /*
  * mupen64plus-rdp-foir - kspec_tex.inc (included by kneon_tex.c)
- * Specialised texture unit variants: texture_body() with a literal texel format / size / TLUT / filter
- * description, flattened so the per-cycle helpers (tex_cycle, fetch_decode, ...) are inlined and their branches on
- * those constants disappear. The tile's coordinate parameters (shift, clamp, mask, mirror) stay run time data.
- * The variants are listed in spec_tex.def.
  *
  * Copyright (C) 2026 foir contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -15,7 +11,7 @@
 #else
 #define FOIR_LSTFB() ((void)0)
 #endif
-/* the generic kernel, as an out-of-line call (the variants are flattened: it must not be inlined into every one of them) */
+/* out of line: the variants are flattened and must not inline it */
 static __attribute__((noinline)) void tex_generic(struct rdp *r, struct px_batch *b)
 {
 #ifdef FOIR_STATS
@@ -24,7 +20,6 @@ static __attribute__((noinline)) void tex_generic(struct rdp *r, struct px_batch
     neon_texture(r, b);
 }
 
-/* every tile the LOD can select (the primitive's tile + 0 .. lod_chain_last) has this texel format and size */
 FOIR_INLINE bool lod_chain_matches(const struct rdp *r, int fmt, int siz)
 {
     const int tn = r->pc.tilenum;
@@ -35,7 +30,6 @@ FOIR_INLINE bool lod_chain_matches(const struct rdp *r, int fmt, int siz)
     return true;
 }
 
-/* every tile the LOD can select has no YUV texels (the "any format" variants handle every other format) */
 FOIR_INLINE bool lod_chain_nonyuv(const struct rdp *r)
 {
     const int tn = r->pc.tilenum;
@@ -44,14 +38,8 @@ FOIR_INLINE bool lod_chain_nonyuv(const struct rdp *r)
     return true;
 }
 
-/* TEX: no LOD. TEXL: the LOD fraction is needed (lodt = TEX_LOD_EN: the LOD also selects the tile); all tiles the LOD can
- * select must have the format of the primitive's tile, which the variant checks for every batch before it runs (else the
- * generic kernel does).
- *
- * TEXA / TEXAL: "any format" variants (spec.h): the structure of the texture unit is compiled in, the format and size of the
- * tiles, the TLUT type and MID_TEXEL are read from the state. The LOD variants take the format of every tile the LOD selects
- * from that tile itself (tex_cycle_tiles / tex_cycle_multi), which only YUV texels would break: the variant hands such a state to the generic
- * kernel (which hands it to the scalar one). */
+/* TEXL: LOD fraction needed (lodt: the LOD also selects the tile); every tile the LOD can select must have the primitive tile's format, checked per batch (else generic).
+ * TEXA / TEXAL: "any format": format, size, TLUT type and MID_TEXEL come from the state; YUV tiles go to the generic kernel. */
 #define TEX(two, t0, t1, nx, fmt0, siz0, fmt1, siz1, smp, mid, tlut, tlt, persp, bl0, bl1) \
     TEX_NAMED(tex_##two##t0##t1##nx##_##fmt0##siz0##fmt1##siz1##_##smp##mid##tlut##tlt##persp##bl0##bl1, \
               two, t0, t1, nx, fmt0, siz0, fmt1, siz1, smp, mid, tlut, tlt, persp, bl0, bl1)

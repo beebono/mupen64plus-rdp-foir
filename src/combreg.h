@@ -1,8 +1,5 @@
 /*
  * mupen64plus-rdp-foir - combreg.h
- * Colour combiner input selectors -> register file index (see enum REG_* in rdp.h).
- * Shared by the parser (runtime) and the specialised combiner kernels (compile time:
- * the functions fold to constants for literal arguments).
  *
  * Copyright (C) 2026 foir contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -12,7 +9,7 @@
 
 #include "rdp.h"
 
-/* RGB equation input: pos 0 = sub A, 1 = sub B, 2 = multiply, 3 = add; sel = raw set_combine field; ch = 0..2 */
+/* the functions fold to constants for literal arguments (specialised combiner kernels) */
 FOIR_INLINE int comb_reg_rgb(int pos, int sel, int ch)
 {
     switch (pos) {
@@ -46,7 +43,6 @@ FOIR_INLINE int comb_reg_rgb(int pos, int sel, int ch)
     }
 }
 
-/* alpha equation input: pos 0 = sub A, 1 = sub B, 2 = multiply, 3 = add */
 FOIR_INLINE int comb_reg_alpha(int pos, int sel)
 {
     if (pos == 2) {

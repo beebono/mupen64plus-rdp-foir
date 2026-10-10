@@ -14,7 +14,6 @@
 #include <unistd.h>
 #include "framelog.h"
 
-/* header: magic[8], u32 rec_bytes, u32 capacity, u32 count (written last), u32 version, u64 t0_ns (CLOCK_MONOTONIC), u64 realtime ns */
 struct fl_hdr { char magic[8]; uint32_t rec_bytes, capacity; uint32_t count, version; uint64_t t0_ns, realtime_ns; };
 
 static unsigned char *l_map;
@@ -27,7 +26,7 @@ bool framelog_open(void)
     const char *path = getenv("FOIR_FRAMELOG");
     if (!path || !*path || l_map) return l_map != NULL;
     const char *mx = getenv("FOIR_FRAMELOG_MAX");
-    uint32_t cap = mx && atoi(mx) > 0 ? (uint32_t)atoi(mx) : 36000;      /* 10 minutes at 60 Hz */
+    uint32_t cap = mx && atoi(mx) > 0 ? (uint32_t)atoi(mx) : 36000;
     size_t len = FL_HDR_BYTES + (size_t)cap * sizeof(struct fl_rec);
     int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) return false;
@@ -61,5 +60,5 @@ void framelog_close(void)
     l_map = NULL; l_hdr = NULL; l_n = 0;
 }
 #else
-typedef int foir_framelog_disabled;   /* keep the translation unit non-empty */
+typedef int foir_framelog_disabled;
 #endif

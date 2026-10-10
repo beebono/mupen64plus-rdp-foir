@@ -1,15 +1,5 @@
 /*
  * mupen64plus-rdp-foir - kneon_tex.c
- * NEON texture unit: perspective divide, tile coordinate processing (shift,
- * clamp, mask, mirror), TMEM texel fetch for every non-YUV format (with TLUT)
- * and point / bilinear / mid-texel filtering, eight pixels per step.
- *
- * Coordinate math runs in int32x4 halves (the intermediate products need the
- * headroom), TMEM is read with per-lane gathers (the address arithmetic is
- * vectorised), and the filtering runs on 16-bit lanes.
- *
- * Not handled here (the scalar kernel runs instead): LOD / detail / sharpen,
- * YUV tiles, the colour-convert (YUV) cycle modes.
  *
  * Copyright (C) 2026 foir contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -19,7 +9,6 @@
 #ifdef FOIR_STATS
 #include <stdio.h>
 #include <stdlib.h>
-/* statistics of the LOD / texture path (-DFOIR_STATS; printed at exit): batches / pixels / groups per mode, number of distinct tiles per group */
 static uint64_t lst_batches[4096], lst_pixels[4096], lst_groups[4096];
 static uint64_t lst_dist[3][9], lst_distu[9], lst_fmt[8][4], lst_generic, lst_lodfb, lst_same12, lst_xhalves, lst_xslow;
 #define LST_ADD(x, n) __atomic_fetch_add(&(x), (n), __ATOMIC_RELAXED)
@@ -64,12 +53,9 @@ static unsigned lst_distinct(uint8x8_t v)
 
 FOIR_INLINE int32x4_t sign16(int32x4_t x) { return vshrq_n_s32(vshlq_n_s32(x, 16), 16); }
 
-/* ---- perspective divide + clamp17 ------------------------------------------------------- */
-
 FOIR_INLINE void tc_divide4(int persp, int32x4_t s, int32x4_t t, int32x4_t w, int32x4_t *sss, int32x4_t *sst)
 {
-    /* s, t, w are the raw 16.16 interpolants of four pixels; the divide works on their integer parts (the arithmetic shift leaves
-     * the sign extended 16 bit values the scalar tc_divide() starts from) */
+    /* raw 16.16 interpolants; the divide uses the integer parts (the arithmetic shift gives the sign-extended 16-bit values scalar tc_divide() starts from) */
     int32x4_t ss = vshrq_n_s32(s, 16), st = vshrq_n_s32(t, 16), sw = vshrq_n_s32(w, 16);
     if (!persp) {
         *sss = vandq_s32(ss, S32(0x1ffff));
@@ -85,8 +71,7 @@ FOIR_INLINE void tc_divide4(int persp, int32x4_t s, int32x4_t t, int32x4_t w, in
     int32x4_t rcp = vshrq_n_s32(tv, 4);
 
     int32x4_t sprod = vmulq_s32(ss, rcp), tprod = vmulq_s32(st, rcp);
-    /* out of bounds: bits 29 .. 29 - shift of the product (the scalar code's tempmask) are not all equal. Shifted to the top and
-     * sign extended back down they form 0 or -1 exactly when they are. */
+    /* out of bounds: bits 29 .. 29 - shift of the product (scalar tempmask) are not all equal; shifted to the top and sign-extended they give 0 / -1 exactly when they are */
     int32x4_t down = vsubq_s32(shift, S32(31));
     uint32x4_t cs = vcgtq_u32(vreinterpretq_u32_s32(vaddq_s32(vshlq_s32(vshlq_n_s32(sprod, 2), down), S32(1))), vdupq_n_u32(1));
     uint32x4_t ct = vcgtq_u32(vreinterpretq_u32_s32(vaddq_s32(vshlq_s32(vshlq_n_s32(tprod, 2), down), S32(1))), vdupq_n_u32(1));
@@ -117,8 +102,6 @@ FOIR_INLINE int32x4_t clamp17v(int32x4_t x)
     return v;
 }
 
-/* ---- per-axis tile coordinate processing ------------------------------------------------------ */
-
 struct axis {
     int shift, lo, hi, clampen, clampdiff, mask, mirror, maskclamped, maskbits, is_t;
 };
@@ -136,7 +119,6 @@ static void axis_init(struct axis *a, const struct tile *tl, int is_t)
     a->is_t = is_t;
 }
 
-/* bilinear / TLUT flavour: texel coordinate, fraction and the "next texel" step (tcclamp_cycle + tcmask_coupled) */
 FOIR_INLINE void axis_bilinear(const struct axis *a, int32x4_t sss, int32x4_t *S, int32x4_t *FR, int32x4_t *DF)
 {
     int32x4_t c = a->shift < 11 ? vshlq_s32(sign16(sss), S32(-a->shift)) : sign16(vshlq_s32(sss, S32(16 - a->shift)));
@@ -171,7 +153,6 @@ FOIR_INLINE void axis_bilinear(const struct axis *a, int32x4_t sss, int32x4_t *S
     *S = s; *FR = fr; *DF = df;
 }
 
-/* point flavour (tcclamp_cycle_light + tcmask) */
 FOIR_INLINE int32x4_t axis_point(const struct axis *a, int32x4_t sss)
 {
     int32x4_t c = a->shift < 11 ? vshlq_s32(sign16(sss), S32(-a->shift)) : sign16(vshlq_s32(sss, S32(16 - a->shift)));
@@ -193,8 +174,6 @@ FOIR_INLINE int32x4_t axis_point(const struct axis *a, int32x4_t sss)
     return s;
 }
 
-/* ---- TMEM gathers + format decode ------------------------------------------------------------- */
-
 FOIR_INLINE uint16x8_t gather16(const uint8_t *tm, const uint16_t *ad)
 {
     uint16x8_t v;
@@ -215,7 +194,7 @@ FOIR_INLINE uint8x8_t gather8(const uint8_t *tm, const uint16_t *ad)
     return v;
 }
 
-FOIR_INLINE int16x8_t expand5(uint16x8_t x)    /* 5-bit -> 8-bit replicate */
+FOIR_INLINE int16x8_t expand5(uint16x8_t x)
 {
     int16x8_t v = vreinterpretq_s16_u16(x);
     return vorrq_s16(vshlq_n_s16(v, 3), vshrq_n_s16(v, 2));
@@ -246,19 +225,16 @@ FOIR_INLINE void decode_16_swapped(uint16x8_t v, int16x8_t out[4])   /* r=b=v>>8
 
 FOIR_INLINE void all4(int16x8_t v, int16x8_t out[4]) { out[0] = out[1] = out[2] = out[3] = v; }
 
-#define TSP_MID_RT 2       /* tsp.mid: MID_TEXEL comes from the render state (generic kernel, "any format" kernels) */
+#define TSP_MID_RT 2       /* tsp.mid: read MID_TEXEL from the render state */
 
-/* What one texture cycle depends on besides the tile's coordinate parameters (shift / clamp / mask, which stay run time
- * data): the texel format and size, TLUT use and the filter. The generic kernel builds it from the render state, a
- * specialised variant (kspec_tex.inc) passes a literal one and has everything folded. */
 struct tsp {
-    int size, fmt;        /* texel size (PIXEL_SIZE_*) and format of the tile */
-    int tlut, tlt;        /* EN_TLUT, TLUT_TYPE (IA) */
-    int smp, mid;         /* SAMPLE_TYPE (bilinear), MID_TEXEL (TSP_MID_RT: read from the render state) */
-    int bilerp;           /* BI_LERP of this cycle; 0 selects the colour-conversion arithmetic */
+    int size, fmt;
+    int tlut, tlt;
+    int smp, mid;
+    int bilerp;           /* 0 selects the colour-conversion arithmetic */
 };
 
-/* Per-row address terms for 4 lanes: base = TMEM row start in address units, swp = odd-row word swap */
+/* swp = odd-row word swap */
 struct rowt { int32x4_t base, swp; };
 
 FOIR_INLINE struct rowt row_terms(const struct tile *tl, const struct tsp *sp, int32x4_t t)
@@ -272,7 +248,7 @@ FOIR_INLINE struct rowt row_terms(const struct tile *tl, const struct tsp *sp, i
     return R;
 }
 
-/* TMEM addresses (halfword index for 16/32-bit texels, byte address for 4/8-bit) of 4 lanes */
+/* halfword index for 16/32-bit texels, byte address for 4/8-bit */
 FOIR_INLINE int32x4_t tap_addr4(const struct tsp *sp, struct rowt R, int32x4_t s, uint16_t *nib)
 {
     int32x4_t a = vaddq_s32(R.base, s);
@@ -285,7 +261,6 @@ FOIR_INLINE int32x4_t tap_addr4(const struct tsp *sp, struct rowt R, int32x4_t s
     return a;
 }
 
-/* gather + decode 8 lanes whose addresses are in ad[] (nib[] holds the nibble selector for 4-bit texels) */
 static void fetch_decode(const struct rdp *r, const struct tile *tl, const struct tsp *sp, const uint16_t *ad, const uint16_t *nib,
                          int16x8_t out[4])
 {
@@ -293,7 +268,6 @@ static void fetch_decode(const struct rdp *r, const struct tile *tl, const struc
     const int size = sp->size, fmt = sp->fmt;
     const bool tlut = sp->tlut;
 
-    /* raw texel -> either an 8-bit palette index (TLUT) or colour channels */
     if (size == PIXEL_SIZE_4BIT || size == PIXEL_SIZE_8BIT) {
         uint8x8_t b = gather8(tm, ad);
         int16x8_t v = vreinterpretq_s16_u16(vmovl_u8(b));
@@ -373,15 +347,13 @@ static void fetch_decode(const struct rdp *r, const struct tile *tl, const struc
     }
 }
 
-/* ---- one texture cycle on 8 lanes ------------------------------------------------------------------ */
-
 FOIR_INLINE int16x8_t narrow16(int32x4_t a, int32x4_t b) { return vcombine_s16(vmovn_s32(a), vmovn_s32(b)); }
 
 struct tctx {
     const struct tile *tl;
     struct axis as, at;
     struct tsp sp;
-    int mid;                      /* MID_TEXEL of this context (a literal in the exact variants; only used with bilinear sampling) */
+    int mid;
 };
 
 FOIR_INLINE void tctx_init(struct tctx *c, const struct rdp *r, const struct tile *tl, const struct tsp *sp)
@@ -402,10 +374,7 @@ FOIR_INLINE void fetch_taps(const struct rdp *r, const struct tile *tl, const st
     fetch_decode(r, tl, sp, ad, nib, out);
 }
 
-/* MID_TEXEL (bilinear sampling, lanes that sit at the centre of their texel use all four taps) is read from the state in every
- * variant, but it is rare: a sample in which some lane is at a texel centre is handed to tex_cycle_mid(), an out-of-line copy of
- * this function in which the four-tap blend is compiled in (midmode = 1), so the code of the common path is exactly that of a
- * variant that was built without MID_TEXEL. */
+/* MID_TEXEL lanes are rare: such samples go to tex_cycle_mid(), an out-of-line copy with the four-tap blend compiled in, so the common path is identical to a variant built without MID_TEXEL */
 static void tex_cycle_mid(const struct rdp *r, const struct tctx *cx, const struct tsp *sp, const int32x4_t sss[2], const int32x4_t sst[2],
                           int16x8_t out[4]);
 
@@ -449,7 +418,7 @@ FOIR_INLINE void tex_cycle_impl(const struct rdp *r, const struct tctx *cx, cons
     }
     struct rowt R0[2], R1[2];
     for (int h = 0; h < 2; h++) R0[h] = row_terms(tl, sp, T[h]);
-    if (!sp->smp) {                  /* TLUT with point sampling: a single texel */
+    if (!sp->smp) {
         fetch_taps(r, tl, sp, R0, S, out);
         for (int c = 0; c < 4; c++) out[c] = vandq_s16(out[c], vdupq_n_s16(0x1ff));
         return;
@@ -470,7 +439,6 @@ FOIR_INLINE void tex_cycle_impl(const struct rdp *r, const struct tctx *cx, cons
     } else if (cx->mid) {
         center = vandq_u16(vceqq_s16(sf, vdupq_n_s16(0x10)), vceqq_s16(tf, vdupq_n_s16(0x10)));
         if (vmaxvq_u16(center) != 0) {
-            /* (copies, so that the state of the caller does not have to live in memory) */
             struct tctx cxc = *cx;
             struct tsp spc = *sp;
             int32x4_t s2[2] = { sss[0], sss[1] }, t2[2] = { sst[0], sst[1] };
@@ -482,8 +450,8 @@ FOIR_INLINE void tex_cycle_impl(const struct rdp *r, const struct tctx *cx, cons
     }
 
     int16x8_t t1[4], t2[4], ta[4];
-    fetch_taps(r, tl, sp, R0, S1, t1);                 /* (s + sdiff, t)      */
-    fetch_taps(r, tl, sp, R1, S, t2);                  /* (s, t + tdiff)      */
+    fetch_taps(r, tl, sp, R0, S1, t1);
+    fetch_taps(r, tl, sp, R1, S, t2);
     if (!any_center) {
         /* lower triangle uses t0, upper triangle t3: fetch whichever each lane needs */
         int32x4_t A[2];
@@ -507,7 +475,6 @@ FOIR_INLINE void tex_cycle_impl(const struct rdp *r, const struct tctx *cx, cons
         return;
     }
 
-    /* mid-texel lanes present (midmode only): all four taps */
     if (!midmode) return;
     int16x8_t t0[4], t3[4];
     fetch_taps(r, tl, sp, R0, S, t0);
@@ -546,22 +513,13 @@ static void tex_cycle(const struct rdp *r, const struct tctx *cx, const struct t
     tex_cycle_impl(r, cx, sp, sss, sst, out, 0);
 }
 
-/* ---- level of detail ------------------------------------------------------------------------------------ */
-
-/* The RDP derives the level of detail of a pixel from three divided coordinate pairs: its own, that of the next pixel in the
- * iteration direction (s + dsinc ...) and that of the pixel one row down (s + dsdy ...). lod_pass() computes it for all the
- * lanes of a batch in two phases:
- *   1. the divided coordinates of every lane (stored: the texture cycles need them too);
- *   2. per group of eight lanes: the "next pixel" divide is taken from the neighbouring lane when that lane really holds the
- *      coordinates s + dsinc, t + dtinc, w + dwinc (the divide is a function of its inputs, so this is exact whatever the
- *      batch looks like; only lanes at a scanline run boundary or the batch ends have to divide), the "row below" divide is
- *      computed, the largest of the four |difference| of the 17-bit sign/magnitude coordinates is folded to a LOD and the level
- *      selection runs on eight 16-bit lanes. */
+/* LOD from three divided coordinate pairs: own, next pixel (s + dsinc ...), pixel one row down (s + dsdy ...). The next-pixel divide is taken
+ * from the neighbouring lane when it holds exactly s + dsinc, t + dtinc, w + dwinc (exact: the divide is a function of its inputs). */
 #define LOD_PAD 8
 struct lodbuf {
-    ALIGN16 int32_t ls_[FOIR_LANES + 2 * LOD_PAD], lt_[FOIR_LANES + 2 * LOD_PAD], lw_[FOIR_LANES + 2 * LOD_PAD];   /* s, t, w (+ the shift) */
-    ALIGN16 int32_t rs_[FOIR_LANES + 2 * LOD_PAD], rt_[FOIR_LANES + 2 * LOD_PAD];                                  /* divided s, t of the pixel */
-    ALIGN16 uint8_t t1[FOIR_LANES], t2[FOIR_LANES];     /* tiles of the first / second cycle (TEX_LOD_EN) */
+    ALIGN16 int32_t ls_[FOIR_LANES + 2 * LOD_PAD], lt_[FOIR_LANES + 2 * LOD_PAD], lw_[FOIR_LANES + 2 * LOD_PAD];
+    ALIGN16 int32_t rs_[FOIR_LANES + 2 * LOD_PAD], rt_[FOIR_LANES + 2 * LOD_PAD];
+    ALIGN16 uint8_t t1[FOIR_LANES], t2[FOIR_LANES];
 };
 #define LB(a) ((a) + LOD_PAD)
 
@@ -574,7 +532,6 @@ FOIR_INLINE void lod_pass_impl(const struct rdp *r, const int32_t *s, const int3
     const int n = ng * 8;
     const int32x4_t add_s = S32(add[0]), add_t = S32(add[1]), add_w = S32(add[2]);
 
-    /* phase 1 */
     for (int i = 0; i < n; i += 4) {
         int32x4_t sv = vaddq_s32(vld1q_s32(s + i), add_s), tv = vaddq_s32(vld1q_s32(t + i), add_t), wv = vaddq_s32(vld1q_s32(w + i), add_w);
         vst1q_s32(ls + i, sv); vst1q_s32(lt + i, tv); vst1q_s32(lw + i, wv);
@@ -625,9 +582,7 @@ FOIR_INLINE void lod_pass_impl(const struct rdp *r, const int32_t *s, const int3
             tc_divide4(persp, vaddq_s32(sv, dsy), vaddq_s32(tv, dty), vaddq_s32(wv, dwy), &nys, &nyt);
             /* lodclamp = any of the six values has bit 17 or 18 set */
             cl[h] = vtstq_s32(vorrq_s32(vorrq_s32(vorrq_s32(is, it), vorrq_s32(ns, nt)), vorrq_s32(nys, nyt)), S32(0x60000));
-            /* |next - cur| of the 17-bit sign/magnitude coordinates, exactly: (sign17(n) << 15 halving-minus sign17(c) << 15) is the
-             * 18-bit difference << 14; a negative difference d is replaced by ~d (the RDP's flip), i.e. v ^ (v >> 31) here, which
-             * only fills the low 14 bits and so keeps the order of the values. */
+            /* |next - cur| of the 17-bit sign/magnitude coordinates: a negative difference d becomes ~d (the RDP's flip), i.e. v ^ (v >> 31), which only fills the low 14 bits and keeps the order */
             int32x4_t cs = vshlq_n_s32(is, 15), ct = vshlq_n_s32(it, 15);
             int32x4_t xs = vhsubq_s32(vshlq_n_s32(ns, 15), cs), xt = vhsubq_s32(vshlq_n_s32(nt, 15), ct);
             int32x4_t ys = vhsubq_s32(vshlq_n_s32(nys, 15), cs), yt = vhsubq_s32(vshlq_n_s32(nyt, 15), ct);
@@ -635,18 +590,16 @@ FOIR_INLINE void lod_pass_impl(const struct rdp *r, const int32_t *s, const int3
             ys = veorq_s32(ys, vshrq_n_s32(ys, 31)); yt = veorq_s32(yt, vshrq_n_s32(yt, 31));
             dm[h] = vreinterpretq_u32_s32(vmaxq_s32(vmaxq_s32(xs, xt), vmaxq_s32(ys, yt)));
         }
-        /* The folded LOD of the RDP is the largest of the four differences when that is below 0x4000, else it has bit 14 set (which
-         * every later use treats as "overflow": magnification off, distant, fraction 0xff). A saturated 16-bit value keeps exactly that. */
+        /* the RDP's folded LOD is the largest difference below 0x4000, else bit 14 set (read as overflow later); a saturated 16-bit value keeps exactly that */
         uint16x8_t lod = vminq_u16(vcombine_u16(vqshrn_n_u32(dm[0], 14), vqshrn_n_u32(dm[1], 14)), k4000);
         uint16x8_t clamp = vcombine_u16(vmovn_u32(cl[0]), vmovn_u32(cl[1]));
 
-        /* lodfrac_lodtile */
         uint16x8_t c1 = vorrq_u16(vceqq_u16(lod, k4000), clamp);
         uint16x8_t c2 = vbicq_u16(vcltq_u16(lod, vdupq_n_u16((uint16_t)min_level)), c1);
         uint16x8_t c3 = vbicq_u16(vbicq_u16(vcltq_u16(lod, vdupq_n_u16(32)), c1), c2);
         uint16x8_t c4 = vmvnq_u16(vorrq_u16(vorrq_u16(c1, c2), c3));
         uint16x8_t ltil = vqsubq_u16(vdupq_n_u16(15), vclzq_u16(vandq_u16(vshrq_n_u16(lod, 5), kff)));     /* floor(log2(.)), 0 for 0 */
-        ltil = vandq_u16(ltil, c4);                                                                        /* only the minification case */
+        ltil = vandq_u16(ltil, c4);
         uint16x8_t mag = vorrq_u16(c2, c3);
         uint16x8_t dis;
         if (max_level) {
@@ -668,7 +621,7 @@ FOIR_INLINE void lod_pass_impl(const struct rdp *r, const int32_t *s, const int3
         uint16x8_t lf = vbslq_u16(c1, kff, vbslq_u16(c2, lf_min, vbslq_u16(c3, lf_mid, lf_far)));
         vst1q_s16(lfo + o, vreinterpretq_s16_u16(lf));
 
-        if (tiles) {   /* tile selection (TEX_LOD_EN) */
+        if (tiles) {
             uint16x8_t ltile = vbslq_u16(dis, vdupq_n_u16((uint16_t)max_level), ltil);
             uint16x8_t base = vaddq_u16(vdupq_n_u16((uint16_t)pc->tilenum), ltile);
             uint16x8_t k7 = vdupq_n_u16(7), one = vdupq_n_u16(1);
@@ -704,8 +657,6 @@ FOIR_INLINE void lod_pass(const struct rdp *r, const int32_t *s, const int32_t *
     else       { if (tiles) lod_pass_p0t(r, s, t, w, add, ng, lfo, lb); else lod_pass_p0(r, s, t, w, add, ng, lfo, lb); }
 }
 
-/* One texture cycle with a per-lane tile. The common group has the same tile in every lane: one pass, straight into out. Mixed
- * groups (a few percent) go through tex_cycle_multi(): a pass per distinct tile, results merged by lane masks. */
 static __attribute__((noinline)) void tex_cycle_multi(const struct rdp *r, struct tctx *cxs, uint32_t *have, const struct tsp *base, uint8x8_t ids,
                                                      const int32x4_t sss[2], const int32x4_t sst[2], int16x8_t out[4])
 {
@@ -731,7 +682,7 @@ static __attribute__((noinline)) void tex_cycle_multi(const struct rdp *r, struc
     }
 }
 
-/* fixed: the format description a specialised variant was built for (all tiles of the chain have it); NULL: take it from the tile */
+/* fixed: the format description a specialised variant was built for (all tiles of the chain); NULL: take it from the tile */
 FOIR_INLINE void tex_cycle_tiles(const struct rdp *r, struct tctx *cxs, uint32_t *have, const struct tsp *base, const struct tsp *fixed, uint8x8_t ids,
                                  const int32x4_t sss[2], const int32x4_t sst[2], int16x8_t out[4])
 {
@@ -747,17 +698,14 @@ FOIR_INLINE void tex_cycle_tiles(const struct rdp *r, struct tctx *cxs, uint32_t
     tex_cycle(r, &cxs[v], fixed ? fixed : &cxs[v].sp, sss, sst, out);
 }
 
-/* ---- kernel ---------------------------------------------------------------------------------------------- */
-
-/* What the texture stage depends on besides the tiles' coordinate parameters (see struct tsp). */
 struct tspec {
-    int two;                 /* two-cycle: a second texture cycle on tile + 1 */
-    int t0, t1, nx;          /* TEXEL0, second cycle, next-pixel TEXEL1 needed */
-    int dolod, lodtiles;     /* LOD fraction needed, LOD selects the tile (TEX_LOD_EN) */
-    int lodfix;              /* variants: all tiles the LOD can select have the format c0 / c1 describe */
+    int two;
+    int t0, t1, nx;
+    int dolod, lodtiles;
+    int lodfix;              /* all tiles the LOD can select have the format c0 / c1 describe */
     int persp;
     struct tsp c0, c1;
-    int anyfmt;              /* "any format" variants: size, format and TLUT type of the tiles come from the render state */
+    int anyfmt;              /* size, format and TLUT type come from the render state */
 };
 
 FOIR_INLINE void texture_body(struct rdp *r, struct px_batch *b, const struct tspec *S)
@@ -793,14 +741,13 @@ FOIR_INLINE void texture_body(struct rdp *r, struct px_batch *b, const struct ts
     }
 #endif
 
-    /* level of detail of the whole batch: fraction (b->lodfrac), tiles, divided coordinates of every lane */
     struct lodbuf lb, lbn;
     if (S->dolod) {
         static const int32_t zero3[3] = { 0, 0, 0 };
         lod_pass(r, b->s, b->t, b->w, zero3, ng, b->lodfrac, &lb, S->persp, lodtiles);
     }
     if (S->nx && lodtiles) {
-        /* the next pixel is evaluated as a pixel of its own: its LOD comes from its own neighbours */
+        /* the next pixel is evaluated as a pixel of its own */
         const int32_t add[3] = { pc->dsinc, pc->dtinc, pc->dwinc };
         int16_t lfn[FOIR_LANES] ALIGN16;
         lod_pass(r, b->s, b->t, b->w, add, ng, lfn, &lbn, S->persp, 1);
@@ -863,8 +810,7 @@ FOIR_INLINE void texture_body(struct rdp *r, struct px_batch *b, const struct ts
     }
 }
 
-/* The LOD selects tile tilenum + 0 .. max_level for cycle 0 and 1 (cycle 1 is one tile above cycle 0 unless the LOD is
- * distant or magnified); with detail textures cycle 0 is one tile higher and cycle 1 two above the level: + 1. */
+/* LOD selects tile tilenum + 0 .. max_level for cycle 0 and 1; detail textures shift the chain up by one */
 FOIR_INLINE int lod_chain_last(const struct rdp *r) { return r->pc.max_level + (r->om.detail_tex_en ? 1 : 0); }
 
 void neon_texture(struct rdp *r, struct px_batch *b)
@@ -875,11 +821,10 @@ void neon_texture(struct rdp *r, struct px_batch *b)
     const struct tile *tl0 = &r->tile[prim_tile];
     const struct tile *tl1 = &r->tile[(prim_tile + 1) & 7];
 
-    /* unsupported: YUV tiles, the conversion arithmetic on filtered / TLUT texels, the convert-one feedback */
     const int pointplain = !(om->sample_type || om->en_tlut);
     int unsupp = tl0->format == FORMAT_YUV || (!om->bi_lerp0 && !pointplain);
     if (two) unsupp |= tl1->format == FORMAT_YUV || (!om->bi_lerp1 && !pointplain) || om->convert_one;
-    if (om->tex_lod_en)         /* any tile the LOD can select */
+    if (om->tex_lod_en)
         for (int k = 0; k <= lod_chain_last(r) && k < 8; k++)
             unsupp |= r->tile[(prim_tile + k) & 7].format == FORMAT_YUV;
 #ifdef FOIR_STATS
@@ -902,22 +847,12 @@ void neon_texture(struct rdp *r, struct px_batch *b)
     texture_body(r, b, &S);
 }
 
-/* ---- COPY cycle (texture rectangles in COPY mode) --------------------------------------------------- */
+/* COPY: address arithmetic runs in 16-bit lanes (only the low 11-12 bits of a TMEM address are used and every operation is exact modulo 2^16);
+ * windows start at an even framebuffer pixel so each is one vector load / store of the byte-swapped RDRAM */
 
-/* The scalar reference (scalar_copy) works in groups of four pixels: the texture coordinates of a group's first pixel are
- * divided / clamped / shifted once, the pixel q of the group reads texel (s + q, t), the tile's mask is applied per texel
- * (no clamp, no mirror), the texel is the raw 16-bit RGBA5551 word (TMEM as is, or the TLUT entry of an 8 / 4-bit colour
- * index) and, with alpha compare, pixels whose low bit is clear are skipped. The vector version below does the same for
- * 16-bit colour buffers and flip != 0 (texture rectangles; the other cases keep the scalar kernel): phase 1 computes the
- * (s, t) of every group of the span, four groups per vector; phase 2 walks the span in windows of eight pixels that start
- * at an even framebuffer pixel (so a window is one vector load / store of the byte-swapped RDRAM), expands the group
- * values to the pixels of the window with a table lookup and gathers the texels. Address arithmetic runs in 16-bit lanes:
- * only the low 11-12 bits of a TMEM address are used and every operation on the way is exact modulo 2^16. */
+#define COPY_MAXG 272          /* groups of four pixels per span (<= 1024 pixels) */
 
-#define COPY_MAXG 272          /* groups of four pixels per span (a span has at most 1024 pixels) */
-
-/* byte indices (for vqtbl1q_u8 on four int16 group values) and in-group pixel numbers of the lanes of a window whose
- * first lane has the phase ph = (offset of the lane in the span) & 3 */
+/* byte indices (vqtbl1q_u8 on four int16 group values) and in-group pixel numbers of a window whose first lane has phase ph = span offset & 3 */
 #define CPT(a, b, c, d, e, f, g, h) { 2 * a, 2 * a + 1, 2 * b, 2 * b + 1, 2 * c, 2 * c + 1, 2 * d, 2 * d + 1, \
                                       2 * e, 2 * e + 1, 2 * f, 2 * f + 1, 2 * g, 2 * g + 1, 2 * h, 2 * h + 1 }
 static const uint8_t copy_gtbl[4][16] = {
@@ -928,7 +863,6 @@ static const int16_t copy_qtbl[4][8] = {
 
 enum { CK_RAW16, CK_TLUT8, CK_TLUT4, CK_TLUT16, CK_GENERIC };
 
-/* texel (raw RGBA5551 word) of eight pixels from the 16-bit-lane texel coordinates; kind selects the fetch */
 FOIR_INLINE uint16x8_t copy_fetch(const struct rdp *r, const struct tile *tl, const int kind, int16x8_t ss, int16x8_t tt)
 {
     const uint8_t *tm = r->tmem;
@@ -952,7 +886,7 @@ FOIR_INLINE uint16x8_t copy_fetch(const struct rdp *r, const struct tile *tl, co
         vst1q_u16(ad, vaddq_u16(vdupq_n_u16(0x400), vshlq_n_u16(idx, 2)));
         return gather16(tm, ad);
     }
-    default: {                                     /* CK_TLUT4 */
+    default: {
         int16x8_t x = vaddq_s16(vshlq_n_s16(tbase, 4), ss);
         int16x8_t a = veorq_s16(vreinterpretq_s16_u16(vshrq_n_u16(vreinterpretq_u16_s16(x), 1)), vshlq_n_s16(odd, 2));
         vst1q_u16(ad, vreinterpretq_u16_s16(a));
@@ -972,13 +906,12 @@ FOIR_INLINE void copy_body(struct rdp *r, int y, const struct span *sp, const in
     const int length = sp->lx - sp->rx;                  /* flip: the span runs from rx up to lx */
     const int xs = sp->rx;
     int n = length + 1;
-    if (xs + n > r->fb_width) n = r->fb_width - xs;      /* pixels past the row end are dropped */
+    if (xs + n > r->fb_width) n = r->fb_width - xs;
     if (n <= 0) return;
     const uint32_t rs = (r->fb_address >> 1) + (uint32_t)(r->fb_width * y);
     const uint32_t i0 = rs + (uint32_t)xs;
     const int head = (int)(i0 & 1);
 
-    /* phase 1: texture coordinates of every group of four pixels (lanes = groups) */
     int16_t gsb[COPY_MAXG + 16] ALIGN16, gtb[COPY_MAXG + 16] ALIGN16;
     int16_t *GS = gsb + 4, *GT = gtb + 4;
     memset(gsb, 0, 8); memset(gtb, 0, 8);
@@ -1004,7 +937,6 @@ FOIR_INLINE void copy_body(struct rdp *r, int y, const struct span *sp, const in
         memset(GS + ng, 0, 8); memset(GT + ng, 0, 8);
     }
 
-    /* phase 2: windows of eight pixels, the first one starting at the even pixel i0 - head */
     const int16x8_t smask = vdupq_n_s16(tl->mask_s ? (int16_t)((1 << (tl->mask_s > 10 ? 10 : tl->mask_s)) - 1) : -1);
     const int16x8_t tmask = vdupq_n_s16(tl->mask_t ? (int16_t)((1 << (tl->mask_t > 10 ? 10 : tl->mask_t)) - 1) : -1);
     static const int16_t lane16[8] = { 0, 1, 2, 3, 4, 5, 6, 7 };
@@ -1018,7 +950,7 @@ FOIR_INLINE void copy_body(struct rdp *r, int y, const struct span *sp, const in
     (void)gsp;
 
     for (int m = 0; m < nwin; m++) {
-        const int jw = 8 * m - head;                     /* span offset of lane 0 (-1 .. n) */
+        const int jw = 8 * m - head;
         const int g0 = jw >> 2, ph = jw & 3;
         int16x8_t jv = vaddq_s16(vdupq_n_s16((int16_t)jw), iota16);
         uint16x8_t mask = vandq_u16(vcgeq_s16(jv, vdupq_n_s16(0)), vcltq_s16(jv, nvec));
@@ -1031,7 +963,6 @@ FOIR_INLINE void copy_body(struct rdp *r, int y, const struct span *sp, const in
 
         uint16x8_t px;
         if (kind == CK_GENERIC) {
-            /* anything else (4 / 8 / 32-bit texels without TLUT): decode to colour, then pack as the scalar kernel does */
             int32x4_t S[2] = { vmovl_s16(vget_low_s16(ss)), vmovl_s16(vget_high_s16(ss)) };
             int32x4_t T[2] = { vmovl_s16(vget_low_s16(tt)), vmovl_s16(vget_high_s16(tt)) };
             struct rowt R[2] = { row_terms(tl, &gsp, T[0]), row_terms(tl, &gsp, T[1]) };
@@ -1049,7 +980,7 @@ FOIR_INLINE void copy_body(struct rdp *r, int y, const struct span *sp, const in
         const uint32_t W = i0 - (uint32_t)head + 8u * (uint32_t)m;
         if (W >= rs && W + 8 <= rowend) {
             uint8x8_t hn = vorr_u8(vdup_n_u8(8), vmul_u8(vand_u8(vmovn_u16(px), vdup_n_u8(1)), vdup_n_u8(7)));
-            if (vminvq_u16(mask) == 0xffff) {            /* every pixel of the window is written: no read-modify-write */
+            if (vminvq_u16(mask) == 0xffff) {
                 vst1q_u16(h16 + W, vrev32q_u16(px));
                 vst1_u8(r->hidden + W, hn);
             } else {
@@ -1075,8 +1006,6 @@ void neon_copy(struct rdp *r, int y, const struct span *sp, int flip)
     else kind = tl->size == PIXEL_SIZE_16BIT ? CK_RAW16 : tl->format == FORMAT_YUV ? -1 : CK_GENERIC;
     const int length = sp->lx - sp->rx;
     const int xs = sp->rx;
-    /* the vector path covers texture rectangles into 16-bit colour buffers that lie inside RDRAM; the rest (8-bit colour
-     * buffer, flip = 0 triangles, YUV texels without TLUT, spans outside the row or the memory) takes the scalar kernel */
     if (kind < 0 || !flip || r->fb_size != PIXEL_SIZE_16BIT || xs < 0 || length >= 1024) {
         NEON_FALLBACK(8);
         foir_kernels_scalar.copy(r, y, sp, flip);

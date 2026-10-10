@@ -1,25 +1,10 @@
 #!/usr/bin/env python3
-"""mtfuzz.py: randomised scenes that stress the worker pool's row-ownership and barrier logic.
+"""mtfuzz.py: random scenes stressing the worker pool's row ownership and barriers; each is replayed with the scalar kernels (reference) and the default
+kernels on 1..N worker threads, and the final RDRAM images must be byte-identical.
 
-Every scene is a random sequence of commands: fills, shaded / textured / Z-buffered triangles with random
-render modes, switches of the colour image between buffers of different width (also overlapping ones),
-loads of texture data straight out of a framebuffer (texture-from-framebuffer) and the textured draws that
-use it. Each scene is replayed with the scalar kernels on the parser thread (the reference) and with the
-default kernels on 1..N worker threads; the final RDRAM images must be byte-identical.
-
---stress makes the scenes long and order-sensitive for the stripe-class claiming of the pool: hundreds of primitives, many of
-them only a few rows tall (a job then has a single stripe class), overlapping blended / Z-tested / filled draws whose result depends
-on the order, frequent render-state changes (every job carries a different state snapshot) and SYNC_FULLs and render-target
-switches in between. --variants runs every scene additionally under pool settings (FOIR_HELPER, FOIR_MT_CLASSES):
-helper off, one / three / four classes per worker.
-
---lag makes scenes with deliberately unbalanced stripe classes, to check the parser's idea of "every job below F is complete" (the
-pool's floor: it decides when a job-ring slot or a state / TMEM snapshot may be overwritten):
-a few stripes get a wide textured rectangle in every iteration (a lot of work for the classes of those stripes) while everything else is
-tiny, and every iteration loads a different texture into TMEM and changes the primitive colour, so a job needs a snapshot of its own for
-about 3000 jobs -- more than the 256 TMEM and 1024 state snapshots and (near the end) the 8192 job slots. A class that lags far behind keeps
-its snapshots alive; a floor that moves past it lets the parser overwrite them and the lagging class renders the wrong texture / colour.
-Texture loads from the frame buffer (a hazard barrier), SYNC_FULLs and render-target switches are mixed in.
+--stress: long, order-sensitive scenes (many small jobs, overlapping blended / Z-tested / filled draws, frequent state changes, syncs, render-target switches).
+--lag: unbalanced stripe classes (a few stripes get heavy work while every iteration changes TMEM and the primitive colour): a lagging class keeps ~3000
+snapshots alive, so a pool floor that moves past it lets the parser overwrite one the class still needs.
 
 usage: mtfuzz.py [-n scenes] [-s seed] [--replay path] [--runner "qemu-aarch64-static -L ..."] [--threads 1,2,3,4]
                  [--stress] [--lag] [--variants default,nohelper,g1,g3,g4]
@@ -38,11 +23,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 from rdpgen import *  # noqa
-import regress  # noqa: upload_tex() for the COPY-cycle rectangles
+import regress  # noqa
 
 def load_variants():
-    """combiner / blender selector sets of the specialised variants (src/spec_comb.def, spec_blend.def): random scenes
-    take their modes from here half of the time so the variants (and their fall back to the generic kernels) get exercised"""
+    """combiner / blender selector sets of the specialised variants: scenes take their modes from here half of the time"""
     import re
     comb, blend = [], []
     for fn, pool, pat in (('spec_comb.def', comb, r'COMBX?\((\d+), (0x[0-9a-f]+), (0x[0-9a-f]+)'),
@@ -60,7 +44,6 @@ VAR_COMB, VAR_BLEND = load_variants()
 
 
 def load_shapes():
-    """shapes of the shape kernels (src/spec_shape.def): (two, rgb0, alpha0, rgb1, alpha1, ext)"""
     out = []
     p = os.path.join(ROOT, 'src', 'spec_shape.def')
     if os.path.exists(p):
@@ -75,7 +58,6 @@ VAR_SHAPE = load_shapes()
 
 
 def shape_sels(rng, sh, half, combact):
-    """random selectors (A, B, multiply, add) of an equation half whose canonical shape is sh (see tools/shapegen.py)"""
     import shapegen as sg
     nsel = [8, 8, 8, 8] if half else [16, 16, 32, 8]
     cls = sg.al_reg if half else sg.rgb_reg
@@ -93,7 +75,6 @@ def shape_sels(rng, sh, half, combact):
 
 
 def shape_combine(rng, cycle=None):
-    """a SET_COMBINE word whose shape is one of the shape kernels', with random operands"""
     pool = [v for v in VAR_SHAPE if cycle is None or v[0] == (1 if cycle else 0)]
     v = rng.choice(pool)
     two = v[0]
@@ -112,7 +93,7 @@ BUF = [0x200000, 0x300000, 0x500000]
 ZB = 0x400000
 TEX = 0x180000
 PAL = 0x1a0000          # palette of the COPY-cycle rectangles
-TEXC = 0x1b0000         # their texture images
+TEXC = 0x1b0000
 
 
 def rgba16(rng):
@@ -122,7 +103,7 @@ def rgba16(rng):
 def rnd_modes(rng, cycle):
     k = dict(cycle=cycle, persp=rng.randrange(2), bilerp_sample=rng.randrange(2), bi0=0 if rng.randrange(10) == 0 else 1,
              bi1=0 if rng.randrange(10) == 0 else 1, sharpen=rng.randrange(6) == 0,
-             lod=rng.randrange(3) == 0, detail=rng.randrange(6) == 0,       # TEX_LOD_EN / detail: tiles 0 .. 3 form a mip chain (make_scene)
+             lod=rng.randrange(3) == 0, detail=rng.randrange(6) == 0,       # TEX_LOD_EN / detail: tiles 0 .. 3 form a mip chain
              mid_texel=rng.randrange(4) == 0,
              rgb_dither=rng.choice([0, 1, 2, 3, 3]), alpha_dither=rng.choice([0, 1, 2, 3, 3]),
              aa=rng.randrange(2), z_compare=rng.randrange(2), z_update=rng.randrange(2), zmode=rng.randrange(4),
@@ -181,7 +162,6 @@ def small_tri(rng, w, h, textured, z, level=0):
 
 def make_scene(rng, stress=False):
     s = Scene()
-    # texture: 32x32 RGBA16 in RDRAM, loaded into TMEM tile 0
     for i in range(32 * 32):
         s.wr16(TEX + i * 2, rgba16(rng))
     widths = [17, 33, 64, 100, 128, 129, 200, 256, 320, 321]
@@ -195,7 +175,6 @@ def make_scene(rng, stress=False):
           fill_rect(0, 0, W - 1, H - 1), sync_pipe(), set_color_image(0, size, W, BUF[0]))
     s.add(set_texture_image(0, 2, 32, TEX), set_tile(0, 2, 0, 0, 7), load_block(7, 0, 0, 1023, 0), sync_pipe(),
           set_tile(0, 2, 8, 0, 0, maskt=rng.choice([0, 5]), masks=rng.choice([0, 5])), set_tile_size(0, 0, 0, 31, 31))
-    # tiles 1 .. 3: the next mip levels (16, 8, 4 texels square; the same random texels, loaded linearly)
     for lvl, (wd, tm) in enumerate([(16, 256), (8, 320), (4, 336)], 1):
         s.add(set_texture_image(0, 2, 32, TEX), set_tile(0, 2, 0, tm, 7), load_block(7, 0, 0, wd * wd - 1, 0), sync_pipe(),
               set_tile(0, 2, max(1, wd // 4), tm, lvl, maskt=rng.choice([0, wd.bit_length() - 1]), masks=rng.choice([0, wd.bit_length() - 1]),
@@ -220,7 +199,7 @@ def make_scene(rng, stress=False):
                     s.add(t)
         elif op == 5:  # fill
             x0, y0 = rng.randrange(curW), rng.randrange(H)
-            hh = rng.randrange(1, H) if not (stress and rng.randrange(2)) else rng.randrange(0, 5)       # (stress: often 1-4 rows)
+            hh = rng.randrange(1, H) if not (stress and rng.randrange(2)) else rng.randrange(0, 5)
             s.add(set_other_modes(cycle=3), set_fill_color(rng.randrange(1 << 32)),
                   fill_rect(x0, y0, min(curW - 1, x0 + rng.randrange(1, curW)), min(H - 1, y0 + hh)))
         elif op == 6:  # switch render target, possibly overlapping with a different width
@@ -280,12 +259,11 @@ def make_lag_scene(rng):
     s.add(set_color_image(0, 2, W, BUF[0]), set_mask_image(ZB), set_scissor(0, 0, W, H))
     s.add(set_other_modes(cycle=3), set_fill_color(rng.randrange(1 << 32)), fill_rect(0, 0, W - 1, H - 1), sync_pipe())
     s.add(set_color_image(0, 2, W, ZB), set_fill_color(0xfffcfffc), fill_rect(0, 0, W - 1, H - 1), sync_pipe(), set_color_image(0, 2, W, BUF[0]))
-    # one cycle, TEXEL0 * PRIM, Z-buffered: a pixel keeps the colour of the nearest of the (hundreds of) triangles that covered it, whichever
-    # iteration that was, so a job that rendered with the wrong snapshot (or was replaced in the job ring) shows in the final image
+    # one cycle, TEXEL0 * PRIM, Z-buffered: a pixel keeps the colour of the nearest triangle, so a job rendered with the wrong snapshot shows in the final image
     s.add(set_other_modes(cycle=0, z_compare=1, z_update=1, zmode=0), set_combine(1, 8, 3, 7, 1, 7, 7, 1, 1, 8, 3, 7, 1, 7, 7, 1))
     s.add(set_tile(0, 2, 0, 0, 7), set_tile(0, 2, 8, 0, 0), set_tile_size(0, 0, 0, 31, 31))
-    heavy = rng.sample(range(H // 4), rng.choice([1, 2, 3, 4]))      # the stripes that get the work
-    ring = rng.randrange(3) == 0       # no state / TMEM change between the draws: the job ring (8192 slots) is what runs out, not the snapshots
+    heavy = rng.sample(range(H // 4), rng.choice([1, 2, 3, 4]))
+    ring = rng.randrange(3) == 0       # no state / TMEM change between the draws: the job ring runs out, not the snapshots
     n = rng.randrange(3800, 4600) if ring else rng.randrange(2800, 3500)
     cur = 0
 
@@ -317,8 +295,8 @@ def make_lag_scene(rng):
         r = rng.randrange(120) if not ring else (0 if rng.randrange(400) == 0 else 99)       # (the ring scenes have no barrier before the end)
         if r == 0:           # a tall triangle: every class
             s.add(tri(0, 0, W - 1, H - 1))
-        elif r in (1, 2):    # the frame buffer as a texture, read from the rows of a heavy (lagging) stripe: the parser must not read them before the classes have
-            if r == 2:       # written them -- a hazard barrier; after a SYNC_FULL right before it
+        elif r in (1, 2):    # the frame buffer as a texture, read from a lagging stripe's rows: the parser must wait for the classes (hazard barrier)
+            if r == 2:
                 s.add(sync_full())
             s.add(sync_pipe(), set_texture_image(0, 2, W, BUF[cur] + 4 * W * 2 * rng.choice(heavy)), load_block(7, 0, 0, 1023, 0), sync_pipe())
             if ring:         # drawn back where it will be overwritten anyway

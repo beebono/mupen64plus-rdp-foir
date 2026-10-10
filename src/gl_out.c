@@ -1,9 +1,5 @@
 /*
  * mupen64plus-rdp-foir - gl_out.c
- * Draws one RGBA texture per frame through the Mupen64Plus video extension.
- * GL entry points are resolved with VidExt_GL_GetProcAddress at runtime so the
- * plugin has no link-time GL dependency (and works with front-ends that
- * override the video extension, e.g. suxty).
  *
  * Copyright (C) 2026 foir contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -14,7 +10,7 @@
 #include "m64p_types.h"
 #include "m64p_vidext.h"
 
-/* ---- minimal GLES2 declarations -------------------------------------------------- */
+/* GL entry points come from VidExt_GL_GetProcAddress at runtime: no link-time GL dependency, works with front-ends that override the video extension */
 typedef unsigned int GLenum, GLuint, GLbitfield;
 typedef int GLint, GLsizei;
 typedef unsigned char GLboolean;
@@ -243,13 +239,11 @@ void gl_out_present(const void *rgba, bool raw16, int w, int h, float screen_w, 
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, f);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, f);
 
-        /* letterbox to 4:3 unless widescreen stretching is requested */
         int vx = 0, vy = 0, vw = ww, vh = wh;
         if (!g.widescreen) {
             if (ww * 3 > wh * 4) { vw = wh * 4 / 3; vx = (ww - vw) / 2; }
             else { vh = ww * 3 / 4; vy = (wh - vh) / 2; }
         }
-        /* the picture may only cover part of the nominal screen (VI borders) */
         {
             int cw = (int)(vw * screen_w), ch = (int)(vh * screen_h);
             if (cw < 1) cw = 1;
@@ -260,7 +254,7 @@ void gl_out_present(const void *rgba, bool raw16, int w, int h, float screen_w, 
         glUseProgram(g.prog);
         glBindBuffer(GL_ARRAY_BUFFER, 0);
         static const GLfloat quad[] = {
-            /* x, y, u, v ; texture row 0 is the top of the picture */
+            /* x, y, u, v; texture row 0 is the top */
             -1.f, -1.f, 0.f, 1.f,
              1.f, -1.f, 1.f, 1.f,
             -1.f,  1.f, 0.f, 0.f,
