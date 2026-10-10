@@ -155,7 +155,7 @@ EXPORT m64p_error CALL PluginStartup(m64p_dynlib_handle core, void *context, voi
 
     ConfigOpenSection("Video-Foir", &l_cfg_foir);
     ConfigSetDefaultBool(l_cfg_foir, "FastCombiner", l_cfg.fast_combiner, "Fast paths for common combiner/blender modes (the NEON kernels always take them)");
-    ConfigSetDefaultBool(l_cfg_foir, "RelaxedPrecision", l_cfg.relaxed_precision, "Lower-precision Z, perspective and texture-coordinate math (no effect yet)");
+    ConfigSetDefaultBool(l_cfg_foir, "RelaxedPrecision", l_cfg.relaxed_precision, "Forces lower accuracy depth values and calculations for speed");
     ConfigSetDefaultString(l_cfg_foir, "FrameSkip", "0", "0 = off, N = fixed frame skip, auto = skip rendering to hold full speed");
     ConfigSetDefaultBool(l_cfg_foir, "InterlaceHack", l_cfg.interlace_hack, "Render one field and line-double instead of full interlace logic");
     ConfigSetDefaultInt(l_cfg_foir, "Threads", l_cfg.threads, "Number of rendering worker threads: 0 = auto (cores - 1), -1 = render on the emulation thread");
@@ -515,7 +515,7 @@ static const struct foir_suxty_option l_opts[OPT_COUNT] = {
     [OPT_NEON]       = { "NEON", "NEON Kernels", "Off = scalar reference kernels (slow)", FOIR_OPT_BOOL, 0, 0, 1, 1, NULL, 1 },
     [OPT_SPECIALIZE] = { "Specialize", "Specialised Kernels", "Per-state precompiled pixel kernels", FOIR_OPT_BOOL, 0, 0, 1, 1, NULL, 1 },
     [OPT_FASTCOMB]   = { "FastCombiner", "Fast Combiner", "Fast paths for common combiner/blender modes", FOIR_OPT_BOOL, 0, 0, 1, 1, NULL, 1 },
-    [OPT_RELAXED]    = { "RelaxedPrecision", "Relaxed Precision", "Lower-precision Z and texture math", FOIR_OPT_BOOL, 0, 0, 1, 1, NULL, 1 },
+    [OPT_RELAXED]    = { "RelaxedPrecision", "Relaxed Precision", "Forces lower accuracy depth values and calculations for speed", FOIR_OPT_BOOL, 0, 0, 1, 1, NULL, 1 },
 };
 
 static bool l_staged_set[OPT_COUNT];

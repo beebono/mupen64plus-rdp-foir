@@ -11,7 +11,7 @@
  * `abi` before using anything else; `size` allows later versions to append fields to the end of the struct.
  *
  * Every option is a plain int: bool 0/1, an int range, or an enum index (the labels are in the descriptor).
- * See README.md, "suxty interface".
+ * See docs/options.md, "suxty interface".
  *
  * THREADING.  get() and set() must be called on the emulation thread (the thread that runs ProcessRDPList /
  * UpdateScreen), but not from inside one of those calls.  The suxty menu runs inside the video-extension buffer swap,
