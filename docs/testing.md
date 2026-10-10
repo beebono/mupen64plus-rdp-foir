@@ -1,0 +1,83 @@
+# Testing
+
+The rule for every optimisation: it must be **bit-exact against the scalar reference at exact settings**, and a **mutation check** (a deliberately wrong build of the code) must show that the tests catch an error in that code. The scalar reference is in turn compared with angrylion-rdp-plus. This page describes the tests, the tools and the capture / replay workflow. Option and environment variable details are in [options.md](options.md).
+
+## Quick start
+
+```sh
+cd projects/unix
+
+# aarch64 cross build + the whole bit-exactness suite under qemu (walkfuzz, neoncheck, mtfuzz, kfuzz)
+make check CROSS_COMPILE=aarch64-linux-gnu- HOST_CPU=aarch64 \
+           RUNNER="qemu-aarch64-static -L /usr/aarch64-linux-gnu"
+
+# scalar reference against angrylion-rdp-plus (needs an angrylion-rdp-plus checkout next to this repository)
+make all replay ref NEON=0 && python3 ../../tools/regress.py
+```
+
+`make check` must report 0 differences everywhere, and `regress.py` 0 differing pixels in every scene. The same suite runs natively on a device (`make check` without `RUNNER`, or `python3 tools/neoncheck.py --replay ./foir-replay`).
+
+Run emulators and qemu jobs inside a memory cap on a desktop; the x86_64 legacy dynarec of older cores can run away on some ROMs.
+
+## Test data, capture and replay
+
+`test-data/dumps` holds captured RDP frames of real games (xz-compressed `.fdump`). They are derived from commercial ROMs, so they are not committed; `test-data/README.md` explains how to capture them. Without dumps, `neoncheck.py` and `make check` still run on the synthetic scenes, so the tests work on a fresh clone; the dumps add real-game coverage (18 frames at the time of writing, six of them with mip-mapped draws).
+
+- **Capture** (in the plugin, any Mupen64Plus front-end with an LLE RSP): `FOIR_DUMP=<prefix> FOIR_DUMP_FRAME=<n> [FOIR_DUMP_FRAMES=<k>]` writes `<prefix>_<n>.fdump`, an RDRAM snapshot plus every RDP command of the next `k` frames (default 2). `Core[RandomizeInterrupt]=False` makes the same frame number capture the same scene.
+- **Replay** (`foir-replay`, no emulator needed, also on a device): `foir-replay dump.fdump [-o out.rdram] [-p out.ppm] [-n repeats] [-t threads] [--scalar] [--nospec] [--fast] [--weave] [--setup-only]`. `-t N` selects the worker count (`0` = inline), `--scalar` the reference kernels, `--nospec` the generic NEON kernels, `--fast` the plugin's default knobs (the offline tools otherwise replay with the accuracy-preserving settings), `--weave` turns the interlace hack off, `--setup-only` skips the pixel stage. It prints timing and the coverage of the specialised variants.
+- **Reference:** `ref-angrylion dump.fdump -o ref.rdram` replays the same dump through angrylion-rdp-plus; `tools/compare.py dump.fdump foir.rdram angry.rdram prefix` decodes the framebuffers of two RDRAM dumps and writes images and difference statistics.
+
+```sh
+make replay ref NEON=0
+FOIR_DUMP=/tmp/smb FOIR_DUMP_FRAME=300 mupen64plus ...     # capture a real frame
+./foir-replay /tmp/smb_300.fdump -p out.ppm                 # replay it offline
+./ref-angrylion /tmp/smb_300.fdump -o ref.rdram             # replay it through angrylion
+```
+
+## The tests
+
+All of these run on x86_64 (scalar build); the NEON ones also under `qemu-aarch64-static` or natively on a device.
+
+- **`tools/neoncheck.py`** replays every scene (the dumps in `test-data/dumps` plus the 25 + 4 synthetic scenes of `regress.py`) with `--scalar` as the reference and the final RDRAM images must be byte-identical for: the default kernels at 0, 1, 2 and 3 worker threads; the combiner path forced with `FOIR_SPEC_COMB=shape|exact|generic` and the texture path with `FOIR_SPEC_TEX=shape|exact|generic` (inline and with 3 workers); the variants off (`--nospec`) inline and with 3 workers; the pool settings (helper off, 4 classes per worker); and the plugin-default knobs (`--fast`, RelaxedPrecision on, which the scalar kernels do not have) variants against generic kernels. It also prints the share of pixels that ran in specialised variants per scene.
+- **`tools/mtfuzz.py`** generates random scenes for the worker pool: fills, shaded / textured / Z-buffered triangles with random render modes, half of the combiner and blender modes taken from the variant lists, COPY-cycle texture rectangles, mip-mapped draws, buffer switches between framebuffers of different width and overlap, texture-from-framebuffer loads, syncs. Scalar inline against the default kernels on 1-4 workers must be identical. `--stress` makes long order-sensitive scenes (hundreds of primitives, many a single stripe tall, a different render state in nearly every job, SYNC_FULLs, render-target switches); `--lag` makes deliberately unbalanced stripe classes and more jobs / snapshots than the job ring and the state / TMEM snapshot rings hold (a Z-buffered picture whose pixels come from random iterations, so a job rendered from an overwritten snapshot or ring slot shows in the output); `--variants nohelper,g1,g3,g4` re-runs every scene under other pool settings; `--comb shape` / `--tex shape` force the second-tier kernels.
+- **`foir-kfuzz`** (aarch64 only) draws random render states through the real command parser, random TMEM / framebuffer / Z contents and random pixel batches, and requires every NEON stage to equal the scalar stage (the store stage on the resulting RDRAM including the hidden bits). Modes: default (generic kernels); **`-S`** walks every entry of the variant tables (iteration *i* writes variant *i*'s key over a random state, checks that the selection picks exactly that variant, runs the whole chain through the selected kernels and compares with the scalar chain; for shape kernels it draws random operands of the kernel's shape); `-T n` restricts `-S` to one table (0 texture, 1 combine, 2 zcmp, 3 blend, 4 store, 5 shape); **`-m 32`** the COPY span kernel (random tile, TLUT, masks, shifts, colour buffers of 16 / 8 / 4 bit and odd addresses, spans touching the row ends or the ends of RDRAM); **`-m 64`** the batch builder against its portable reference with the pixel stages replaced by a recorder (the replay-based checks cannot see the builder, because the scalar replay uses the same one); **`-L`** mip-map scenes (TEX_LOD_EN, detail, sharpen, perspective, one and two cycles, point and bilinear, linear ramps with steps from sub-texel to the largest the 14-bit LOD holds, and now and then a disagreeing tile inside the chain). One iteration in eight puts the colour or Z buffer at the first / last pixels of RDRAM to exercise the bounds checks.
+- **`foir-walkfuzz`** checks the per-row edge walker (`walk_row` NEON and `walk_row_c` portable, `src/walk.h`) against the sequential walker of foir commit c73eb8e, kept verbatim in `tools/walk_ref.inc` as the oracle. Random primitives from ordinary triangles to extreme ones (14-bit vertices, up to 12,000 subscanlines of walking before the first visible row, full-range 28-bit edge positions and 30-bit slopes so that the products wrap many times, fully random records, random scissors, interlace fields and cycle types) go through both; the visibility, first / last row, per-primitive constants and for every row the validity and every span field are compared, with the rows computed in ascending and in shuffled order.
+- **`tools/regress.py`** builds synthetic RDP scenes (`tools/rdpgen.py`), runs each through `foir-replay` (scalar reference) and `ref-angrylion`, and compares the framebuffers: 25 scenes (15 general, 10 mip-map), all with 0 differing pixels. Four further scenes (`XSCENES`: one-cycle perspective LOD with a max level above 0) are NEON-vs-scalar only, because the scalar reference differs from angrylion in the far part of the plane (angrylion's `tclod_1cycle_current` has span-edge cases the scalar kernel does not model; not investigated). Run it from `projects/unix` after `make replay ref`. The optional arguments are an output directory (default: a git-ignored directory in the repository) and scene names; the four `XSCENES` run only when named.
+- **`tools/vitest.py`** checks the VI output of an interlaced frame rendered one field at a time (weave against `InterlaceHack`).
+- **Cross-architecture check:** the final RDRAM of `foir-replay -o` from the x86_64 `NEON=0` build and from the aarch64 build, compared with `cmp`, for every dump inline and with 3 workers.
+- **`make check`** runs, in order: walkfuzz (40,000 primitives), neoncheck, `mtfuzz` (60 scenes, plus 24 `--stress` and 20 `--lag` with pool variants), and on aarch64 `mtfuzz --comb shape` and `--tex shape` (40 each) and kfuzz: default 3,000; `-m 32` 20,000; `-m 64` 40,000; `-S` 15,000 over all 499 table entries; `-S -T 5` 15,000 (shape kernels); `-S -T 0` 8,000 (texture); `-L -m 1` 20,000; `-L -S -T 0` 8,000. About 8 minutes under qemu.
+
+## In-plugin verifier
+
+`FOIR_NEON_VERIFY=1 FOIR_KNOBS=exact` runs every NEON stage (texture, combine, zcmp, blend, store, COPY), specialised variants included, next to the scalar kernel on each batch and counts mismatches (reported in the 120-frame log line and at exit). It works in game and with `foir-replay`. Use `FOIR_KNOBS=exact`, because the scalar kernels have no RelaxedPrecision. Combine it with `FOIR_SPEC_COMB=shape FOIR_SPEC_TEX=shape` to push every batch through the second-tier kernels. At the last full run: 181 non-empty gameplay windows of 62 games, 17.2 million combiner batches and 16.1 million texture batches, 0 mismatching; in game on the device (3 workers, 60-75 s each) Paper Mario, Rocket Robot on Wheels, Mischief Makers, Super Mario 64, Donkey Kong 64 and Banjo-Kazooie, 0 mismatching in every stage.
+
+## Other checks that were run
+
+- **Screenshots** at fixed plugin frames (`FOIR_SHOT_DIR`, `FOIR_SHOT_FRAMES`) of 12 games from the old and the new plugin, with `Core[RandomizeInterrupt]=False`: byte-identical. A broader run of 23 ROMs for 58 s each, with three RSP setups (cxd4, parallel-rsp standalone, rsp-hle + parallel-rsp), produced 98 screenshots that were bit-identical across the setups, without a crash or hang.
+- **Sanitizers:** ThreadSanitizer on the x86_64 scalar build with 3 workers and the helper (run with `setarch -R` because of the kernel's mmap randomisation) on the replay dumps and on `--lag` scenes; ASan / UBSan on `foir-walkfuzz` and on the replay with 3 workers. No reports. ThreadSanitizer cannot run the NEON kernels, so the row-ownership rule for the NEON windows (an odd-aligned or COPY window must not leave its row) is only tested for equal output.
+- **RSP pairing helpers** (`tools/prsp/`): a timing shim (`rspt.c`) that forwards to the real RSP plugin and logs time per `DoRspCycles` call, an audio dump plugin, and scripts that compare DMEM / IMEM hashes, screenshots and audio streams between RSP builds.
+- **Desktop notes.** With the stock core's legacy x86_64 dynarec, a few games (Indiana Jones and the Infernal Machine, Star Wars Episode I Racer, Excitebike 64, Iggy's Reckin' Balls, Pilotwings 64) were seen never to get past the IPL3 RDRAM calibration, so they send no RDP lists; `--emumode 1`, or a core built with `NEW_DYNAREC=1` (what the aarch64 devices use), avoids it. Donald Duck - Goin' Quackers and Excitebike 64 wait for a button press at their "no Controller Pak" screens, so with the dummy input plugin they stop on a static screen (zero new RDP lists per 120 frames is normal there). Headless: `SDL_VIDEODRIVER=offscreen`.
+
+## Mutation checks
+
+A mutation check builds a deliberately wrong version of the code under test (in a copy of the tree) and runs the tests on it; each tool must fail. Examples of what was shown to be caught:
+
+| area | mutation | caught by |
+|---|---|---|
+| batch builder | one bit of the right-edge coverage table flipped; interior mask `0x05` -> `0x04`; Z ramp built from the `w` step | `kfuzz -m 64` (20 failing iterations within 353 / 46 / 67) and the cross-architecture check; **not** by `neoncheck.py` on the synthetic scenes |
+| edge walker | jump one subscanline too far; interpolants one row too far; left edge switching one subscanline late; `ym == ycur` miscounted | `foir-walkfuzz` (within 60 primitives) and `regress.py` (4-13 of 15 scenes differ); **not** by neoncheck / mtfuzz / kfuzz |
+| LOD path | level off by one; fraction shifted one bit too far; wrong tile in one lane; neighbour-lane reuse ignoring `w`; LOD saturation; perspective-divide bounds test inverted; chain bound short | `kfuzz -L` / `-S -T 0` (20 of 20,000 iterations); the captured frames alone catch only some of them (the chain-bound, `w` and saturation errors need the fuzz scenes) |
+| COPY kernel | palette base off; no half-used first window; alpha compare ignored; texture mask limit | `kfuzz -m 32` (20 failing of 3,000 each) |
+| texture / Z tiers | MID_TEXEL ignored; AA ignored in the Z-compare variants; `anyfmt` off in the any-format kernels | `kfuzz -S` |
+| worker pool | the helper renders a class's tasks in reverse; stale state or TMEM snapshot; claim without compare-and-swap; premature job floor (three variants) | `mtfuzz --stress` (1-4) and `--lag` (all; the floor mutations were caught in only 0-2 of 60 `--stress` scenes, which is why `--lag` exists); ThreadSanitizer for the unsynchronised claim |
+
+The mutations that the existing replay-based checks miss (batch builder, edge walker) are the reason `kfuzz -m 64` and `foir-walkfuzz` exist: `neoncheck.py` and `mtfuzz.py` compare the NEON or threaded renderer with the scalar one, and both sides use the same builder and walker.
+
+## Debug builds and logs
+
+Pass these as **environment** variables to make (`CFLAGS=-DFOIR_STATS make ...`), not as make arguments; use `POSTFIX=-st` for a separate object directory and plugin name, and rebuild without them afterwards.
+
+- **`-DFOIR_STATS`**: per-state and per-stage-key pixel statistics (`FOIR_STATE_STATS=1`, `FOIR_STATE_STATS_ALL=1`, `FOIR_STATE_STATS_FILE=path`), NEON fallback counters (`FOIR_NEON_STATS`). These logs are the input of `tools/specstats.py` and `shapegen.py` ([adding variants](design.md#adding-variants)).
+- **`-DFOIR_FRAMELOG`**: `FOIR_FRAMELOG=path` writes one fixed-size binary record per `UpdateScreen` (per VI frame) into a shared mmap (no syscall per frame, survives SIGKILL; put it on a tmpfs on a handheld): enter / leave timestamps, time inside `ProcessRDPList` (total, longest call, the `SYNC_FULL` wait, all barrier waits), `UpdateScreen` stages (drain, VI convert, present including its vsync wait), commands / primitives / pixels / texture loads / jobs of the interval, the workers' busy time (sum and busiest), the time the emulation thread spent as a helper, and its own CPU time, page faults and context switches (a frame whose wall time far exceeds its thread CPU time was blocked or preempted, not computing). `FOIR_FRAMELOG_MAX=n` caps the records (default 36,000). `tools/framelog.py FILE` prints the frame-time distribution and the ten slowest frames with their breakdown (`--csv` for everything, `--from N` to skip boot).
+- **`-DFOIR_STAGETIME`**: per-stage timers around every kernel call, printed by `foir-replay`; used to attribute the cost of the kernel tiers.
+- **Log lines:** `FOIR_LOGFILE=path` additionally writes the plugin's log lines to an unbuffered file. Every 120 frames it logs wall time per frame, RDP time (parse + setup, of which the `SYNC_FULL` wait), VI convert / present time, pixels, primitives, skipped frames, CPU per frame, and the share of pixels that ran in specialised variants per stage.

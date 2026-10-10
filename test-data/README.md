@@ -8,7 +8,7 @@ committed; generate them locally. Everything in this directory except this file 
 - `tools/neoncheck.py` (and so `make check`) replays every `test-data/dumps/*.fdump` / `*.fdump.xz` with the NEON
   kernels against the scalar reference. With no dumps it runs only the synthetic scenes from `tools/regress.py`, so the
   tests still work on a fresh clone; the dumps add real-game coverage.
-- The benchmark tables in the top-level README ("captured frames") were measured on the set below with `foir-replay`.
+- The benchmark tables in `docs/performance.md` ("captured frames") were measured on the set below with `foir-replay`.
 
 ## Generating dumps
 
