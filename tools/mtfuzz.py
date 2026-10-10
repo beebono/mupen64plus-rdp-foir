@@ -7,7 +7,22 @@ loads of texture data straight out of a framebuffer (texture-from-framebuffer) a
 use it. Each scene is replayed with the scalar kernels on the parser thread (the reference) and with the
 default kernels on 1..N worker threads; the final RDRAM images must be byte-identical.
 
+--stress makes the scenes long and order-sensitive for the stripe-class claiming of the pool: hundreds of primitives, many of
+them only a few rows tall (a job then has a single stripe class), overlapping blended / Z-tested / filled draws whose result depends
+on the order, frequent render-state changes (every job carries a different state snapshot) and SYNC_FULLs and render-target
+switches in between. --variants runs every scene additionally under pool settings (FOIR_HELPER, FOIR_MT_CLASSES):
+helper off, one / three / four classes per worker.
+
+--lag makes scenes with deliberately unbalanced stripe classes, to check the parser's idea of "every job below F is complete" (the
+pool's floor: it decides when a job-ring slot or a state / TMEM snapshot may be overwritten):
+a few stripes get a wide textured rectangle in every iteration (a lot of work for the classes of those stripes) while everything else is
+tiny, and every iteration loads a different texture into TMEM and changes the primitive colour, so a job needs a snapshot of its own for
+about 3000 jobs -- more than the 256 TMEM and 1024 state snapshots and (near the end) the 8192 job slots. A class that lags far behind keeps
+its snapshots alive; a floor that moves past it lets the parser overwrite them and the lagging class renders the wrong texture / colour.
+Texture loads from the frame buffer (a hazard barrier), SYNC_FULLs and render-target switches are mixed in.
+
 usage: mtfuzz.py [-n scenes] [-s seed] [--replay path] [--runner "qemu-aarch64-static -L ..."] [--threads 1,2,3,4]
+                 [--stress] [--lag] [--variants default,nohelper,g1,g3,g4]
 """
 import argparse
 import hashlib
@@ -149,7 +164,22 @@ def rnd_tri(rng, w, h, textured, z, level=0):
         return None
 
 
-def make_scene(rng):
+def small_tri(rng, w, h, textured, z, level=0):
+    """a triangle inside a box of a few rows (one or two stripes, so a job has a single stripe class)"""
+    y0 = rng.uniform(-2, h)
+    x0 = rng.uniform(-10, w)
+    bw, bh = rng.uniform(2, max(3, w / 2)), rng.choice([1.5, 3.0, 5.0, 9.0])
+    pts = [(x0 + rng.uniform(0, bw), y0 + rng.uniform(0, bh)) for _ in range(3)]
+    shade = [tuple(rng.randrange(256) for _ in range(4)) for _ in range(3)]
+    tex = [(rng.uniform(-8, 40), rng.uniform(-8, 40), rng.uniform(0.2, 1.0)) for _ in range(3)] if textured else None
+    zs = [rng.randrange(1000, 60000) for _ in range(3)] if z else None
+    try:
+        return triangle(pts, shade=shade, tex=tex, zs=zs, level=level)
+    except Exception:
+        return None
+
+
+def make_scene(rng, stress=False):
     s = Scene()
     # texture: 32x32 RGBA16 in RDRAM, loaded into TMEM tile 0
     for i in range(32 * 32):
@@ -157,7 +187,7 @@ def make_scene(rng):
     widths = [17, 33, 64, 100, 128, 129, 200, 256, 320, 321]
     bpp32 = rng.randrange(5) == 0
     W = rng.choice(widths)
-    H = rng.randrange(24, 90)
+    H = rng.randrange(24, 90) if not stress else rng.randrange(40, 200)
     size = 3 if bpp32 else 2
     s.add(set_color_image(0, size, W, BUF[0]), set_mask_image(ZB), set_scissor(0, 0, W, H))
     s.add(set_other_modes(cycle=3), set_fill_color(rng.randrange(1 << 32)), fill_rect(0, 0, W - 1, H - 1), sync_pipe())
@@ -172,21 +202,27 @@ def make_scene(rng):
                        ms=rng.randrange(2), mt=rng.randrange(2), cs=rng.randrange(4) == 0), set_tile_size(lvl, 0, 0, wd - 1, wd - 1))
     cur = 0
     curW = W
-    for step in range(rng.randrange(12, 40)):
+    for step in range(rng.randrange(12, 40) if not stress else rng.randrange(150, 450)):
         op = rng.randrange(12)
+        if stress and op == 8 and rng.randrange(3):
+            op = 4                  # fewer full syncs than draws
+        if stress and op in (9, 11):
+            op = 5                  # more fills: order-dependent overwrites
         if op <= 4:   # triangles
             cyc = rng.randrange(2)
             textured = rng.randrange(3) != 0
             s.add(rnd_combine(rng, cyc), set_prim_color(rng.randrange(1 << 32)), set_env_color(rng.randrange(1 << 32)),
                   set_other_modes(**rnd_modes(rng, cyc)))
             for _ in range(rng.randrange(1, 4)):
-                t = rnd_tri(rng, curW, H, textured, rng.randrange(2), level=rng.randrange(4))
+                t = small_tri(rng, curW, H, textured, rng.randrange(2), level=rng.randrange(4)) if stress and rng.randrange(3) else \
+                    rnd_tri(rng, curW, H, textured, rng.randrange(2), level=rng.randrange(4))
                 if t:
                     s.add(t)
         elif op == 5:  # fill
             x0, y0 = rng.randrange(curW), rng.randrange(H)
+            hh = rng.randrange(1, H) if not (stress and rng.randrange(2)) else rng.randrange(0, 5)       # (stress: often 1-4 rows)
             s.add(set_other_modes(cycle=3), set_fill_color(rng.randrange(1 << 32)),
-                  fill_rect(x0, y0, min(curW - 1, x0 + rng.randrange(1, curW)), min(H - 1, y0 + rng.randrange(1, H))))
+                  fill_rect(x0, y0, min(curW - 1, x0 + rng.randrange(1, curW)), min(H - 1, y0 + hh)))
         elif op == 6:  # switch render target, possibly overlapping with a different width
             nb = rng.randrange(3)
             nw = rng.choice(widths)
@@ -226,6 +262,79 @@ def make_scene(rng):
     return s, (3 if bpp32 else 2, BUF[0], W, 0x006C02EC, 0x002E020E, 0x200, 0x400)
 
 
+VARIANTS = {
+    'default': {},
+    'nohelper': {'FOIR_HELPER': '0'},
+    'g1': {'FOIR_MT_CLASSES': '1'},
+    'g3': {'FOIR_MT_CLASSES': '3'},
+    'g4': {'FOIR_MT_CLASSES': '4'},
+}
+
+
+def make_lag_scene(rng):
+    s = Scene()
+    W, H = 320, 64
+    NT = 48
+    for i in range(NT * 32 * 32):
+        s.wr16(TEX + i * 2, rgba16(rng))
+    s.add(set_color_image(0, 2, W, BUF[0]), set_mask_image(ZB), set_scissor(0, 0, W, H))
+    s.add(set_other_modes(cycle=3), set_fill_color(rng.randrange(1 << 32)), fill_rect(0, 0, W - 1, H - 1), sync_pipe())
+    s.add(set_color_image(0, 2, W, ZB), set_fill_color(0xfffcfffc), fill_rect(0, 0, W - 1, H - 1), sync_pipe(), set_color_image(0, 2, W, BUF[0]))
+    # one cycle, TEXEL0 * PRIM, Z-buffered: a pixel keeps the colour of the nearest of the (hundreds of) triangles that covered it, whichever
+    # iteration that was, so a job that rendered with the wrong snapshot (or was replaced in the job ring) shows in the final image
+    s.add(set_other_modes(cycle=0, z_compare=1, z_update=1, zmode=0), set_combine(1, 8, 3, 7, 1, 7, 7, 1, 1, 8, 3, 7, 1, 7, 7, 1))
+    s.add(set_tile(0, 2, 0, 0, 7), set_tile(0, 2, 8, 0, 0), set_tile_size(0, 0, 0, 31, 31))
+    heavy = rng.sample(range(H // 4), rng.choice([1, 2, 3, 4]))      # the stripes that get the work
+    ring = rng.randrange(3) == 0       # no state / TMEM change between the draws: the job ring (8192 slots) is what runs out, not the snapshots
+    n = rng.randrange(3800, 4600) if ring else rng.randrange(2800, 3500)
+    cur = 0
+
+    def tri(y0, x0, x1, hh):
+        pts = [(x0 + rng.uniform(0, 4), y0 + rng.uniform(0, 0.5)), (x1 - rng.uniform(0, 4), y0 + rng.uniform(0, hh)), (x0 + rng.uniform(0, 4), y0 + hh)]
+        z = rng.randrange(1000, 60000)
+        t = triangle(pts, tex=[(rng.uniform(0, 31), rng.uniform(0, 31), 1.0) for _ in range(3)], zs=[z, z, z])
+        return t
+
+    def load():
+        return [set_texture_image(0, 2, 32, TEX + rng.randrange(NT) * 0x800), load_block(7, 0, 0, 1023, 0), sync_pipe(), set_prim_color(rng.randrange(1 << 32))]
+
+    if ring:
+        s.add(*load())
+    for i in range(n):
+        if i % (n // 8 + 1) == 0:        # another set of stripes gets the work (so every class lags in some phase)
+            heavy = rng.sample(range(H // 4), rng.choice([1, 2, 3]))
+        if not ring:
+            s.add(*load())
+        hs = rng.choice(heavy)
+        x0 = rng.randrange(0, 20)
+        s.add(tri(4 * hs, x0, x0 + rng.randrange(240, 300), 3.9))
+        for _ in range(rng.randrange(1, 3)):
+            ls = rng.randrange(H // 4)
+            lx = rng.randrange(0, W - 40)
+            if not ring:
+                s.add(*load())
+            s.add(tri(4 * ls, lx, lx + rng.randrange(8, 40), rng.choice([1.0, 2.0, 3.9])))
+        r = rng.randrange(120) if not ring else (0 if rng.randrange(400) == 0 else 99)       # (the ring scenes have no barrier before the end)
+        if r == 0:           # a tall triangle: every class
+            s.add(tri(0, 0, W - 1, H - 1))
+        elif r in (1, 2):    # the frame buffer as a texture, read from the rows of a heavy (lagging) stripe: the parser must not read them before the classes have
+            if r == 2:       # written them -- a hazard barrier; after a SYNC_FULL right before it
+                s.add(sync_full())
+            s.add(sync_pipe(), set_texture_image(0, 2, W, BUF[cur] + 4 * W * 2 * rng.choice(heavy)), load_block(7, 0, 0, 1023, 0), sync_pipe())
+            if ring:         # drawn back where it will be overwritten anyway
+                s.add(tri(8, 8, 60, 3.9), set_texture_image(0, 2, 32, TEX), load_block(7, 0, 0, 1023, 0), sync_pipe())
+            else:            # drawn into the third buffer without Z test, at a place nothing else touches: the copy stays in the final image
+                ys = 4 * rng.randrange(H // 4)
+                xs = rng.randrange(0, W - 120)
+                s.add(set_color_image(0, 2, W, BUF[2]), set_other_modes(cycle=0), tri(ys, xs, xs + 100, 3.9), sync_pipe(),
+                      set_color_image(0, 2, W, BUF[cur]), set_other_modes(cycle=0, z_compare=1, z_update=1, zmode=0))
+        elif r == 3:         # the other buffer
+            cur ^= 1
+            s.add(sync_pipe(), set_color_image(0, 2, W, BUF[cur]), set_scissor(0, 0, W, H))
+    s.add(sync_full())
+    return s, (2, BUF[0], W, 0x006C02EC, 0x002E020E, 0x200, 0x400)
+
+
 def sha(path):
     h = hashlib.sha256()
     with open(path, 'rb') as f:
@@ -241,6 +350,9 @@ def main():
     ap.add_argument('--replay', default=os.path.join(ROOT, 'projects', 'unix', '_out_AARCH', 'foir-replay'))
     ap.add_argument('--runner', default='')
     ap.add_argument('--threads', default='1,2,3,4')
+    ap.add_argument('--stress', action='store_true', help='long, order-sensitive scenes with many small jobs (see above)')
+    ap.add_argument('--lag', action='store_true', help='unbalanced stripe classes and snapshot / job-ring pressure (see above)')
+    ap.add_argument('--variants', default='', help='comma list of pool settings every scene is also run under: ' + ','.join(VARIANTS))
     ap.add_argument('--comb', default='', help='FOIR_SPEC_COMB for the candidate runs (auto, exact, shape, generic)')
     ap.add_argument('--tex', default='', help='FOIR_SPEC_TEX for the candidate runs (auto, exact, shape, generic)')
     args = ap.parse_args()
@@ -251,39 +363,49 @@ def main():
     if not os.path.exists(args.replay):
         args.replay = os.path.join(ROOT, 'projects', 'unix', 'foir-replay')
     threads = [int(t) for t in args.threads.split(',') if t]
+    variants = [v for v in args.variants.split(',') if v and v != 'default']
+    for v in variants:
+        if v not in VARIANTS: ap.error('unknown variant ' + v)
     runner = shlex.split(args.runner)
     bad = 0
+    bad_scenes = 0
+    nruns = 0
     cov, ncov = [0.0] * 5, 0
     with tempfile.TemporaryDirectory() as tmp:
         for i in range(args.n):
             seed = args.s + i
             rng = random.Random(seed)
-            sc, vi = make_scene(rng)
+            sc, vi = make_lag_scene(rng) if args.lag else make_scene(rng, args.stress)
             d = os.path.join(tmp, 's.fdump')
             sc.write(d, vi)
             ref = os.path.join(tmp, 'ref.rdram')
             subprocess.run(runner + [args.replay, d, '-o', ref, '--scalar'], capture_output=True, check=True)
             h0 = sha(ref)
             line = []
-            for t in [0] + threads:
+            runs = [(t, 'default') for t in [0] + threads] + [(t, v) for v in variants for t in threads]
+            for t, var in runs:
                 out = os.path.join(tmp, 'c.rdram')
-                res = subprocess.run(runner + [args.replay, d, '-o', out] + (['-t', str(t)] if t else []), capture_output=True, check=True, text=True, env=env)
+                renv = dict(env or os.environ)
+                renv.update(VARIANTS[var])
+                res = subprocess.run(runner + [args.replay, d, '-o', out] + (['-t', str(t)] if t else []), capture_output=True, check=True, text=True, env=renv)
                 if t == 0:
                     m = re.search(r'specialised pixels: texture ([\d.]+)%.*?combine ([\d.]+)%, zcmp ([\d.]+)%, blend ([\d.]+)%, store ([\d.]+)%', res.stderr)
                     if m:
                         for i in range(5): cov[i] += float(m.group(i + 1))
                         ncov += 1
                 ok = sha(out) == h0
-                line.append('%s%s' % ('inline' if not t else '%dt' % t, '' if ok else ':DIFF'))
+                line.append('%s%s%s' % ('inline' if not t else '%dt' % t, '' if var == 'default' else '/' + var, '' if ok else ':DIFF'))
                 if not ok:
                     bad += 1
+            nruns += len(line)
             if any('DIFF' in x for x in line):
+                bad_scenes += 1
                 print('seed %d: %s' % (seed, ' '.join(line)))
                 sys.stdout.flush()
         if ncov:
             print('mtfuzz: mean share of the pixels in specialised variants: texture %.0f%%, combine %.0f%%, zcmp %.0f%%, blend %.0f%%, store %.0f%%' %
                   tuple(c / ncov for c in cov))
-        print('mtfuzz: %d scene(s), %d difference(s)' % (args.n, bad))
+        print('mtfuzz: %d scene(s), %d difference(s)%s' % (args.n, bad, ' (%d of %d scenes, %d of %d runs differ)' % (bad_scenes, args.n, bad, nruns) if bad else ''))
     return 1 if bad else 0
 
 

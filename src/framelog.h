@@ -42,6 +42,8 @@ struct fl_rec {
     uint32_t thr_cpu_ns;      /* emulation thread CPU time (user + system) since the previous record */
     uint32_t thr_faults;      /* minor faults | major faults << 16 (deltas) */
     uint32_t thr_ctxsw;       /* voluntary | involuntary context switches << 16 (deltas) */
+    uint32_t helper_ns;       /* of mtsync_ns: the emulation thread rendering stripe classes itself (SyncHelper) */
+    uint32_t reserved;
 };
 
 bool framelog_open(void);                     /* FOIR_FRAMELOG set and the file mapped */

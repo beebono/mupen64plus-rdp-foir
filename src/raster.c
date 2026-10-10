@@ -560,6 +560,16 @@ static void prim_prepare(struct rdp *r)
     pc->dwinc = f ? pc->dw : -pc->dw; pc->dzinc = f ? pc->dz : -pc->dz;
 }
 
+/* the first row >= y that belongs to stripe class `wid` of `nw` */
+static inline int row_first_owned(int y, int nw, int wid)
+{
+    int s = y >> FOIR_STRIPE_SHIFT, m = s % nw;
+    if (m == wid) return y;
+    int ds = wid - m;
+    if (ds < 0) ds += nw;
+    return (s + ds) << FOIR_STRIPE_SHIFT;
+}
+
 /* Render the rows start..end of a job that this context owns. The spans come from the setup record `pw` (computed here, one
  * row at a time, by walk_row) or, for the tests, from the ready-made array `rows` (pw == NULL). */
 FOIR_INLINE void render_job(struct rdp *r, const struct span *rows, int jlo, const struct prim_walk *pw, int start, int end, int ref)
@@ -568,19 +578,22 @@ FOIR_INLINE void render_job(struct rdp *r, const struct span *rows, int jlo, con
     struct px_batch *b = &r->batch;
     int ct = r->om.cycle_type;
     (void)ref;
-    int nw = r->nworkers > 1 ? r->nworkers : 1;
-    int wid = r->worker_id;
+    const int nw = r->nworkers > 1 ? r->nworkers : 1;
+    const int wid = nw > 1 ? r->worker_id : 0;
     struct span row;
 
+    /* The rows this context renders: stripes (y >> FOIR_STRIPE_SHIFT) with stripe % nw == wid, in ascending order. Whole
+     * stripes the context does not own are jumped over (a class of the worker pool is 1 / nw of the stripes). */
+#define FIRST_ROW(y) ((nw == 1) ? (y) : row_first_owned((y), nw, wid))
+#define NEXT_ROW_IDX(y) ((nw == 1 || (((y) + 1) & ((1 << FOIR_STRIPE_SHIFT) - 1))) ? (y) + 1 : (y) + 1 + (nw - 1) * (1 << FOIR_STRIPE_SHIFT))
 #define NEXT_ROW() \
-        if (nw > 1 && ((y >> FOIR_STRIPE_SHIFT) % nw) != wid) continue; \
         const struct span *sp; \
         if (pw) { if (!walk_row(pw, y, &row)) continue; sp = &row; } \
         else { sp = &rows[y - jlo]; if (!sp->validline) continue; }
 
     if (ct == CYCLE_TYPE_FILL) {
         if (r->fb_size == PIXEL_SIZE_4BIT) return;
-        for (int y = start; y <= end; y++) {
+        for (int y = FIRST_ROW(start); y <= end; y = NEXT_ROW_IDX(y)) {
             NEXT_ROW();
             int x0 = sp->lx < sp->rx ? sp->lx : sp->rx;
             int x1 = sp->lx < sp->rx ? sp->rx : sp->lx;
@@ -593,7 +606,7 @@ FOIR_INLINE void render_job(struct rdp *r, const struct span *rows, int jlo, con
     }
     if (ct == CYCLE_TYPE_COPY) {
         if (r->fb_size == PIXEL_SIZE_32BIT) return;
-        for (int y = start; y <= end; y++) {
+        for (int y = FIRST_ROW(start); y <= end; y = NEXT_ROW_IDX(y)) {
             NEXT_ROW();
             k->copy(r, y, sp, r->pc.flip);
             r->stat_pixels += (uint32_t)(sp->lx < sp->rx ? sp->rx - sp->lx : sp->lx - sp->rx) + 1;
@@ -608,7 +621,7 @@ FOIR_INLINE void render_job(struct rdp *r, const struct span *rows, int jlo, con
     struct span_vec sv;
     span_vec_init(&sv, &r->pc);
 #endif
-    for (int y = start; y <= end; y++) {
+    for (int y = FIRST_ROW(start); y <= end; y = NEXT_ROW_IDX(y)) {
         NEXT_ROW();
 #if defined(FOIR_NEON)
         if (ref) render_span_ref(r, y, sp);
@@ -618,6 +631,8 @@ FOIR_INLINE void render_job(struct rdp *r, const struct span *rows, int jlo, con
 #endif
     }
 #undef NEXT_ROW
+#undef NEXT_ROW_IDX
+#undef FIRST_ROW
     batch_flush(r, b);
 }
 

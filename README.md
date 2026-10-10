@@ -276,17 +276,25 @@ eight lanes (dead lanes cost the whole texture / combiner / blender pipeline, ab
   each row it owns (the four subscanlines in the four lanes of a NEON vector; a portable version for the scalar build), hands it
   to the batch builder and forgets it: no span records are written, queued or read by another core. The scalar and the inline
   (`Threads = -1`, `foir-replay -t 0`) paths use the same `walk_row`.
-* Workers run the whole pixel pipeline for the **rows they own**: row `y` belongs to worker
-  `(y >> 2) % N` (4-row stripes). A worker is a private `struct rdp` context whose render-state block is
-  refreshed from the snapshot, so the kernels read `r->om`, `r->tile[]`, ... unchanged. Workers share nothing
-  in the hot loop: framebuffer, Z and hidden-bit rows are private to their owner and no lock is taken per
-  pixel or per primitive. (Pixels past the end of a row are dropped instead of wrapping into the next row,
-  which another worker owns; vector stores that would rewrite pixels outside their row fall back to
-  per-lane stores. ThreadSanitizer is clean on the test frames.)
+* Workers run the whole pixel pipeline for the **rows of their stripe classes**. The rows are cut into 4-row stripes and stripe `s`
+  belongs to the class `s % K` (`K` = 2 x workers with the emulation-thread helper, else `K` = workers; with 3 workers and the helper
+  6 classes, class `c` has the home worker `c % 3`, so a worker's rows are exactly the `(y >> 2) % N == id` rows of the earlier design).
+  A class is the unit of ordering: the parser appends the index of every job to the queue of each class it has rows in (a 32-bit mask in the
+  job), and the tasks of a class -- one per job -- are applied strictly in job order, one at a time. A class has one state word
+  (tasks completed << 1 | busy) that is its lock: a thread claims the next task of an idle class with a compare-and-swap, renders the
+  rows of that class of the job, and publishes the next position with a release store, which also hands the pixels to whoever claims the
+  class next. Home workers take the oldest pending task of their own classes; **the emulation thread claims idle classes of any worker while
+  it waits at a barrier** ([below](#the-emulation-thread-as-a-helper-and-the-sync_full-wait)). A worker is a private `struct rdp` context whose
+  render-state block is refreshed from the snapshot of whatever job it renders, so the kernels read `r->om`, `r->tile[]`, ... unchanged
+  (the helper has such a context too). Workers share nothing in the hot loop: framebuffer, Z and hidden-bit rows are private to the class
+  and no lock is taken per pixel or per primitive; the only shared words are the class states, the queue tails and the job ring.
+  (Pixels past the end of a row are dropped instead of wrapping into the next row, which another class owns; vector stores that would
+  rewrite pixels outside their row fall back to per-lane stores. ThreadSanitizer is clean on the test frames.)
 * All workers are drained only when the parser needs a consistent RDRAM: `SYNC_FULL`, VI scan-out /
   `ReadScreen2` / `FBRead` / `FBWrite`, a texture load whose source overlaps memory queued primitives still
   write (texture-from-framebuffer), a change of render-target geometry that would break row ownership of memory
-  still being written, and shutdown. Idle workers spin for 400 us, then sleep on a condition variable.
+  still being written, and shutdown. At all of these the emulation thread renders pending tasks itself instead of idling (`SyncHelper`, default on).
+  Idle workers spin for 400 us, then sleep on a condition variable.
 * `Threads` = 0 picks `cores - 1` workers (3 on a 4-core chip); `-1` renders on the emulation thread
   (the M1 behaviour, useful for debugging). The environment variable `FOIR_THREADS` overrides the setting.
 
@@ -446,6 +454,7 @@ python3 tools/specstats.py --loo 40 log*.txt                          # leave-on
 | `FrameSkip` | `0` | `0` = off, `N` = render one frame in `N+1`, `auto` = skip when the achieved frame interval exceeds the VI period (levels: none / every 2nd / 2 of 3). Skipped frames are still parsed (state, TMEM loads, syncs) but not rendered. |
 | `InterlaceHack` | on | Show only the freshest field of field-rendered interlaced frames (see above). |
 | `Threads` | `0` | Worker threads; `0` = auto (cores - 1), `-1` = none. |
+| `SyncHelper` | on | The emulation thread renders pending stripe classes while it waits for the workers (SYNC_FULL, VI scan-out, hazard barriers, full job ring). Exact; `False` = it idles (the previous behaviour). |
 | `NEON` | on | Use the NEON kernels (`False` = scalar reference). |
 | `Specialize` | on | Use the precompiled per-state pixel kernel variants ([below](#specialised-pixel-kernels-m3)); off = the generic NEON kernels only (bit-identical output, slower). Needs `NEON`. |
 
@@ -464,7 +473,7 @@ zcmp, blend, store, fill, copy; a stage that is not NEON is not specialised eith
 `FOIR_SPEC_COMB=auto|exact|shape|generic` (combiner dispatch: exact variant -> shape kernel -> generic kernel, or only some of them, see
 [Shape kernels](#shape-kernels-combiner)), `FOIR_SPEC_TEX=auto|exact|shape|generic` (texture dispatch: exact variant -> "any format" kernel -> generic kernel, see
 [below](#texture-and-z-compare-the-second-tier-any-format)), `FOIR_NEON_VERIFY=1` (run every NEON stage, the specialised variants included, next to the scalar one and report differences;
-combine it with `FOIR_KNOBS=exact`, the scalar kernels have no RelaxedPrecision), `FOIR_MT_STATS=1`, `FOIR_LOGFILE=path`.
+combine it with `FOIR_KNOBS=exact`, the scalar kernels have no RelaxedPrecision), `FOIR_MT_STATS=1`, `FOIR_LOGFILE=path`, `FOIR_HELPER=0|1` (= `SyncHelper`), `FOIR_MT_CLASSES=n` (stripe classes per worker: default 2 with the helper, 1 without).
 
 ### suxty interface
 
@@ -1182,6 +1191,232 @@ session under the device lock, governor `performance` -> `schedutil`; median (mi
 and the sweep's scripted input. The `-DFOIR_STATS` build (`POSTFIX=-st`) was built in the tree once and from a copy otherwise; the `-st` object directory was removed afterwards.
 
 
+### The emulation thread as a helper, and the SYNC_FULL wait
+
+**What was found.** The in-game hitch sweep on the RG35XX SP (`test-output/a53sweep2`: H700, 4 x Cortex-A53, 3 workers) attributes 260 of 433 frames longer than 36 ms to the emulation thread waiting at `SYNC_FULL` for the workers
+(Donkey Kong 64 112 of 142, Pokemon Snap without input 77 of 87, Banjo-Kazooie, Ocarina of Time). In those frames the workers' busy times add up to 56-94 ms with the busiest worker at 23-38 ms: the pool is saturated, not unbalanced, and the fourth core
+(the emulation thread's) sits in `mt_sync` / `wait_progress` doing nothing while the three workers render.
+
+**Design.**
+
+* *Stripe classes* (`mt.c`, [Threading](#threading)): the 4-row stripes are cut into `K` classes (`s % K`, K = 2 x workers with the helper, 1 x without). A class is the unit of ordering. For every job the parser appends the job index to the queue of
+  each class the job has rows in (a 32-bit mask in the job; classes without rows get nothing, so a thin primitive costs one task, not K). The state word of a class (`tasks completed << 1 | busy`) is its lock: `claim_task()` takes the oldest pending task
+  of the idle classes it may look at with one compare-and-swap, `run_task()` renders the rows of that class of the job (the same `render_job` as before, now jumping over the stripes of other classes instead of testing every row), a release store publishes
+  the next position. That store is also what makes the class's pixels visible to whoever claims the class next, and to the parser at a barrier (acquire loads).
+  **Order is exact by construction**: a class has one claimable task at a time, tasks come off its queue in job order, so every pixel sees its primitives in primitive order whichever thread renders them; threads never wait for each other.
+  Home workers claim only classes `c % workers == id`, which are the same rows as the old `(y >> 2) % workers == id` partition; the claim protocol alone costs nothing measurable (the helper-off pool is even 2-5 % faster than the old one in replay, see below, and indistinguishable from it in game).
+* *Snapshots.* Every task carries its job's state / TMEM generation; a thread (worker or helper) refreshes its private `struct rdp` from the snapshot slot when the generation differs, exactly as a worker always did, so the helper's context is as current as
+  a worker's. The parser's idea of "every job below `F` is complete" (`mt_floor()`: the oldest job still pending or running in any class, cached and only recomputed when a ring slot / snapshot slot is needed) decides when a job-ring slot, a state snapshot or a TMEM snapshot
+  may be overwritten; a pending task of a lagging class keeps all three alive.
+* *The helper.* The parser thread has its own context. Everywhere it used to idle it now calls `help_one()` (claim the oldest pending task of any idle class, render it, release it) and only backs off (`cpu_relax` / `sched_yield` / 50 us sleeps, as before) when
+  every pending class is busy on a worker: `mt_sync` (SYNC_FULL, VI drain, `FBRead` / `FBWrite` / `ReadScreen2`, hazard barriers on texture loads from memory queued primitives write, render-target changes, shutdown), a full job ring, a full state or TMEM
+  snapshot ring. It never renders while it parses, so the parser is never delayed by it, and no worker ever waits for the helper: a class the helper holds just has no claimable task for the workers (they take another of their own, or sleep).
+* *Regions.* The render-target hazard list also had a latent overflow (two new keys registered at 7 of 8 slots wrote past the array); it now reserves room before registering and a full list is a barrier, as intended.
+
+**Exactness.** `make check` (neoncheck 47 scenes incl. new pool-setting columns, mtfuzz 60 + 40 + 40 scenes, mtfuzz `--stress` 24 and `--lag` 20 scenes, kfuzz incl. `-m 64`, `-S`, `-L`, walkfuzz): 0 differences; `regress.py`: 25 of 25 scenes, 0 differing pixels vs angrylion;
+`FOIR_NEON_VERIFY=1 FOIR_KNOBS=exact` on the 18 dumps at 0 and 3 workers: 36 runs, 773,881 batches, 0 mismatching; the final RDRAM of the 18 dumps against the 6afc7c3 build (`-t 0` reference) at 1, 2, 3, 4, 7 workers, with the helper off,
+with 3 and 4 classes per worker (11 configurations, 18 dumps, exact and `--fast`): 0 differ; after `DeferSync` was removed again, the RDRAM of the 18 dumps is identical before and after the removal (`-t 0`, 3, 7, helper off at 3 and 7, exact and `--fast`, x86_64 scalar and aarch64 under qemu: 360 comparisons); ThreadSanitizer (x86_64 scalar build, 3 workers + helper, 6 dumps x 4 settings and 4 `--lag` scenes x 2 settings, 32 runs; after the removal 4 dumps x helper on / off, 8 runs): no reports;
+mtfuzz `--stress` with every pool setting and 1-7 threads: 300 scenes on x86_64 and 100 under qemu-aarch64, 0 differences.
+New tests: `mtfuzz.py --variants` runs every scene also with the helper off, 1 / 3 / 4 classes per worker; `--stress` makes long order-sensitive scenes (hundreds of primitives, many of them one stripe tall, so a job has a single class,
+overlapping blended / Z-tested / filled draws, a different render state in nearly every job, SYNC_FULLs, render-target switches, textures from the frame buffer); `--lag` makes deliberately unbalanced class loads -- a few stripes get a wide Z-buffered textured
+triangle in every iteration, everything else is tiny, every iteration loads a different texture and changes the primitive colour, ~3000 jobs and as many snapshots, more than the 256 TMEM snapshots, 1024 state snapshots and (in the "ring" third of the scenes, without
+state changes) than the 8192 job slots, with the heavy stripes changing eight times per scene so each class lags in turn. A pixel keeps the colour of the nearest of the hundreds of triangles that covered it, whichever iteration that was, so a job rendered from an
+overwritten snapshot or job slot shows in the final image. `neoncheck.py` adds the pool settings to every scene.
+
+**Mutations** (built in a copy of the tree with a `-DMUT=n` hook, x86_64 scalar build; the entries are runs / scenes that differ from the scalar reference, out of the runs the mutation can affect; a run is one scene at one thread count and pool setting):
+
+| # | mutation | `mtfuzz --stress` (60 scenes, 1020 runs; runs the mutation can affect: 720) | `mtfuzz --lag` (80 scenes, 1040 runs; affected: see column) | other |
+|---|---|---|---|---|
+| 1 | the helper renders the two oldest pending tasks of a class in reverse order (breaks the per-class order) | 719 / 720 runs differ, 60 / 60 scenes | 336 / 720 runs, 77 / 80 scenes | |
+| 2 | the helper keeps a stale render-state snapshot after the first (never refreshes) | 720 / 720, 60 / 60 | 443 / 720, 51 / 80 | |
+| 3 | the helper keeps a stale TMEM snapshot | 720 / 720, 60 / 60 | 444 / 720, 52 / 80 | |
+| 4 | the helper ignores the busy flag and claims without the compare-and-swap (two threads in one class) | 719 / 720, 60 / 60 | 134 / 720, 60 / 80 | ThreadSanitizer: data races at once (`rdram.h`, 2 dumps) |
+| 5 | **premature floor**: after every task the helper runs, the parser believes every queued job is complete | 2 / 720, 2 / 60 | **720 / 720 runs, 80 / 80 scenes** | |
+| 6 | **premature floor**: `mt_floor()` ignores the last class (affects the 960 runs with a pool) | 0 / 960 | 472 / 960 runs, 76 / 80 scenes | |
+| 7 | **premature floor**: `mt_floor()` counts a class that is running a task as done with it (960 runs) | 0 / 960 | **829 / 960 runs, 80 / 80 scenes** | |
+
+The floor mutations (5-7) were caught in only 0-2 of 60 `--stress` scenes (the original weak spot: a floor that is too high matters only when a class lags far behind *and* a slot is then reused); the `--lag` scenes catch them in 80 / 80
+(5, 7) and 76 / 80 scenes (6: the one class it ignores has to be the lagging one in some phase of the scene), and every `--lag` scene passes the unmutated tree (150 scenes x 7 pool settings x 1-7 threads on x86_64, 20 under qemu-aarch64: 0 differences).
+Every mutation is caught in at least 95 % of the scenes of one of the two kinds (1-4: all 60 `--stress` scenes; 5-7: 76-80 of the 80 `--lag` scenes). (The mutation runs were made while `DeferSync`, since removed, still existed: their run counts include its pool settings, and a mutation of its region bookkeeping, #5 then, is left out.)
+
+
+**Timing, offline replay** (`foir-replay --fast -n 20`, 8 dumps, 3 rounds with the order of the conditions rotated, medians, clocks pinned -- RG35XX SP: spruce Performance mode 1512 MHz; RGDS+: `performance` governor, restored to `schedutil`; ms per run, ratio to the 6afc7c3 build in brackets;
+`new` = default (helper on, 2 classes per worker), `nh` = helper off, `g3` / `g4` = 3 / 4 classes per worker). In a replay the wait at `SYNC_FULL` is most of the frame, so this is the upper bound of what the helper brings.
+
+RG35XX SP (A53), three workers:
+
+```
+dump                                   old           new            nh            g3            g4
+Banjo-Kazooie_450            13.34 (1.000)  9.95 (0.746) 12.89 (0.966)  9.89 (0.741)  9.78 (0.733)
+Donkey_Kong_64_800            6.66 (1.000)  5.08 (0.762)  6.20 (0.931)  5.08 (0.763)  5.19 (0.779)
+GoldenEye_007_900             2.60 (1.000)  1.84 (0.708)  2.46 (0.944)  1.74 (0.670)  1.81 (0.695)
+Paper_Mario_900               5.02 (1.000)  3.74 (0.745)  4.64 (0.925)  3.75 (0.748)  3.76 (0.749)
+Pokemon_Snap_300             27.61 (1.000) 21.36 (0.774) 28.00 (1.014) 21.91 (0.793) 22.14 (0.802)
+Rocket_1500                  10.90 (1.000)  8.69 (0.797) 10.64 (0.976)  8.78 (0.805)  8.85 (0.812)
+Star_Fox_64_1000              8.76 (1.000)  6.17 (0.704)  7.76 (0.886)  6.03 (0.688)  5.80 (0.661)
+Super_Mario_64_650            8.11 (1.000)  6.39 (0.789)  7.86 (0.970)  6.64 (0.819)  6.54 (0.806)
+geomean ratio                        1.000         0.753         0.951         0.752         0.753
+```
+
+RGDS+ (A55), three workers:
+
+```
+dump                                   old           new            nh            g3            g4
+Banjo-Kazooie_450            12.90 (1.000)  9.44 (0.732) 12.36 (0.958)  9.55 (0.740)  9.47 (0.734)
+Donkey_Kong_64_800            5.72 (1.000)  4.83 (0.844)  5.60 (0.980)  4.92 (0.861)  5.13 (0.898)
+GoldenEye_007_900             2.75 (1.000)  1.86 (0.678)  2.63 (0.957)  1.91 (0.694)  1.92 (0.699)
+Paper_Mario_900               4.77 (1.000)  3.80 (0.797)  4.58 (0.959)  3.73 (0.782)  3.78 (0.792)
+Pokemon_Snap_300             25.39 (1.000) 21.59 (0.850) 26.71 (1.052) 20.97 (0.826) 20.80 (0.819)
+Rocket_1500                  10.08 (1.000)  7.83 (0.777)  9.70 (0.962)  8.02 (0.796)  8.04 (0.798)
+Star_Fox_64_1000              7.09 (1.000)  5.71 (0.805)  6.97 (0.984)  5.69 (0.802)  5.90 (0.832)
+Super_Mario_64_650            7.07 (1.000)  5.95 (0.841)  7.10 (1.004)  6.24 (0.883)  6.06 (0.857)
+geomean ratio                        1.000         0.788         0.982         0.796         0.801
+```
+
+One thread (`-t 0`, nothing to help): geometric mean of new / old 0.998 (A53) and 0.994 (A55), i.e. no change. The helper takes the three-worker replay down by 21-25 % -- a fourth renderer for the tail -- and the pool without the helper (`nh`) is 2-5 % faster than
+before (the stripe jump of `render_job`: rows of other classes are no longer visited). Three or four classes per worker are no better than two (0.752 / 0.753 against 0.753 on the A53, 0.796 / 0.801 against 0.788 on the A55), so two it is.
+
+**Timing, in game.** The method of `test-output/a53sweep2`: rsp-hle with parallel-rsp (e317ef6) as RspFallback, `FOIR_THREADS=3`, default knobs, scripted input (Pokemon Snap: none at all, the standing rule), 75 s runs, window = presented frames after VI 1440,
+frame time = `CLOCK_MONOTONIC` between swap returns (`swaptime.so`), `FOIR_FRAMELOG` builds of both (`o` = 6afc7c3, `n` = this tree, helper on; `nh` = helper off), private HOME / XDG / configdir, clocks pinned, builds alternated within sessions
+of three runs (A B A, B A B). Median (min-max) over the runs; "emu thread" is the wall time of the emulation thread between two UpdateScreens, "RDP callbacks" its part inside `ProcessRDPList` (parse + setup + every wait), the SYNC_FULL wait includes the rendering the helper does
+there, "helper" is the time it spent rendering classes in all its waits. Frames > 36 ms: in brackets those in which the SYNC_FULL wait was at least 40 % of the frame time. (Frame times are vsync-locked, 30 fps games alternate 20 / 13 ms; the window is 2800-3300 frames.)
+
+RG35XX SP (A53, 1512 MHz):
+
+| game | build | runs | fps | emu thread ms/frame (wall, excl. UpdateScreen) | of which RDP callbacks (parse + setup + waits) | SYNC_FULL wait ms/frame (share of emu thread) | helper ms/frame | process-thread CPU ms/frame | frame p50 / p95 / p99 / max ms | frames > 33.3 ms | frames > 36 ms (SYNC_FULL-dominated) |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|
+| Donkey Kong 64 | o | 6 | 59.2 (59.2-59.3) | 13.18 (13.04-13.33) | 3.78 (3.75-3.81) | 2.41 (18 %) | 0.00 | 13.74 (13.71-13.77) | 16.7 / 30.4 / 37.3 / 60 | 78 (69-80) | 43 (32-45) (21) |
+|  | n | 6 | 59.4 (59.4-59.4) | 12.40 (12.33-12.43) | 3.13 (3.12-3.15) | 1.71 (14 %) | 1.55 | 13.16 (13.15-13.18) | 16.8 / 28.1 / 32.8 / 49 | 23 (19-32) | 10 (9-17) (0) |
+|  | nh | 3 | 59.3 (59.1-59.3) | 13.18 (13.04-13.22) | 3.79 (3.74-3.82) | 2.37 (18 %) | 0.00 | 13.75 (13.73-13.77) | 16.8 / 30.4 / 37.4 / 46 | 85 (77-85) | 42 (38-45) (22) |
+| Pokemon Snap (no input) | o | 6 | 38.5 (38.0-38.6) | 24.47 (24.22-24.75) | 10.55 (10.46-10.80) | 8.56 (35 %) | 0.00 | 24.78 (24.66-25.14) | 27.5 / 37.3 / 45.2 / 72 | 162 (152-198) | 121 (116-124) (110) |
+|  | n | 6 | 44.2 (43.0-44.3) | 20.61 (20.43-21.30) | 7.32 (7.31-7.69) | 5.42 (26 %) | 5.22 | 20.93 (20.88-21.63) | 24.0 / 32.9 / 36.9 / 72 | 62 (53-93) | 23 (21-29) (16) |
+|  | nh | 3 | 37.2 (36.6-37.5) | 25.24 (25.17-25.60) | 11.34 (11.13-11.70) | 9.23 (37 %) | 0.00 | 25.86 (25.60-26.38) | 28.6 / 38.7 / 46.5 / 73 | 205 (175-215) | 124 (111-127) (118) |
+| Banjo-Kazooie | o | 3 | 59.0 (58.9-59.0) | 11.68 (11.65-11.77) | 2.67 (2.65-2.68) | 1.11 (10 %) | 0.00 | 12.30 (12.27-12.30) | 16.8 / 29.4 / 35.2 / 115 | 51 (51-53) | 22 (22-27) (2) |
+|  | n | 6 | 59.1 (59.0-59.1) | 11.39 (11.34-11.52) | 2.37 (2.36-2.39) | 0.71 (6 %) | 0.61 | 12.03 (12.01-12.06) | 16.8 / 27.7 / 33.1 / 115 | 26 (25-29) | 13 (12-19) (0) |
+| Zelda: Ocarina of Time | o | 3 | 59.4 (59.4-59.5) | 6.96 (6.87-13.15) | 2.06 (2.05-7.58) | 1.21 (18 %) | 0.00 | 7.82 (7.71-13.97) | 16.8 / 24.3 / 31.0 / 71 | 21 (0-22) | 17 (0-18) (4) |
+|  | n | 6 | 59.4 (59.4-59.4) | 6.40 (6.36-6.45) | 1.63 (1.60-1.66) | 0.75 (12 %) | 0.65 | 7.35 (7.31-7.37) | 16.8 / 23.2 / 29.2 / 60 | 4 (3-7) | 3 (3-4) (0) |
+| Super Mario 64 | o | 6 | 59.4 (59.4-59.4) | 8.45 (8.42-8.59) | 2.40 (2.37-2.44) | 1.86 (22 %) | 0.00 | 9.40 (9.36-9.42) | 16.8 / 22.1 / 29.8 / 72 | 6 (5-9) | 4 (4-6) (0) |
+|  | n | 6 | 59.4 (59.4-59.4) | 7.99 (7.87-8.05) | 1.80 (1.78-1.82) | 1.23 (15 %) | 1.10 | 8.88 (8.88-8.89) | 16.8 / 20.0 / 25.9 / 73 | 6 (5-7) | 5 (4-6) (0) |
+|  | nh | 3 | 59.4 (59.4-59.4) | 8.60 (8.42-8.63) | 2.36 (2.32-2.42) | 1.79 (21 %) | 0.00 | 9.38 (9.37-9.42) | 16.8 / 22.6 / 29.8 / 72 | 6 (5-7) | 5 (5-5) (0) |
+| Paper Mario | o | 3 | 59.4 (59.3-59.4) | 8.79 (8.68-8.94) | 3.05 (2.93-3.06) | 2.06 (23 %) | 0.00 | 9.63 (9.50-9.66) | 16.7 / 24.4 / 31.2 / 78 | 13 (11-15) | 8 (7-13) (0) |
+|  | n | 6 | 59.4 (59.3-59.4) | 8.16 (8.11-8.50) | 2.41 (2.36-2.44) | 1.38 (17 %) | 1.23 | 9.06 (9.02-9.09) | 16.8 / 20.6 / 31.6 / 74 | 9 (8-12) | 7 (6-9) (0) |
+
+RGDS+ (A55, `performance`, ~1.58 GHz real):
+
+| game | build | runs | fps | emu thread ms/frame (wall, excl. UpdateScreen) | of which RDP callbacks (parse + setup + waits) | SYNC_FULL wait ms/frame (share of emu thread) | helper ms/frame | process-thread CPU ms/frame | frame p50 / p95 / p99 / max ms | frames > 33.3 ms | frames > 36 ms (SYNC_FULL-dominated) |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|
+| Donkey Kong 64 | o | 3 | 60.0 (60.0-60.0) | 13.66 (13.46-14.13) | 3.53 (3.53-3.56) | 2.18 (16 %) | 0.00 | 12.61 (12.58-12.62) | 16.6 / 30.2 / 34.2 / 50 | 43 (33-57) | 16 (14-21) (1) |
+|  | n | 6 | 60.0 (59.9-60.0) | 13.62 (13.33-14.51) | 2.94 (2.89-2.98) | 1.55 (11 %) | 1.39 | 12.07 (12.04-12.11) | 16.6 / 30.2 / 33.4 / 49 | 31 (22-42) | 10 (8-14) (0) |
+| Pokemon Snap (no input) | o | 3 | 43.5 (43.4-43.7) | 21.86 (21.48-21.93) | 7.80 (7.66-7.84) | 5.87 (27 %) | 0.00 | 20.49 (20.41-20.59) | 24.4 / 34.0 / 37.6 / 73 | 93 (91-97) | 24 (22-24) (16) |
+|  | n | 6 | 46.9 (46.9-47.1) | 20.13 (19.78-20.35) | 6.11 (6.09-6.19) | 4.14 (21 %) | 3.99 | 18.79 (18.76-18.86) | 19.0 / 30.2 / 33.3 / 71 | 19 (17-21) | 7 (6-9) (2) |
+| Banjo-Kazooie | o | 3 | 59.6 (59.6-59.6) | 12.77 (12.67-13.81) | 2.38 (2.38-2.39) | 0.76 (6 %) | 0.00 | 11.47 (11.45-11.49) | 16.6 / 29.9 / 34.2 / 119 | 39 (35-42) | 19 (17-21) (0) |
+|  | n | 6 | 59.6 (59.6-59.7) | 13.23 (13.21-13.70) | 2.17 (2.16-2.19) | 0.52 (4 %) | 0.45 | 11.30 (11.29-11.31) | 16.6 / 30.0 / 33.5 / 117 | 34 (30-45) | 16 (15-20) (0) |
+| Zelda: Ocarina of Time | o | 8 | 59.9 (59.7-59.9) | 14.91 (14.50-15.32) | 1.38 (1.28-1.40) | 0.58 (4 %) | 0.00 | 6.68 (5.63-6.79) | 16.8 / 30.4 / 36.0 / 53 | 76 (9-88) | 32 (8-45) (0) |
+|  | n | 10 | 59.9 (59.9-60.0) | 14.91 (14.70-15.52) | 1.26 (1.24-1.27) | 0.45 (3 %) | 0.40 | 6.55 (6.50-6.58) | 16.8 / 31.1 / 36.8 / 52 | 85 (69-112) | 43 (27-54) (0) |
+| Super Mario 64 | o | 3 | 59.9 (59.9-59.9) | 13.78 (13.70-14.04) | 1.74 (1.74-1.75) | 1.15 (8 %) | 0.00 | 8.18 (8.17-8.21) | 16.6 / 29.5 / 31.9 / 78 | 23 (23-25) | 10 (8-10) (0) |
+|  | n | 6 | 59.9 (59.9-59.9) | 13.24 (13.03-13.82) | 1.42 (1.41-1.45) | 0.80 (6 %) | 0.74 | 7.86 (7.83-7.92) | 16.6 / 29.4 / 31.5 / 81 | 12 (11-14) | 5 (5-7) (0) |
+| Paper Mario | o | 3 | 59.9 (59.9-60.0) | 12.53 (10.98-12.81) | 2.32 (2.30-2.41) | 1.35 (11 %) | 0.00 | 8.40 (8.36-8.54) | 16.6 / 30.0 / 34.2 / 87 | 38 (32-45) | 19 (14-19) (0) |
+|  | n | 6 | 59.9 (59.9-60.0) | 12.81 (10.81-13.00) | 2.07 (2.02-2.11) | 1.05 (8 %) | 0.93 | 8.24 (8.09-8.26) | 16.6 / 29.6 / 32.4 / 73 | 22 (19-25) | 9 (8-11) (0) |
+
+* **Pokemon Snap, the throughput-bound case, 38.5 -> 44.2 fps (+15 %) on the A53, 43.5 -> 46.9 fps (+8 %) on the A55**; frames above 36 ms 121 -> 23 (A53) and 24 -> 7 (A55), p99 45.2 -> 36.9 ms and 37.6 -> 33.3 ms. The emulation thread renders 5.2 ms of every
+  frame on the A53 (4.0 ms on the A55) that it used to spend asleep; the process CPU time per frame falls by 15 % (24.8 -> 20.9 ms) because the workers idle less in their spin.
+* **Donkey Kong 64 on the A53: frames above 36 ms 43 -> 10 (the 21 SYNC_FULL-dominated ones -> 0), p99 37.3 -> 32.8 ms**; Banjo-Kazooie 22 -> 13 (p99 35.2 -> 33.1), Ocarina of Time 17 -> 3 (31.0 -> 29.2), Super Mario 64 and Paper Mario unchanged within the noise
+  (p95 / p99 slightly better). All the games that were at the 60 fps cap stay there; the SYNC_FULL wait falls by 29-38 % (the rest of it is the workers finishing the last classes) and the RDP callbacks of the emulation thread by 11-31 %.
+* **A55: no regression, small gains where there is anything to win** (Snap above; DK64 frames > 36 ms 16 -> 10, Banjo 19 -> 16, SM64 10 -> 5, Paper Mario 19 -> 9). Ocarina of Time on the A55 is the one row that does not follow: 32 (8-45) -> 43 (27-54) frames above 36 ms in 8 / 10 runs, with identical fps, p50, p95 (30.4 / 31.1 ms)
+  and a SYNC_FULL wait of only 0.5 ms/frame (3 %), i.e. there is nothing for the helper to win in that scripted run and the distributions of the runs overlap; it is listed as an open observation, not explained.
+* The helper-off runs of the A53 (`nh`) reproduce the old build in every column (DK64 hitches 42 against 43, Snap 124 against 121): the claiming protocol itself is free in game as in replay.
+
+The ten spikiest frames of the median-p99 run (A53, `n`; `o` below for comparison). F = swap-to-swap, E = emulation thread before UpdateScreen, cb = RDP callbacks, syncf = SYNC_FULL wait (helper rendering included), helper = time rendering as the helper, wkSum / wkMax = workers' busy time (sum / busiest),
+thr_cpu = emulation-thread CPU time of the interval (ms):
+
+Donkey Kong 64, new:
+
+```
+median-p99 run of Donkey_Kong_64 n: n.Donkey_Kong_64.2 (p99 32.9 ms)
+   VI       F       E   cb  syncf helper drain    vi present | wkSum wkMax  jobs prims thr_cpu
+ 2137    58.0    57.7  21.3   18.2   17.9   0.0   0.0     0.4 |  51.7  26.5   875   875    58.0
+ 3771    43.9    42.8   5.4    1.4    1.3   0.0   0.2     0.9 |  39.1  13.1  1243  1244    43.9
+ 2239    41.8    40.6   6.8    2.8    2.7   0.0   0.2     1.0 |  45.4  15.6  1448  1448    41.7
+ 3795    39.7    38.6   6.8    2.9    2.3   0.0   0.2     1.0 |  42.6  14.8  1159  1159    39.7
+ 3825    39.2    38.0  19.2   14.3    9.8   0.0   0.2     0.9 |  70.1  28.1  1289  1290    39.1
+ 1596    38.9    37.7  16.3   13.3    4.3   0.0   0.2     1.0 |  50.6  22.5   749   749    37.4
+ 1740    37.5    36.4  12.9    8.9    8.5   0.0   0.2     0.9 |  41.2  17.8  1183  1184    34.4
+ 2131    37.5    37.2   0.2    0.1    0.1   0.0   0.0     0.3 |   0.1   0.1     1     1    37.5
+ 2261    37.0    35.9   7.0    2.9    2.5   0.0   0.2     0.9 |  47.6  16.1  1427  1427    36.9
+ 2032    36.6    35.4  16.8   14.2    9.6   0.0   0.2     1.0 |  63.0  24.2   771   774    34.8
+```
+
+Donkey Kong 64, old:
+
+```
+median-p99 run of Donkey_Kong_64 o: o.Donkey_Kong_64.2 (p99 37.5 ms)
+   VI       F       E   cb  syncf helper drain    vi present | wkSum wkMax  jobs prims thr_cpu
+ 2137    59.7    59.3   8.5    5.6    0.0   0.0   0.0     0.4 |  41.9  14.1   875   875    45.3
+ 2239    54.2    53.1  18.4   13.1    0.0   0.0   0.2     0.9 |  60.0  28.5  1448  1448    51.7
+ 2131    51.6    51.3   0.2    0.1    0.0   0.0   0.0     0.3 |   0.2   0.1     1     1    37.4
+ 3771    46.9    45.8   6.4    2.6    0.0   0.0   0.2     1.0 |  45.2  15.2  1243  1244    46.4
+ 1699    45.2    44.1  15.8   12.7    0.0   0.0   0.2     0.9 |  53.9  24.9   880   883    44.4
+ 2052    44.0    42.9  24.5   22.2    0.0   0.0   0.2     0.9 |  71.1  33.3   725   725    42.8
+ 3865    43.3    42.2  21.3   16.8    0.0   0.0   0.2     1.0 |  48.9  17.2  1315  1315    40.5
+ 2489    41.7    40.6  19.8   15.9    0.0   0.0   0.2     0.9 |  66.3  26.4  1203  1203    37.1
+ 1806    41.2    40.1  22.7   20.7    0.0   0.0   0.2     1.0 |  57.8  29.3   588   588    41.2
+ 3795    41.0    39.9   7.3    3.5    0.0   0.0   0.2     0.9 |  44.8  15.5  1159  1159    40.7
+```
+
+Pokemon Snap (no input), new:
+
+```
+median-p99 run of Pokemon_Snap n: n.Pokemon_Snap.0 (p99 36.9 ms)
+   VI       F       E   cb  syncf helper drain    vi present | wkSum wkMax  jobs prims thr_cpu
+ 2714    72.8    71.6   0.9    0.0    0.0   0.0   0.2     1.0 |  15.9   5.4   102   102    69.6
+ 2113    44.0    42.8  14.2   11.1   10.5   0.0   0.2     1.0 |  90.6  34.9   732   732    31.9
+ 2097    41.2    39.9  21.8   17.3   14.8   0.0   0.2     1.0 | 104.3  36.5   736   736    37.9
+ 1621    40.9    39.7  24.0   21.4   14.5   0.0   0.2     1.0 |  80.6  35.9   536   536    39.1
+ 2144    40.7    39.4  20.8   17.9   12.8   0.0   0.2     1.1 |  97.2  35.7   732   732    38.8
+ 1602    39.4    38.3  23.2   19.1   13.1   0.0   0.2     0.9 |  63.2  24.5   964   964    33.6
+ 2180    39.3    38.1  22.0   19.2   12.9   0.0   0.2     1.0 |  79.6  27.5   635   635    39.1
+ 2509    39.3    38.1  14.5   11.3    7.3   0.0   0.2     1.0 |  81.7  29.5   715   715    31.2
+ 2129    39.1    37.9  20.8   16.7   16.3   0.0   0.2     1.0 |  81.2  32.6   732   732    37.7
+ 1561    38.9    37.7  22.4   17.5    9.0   0.0   0.2     1.0 |  78.8  32.0   959   959    37.1
+```
+
+Pokemon Snap (no input), old:
+
+```
+median-p99 run of Pokemon_Snap o: o.Pokemon_Snap.0 (p99 45.3 ms)
+   VI       F       E   cb  syncf helper drain    vi present | wkSum wkMax  jobs prims thr_cpu
+ 2714    70.4    69.2   1.0    0.0    0.0   0.0   0.2     1.0 |  15.4   5.2   102   102    70.2
+ 2123    57.7    56.6  40.1   37.4    0.0   0.0   0.2     0.9 | 116.8  53.1   732   732    47.2
+ 2098    57.7    56.6  39.1   34.6    0.0   0.0   0.2     0.9 | 120.4  53.2   736   736    47.4
+ 2126    57.1    56.0  39.1   36.3    0.0   0.0   0.2     0.9 | 105.3  42.2   732   732    47.7
+ 2140    54.6    53.5  35.3   32.5    0.0   0.0   0.2     1.0 | 120.7  48.8   732   732    47.3
+ 2218    52.1    50.9  35.2   32.8    0.0   0.0   0.2     1.0 | 105.0  46.6   666   666    46.3
+ 2210    50.8    49.7  34.1   31.7    0.0   0.0   0.2     0.9 |  89.9  34.4   665   665    45.7
+ 2112    48.3    47.1  30.2   27.5    0.0   0.0   0.2     1.0 | 108.3  43.5   732   732    47.1
+ 1628    47.8    46.6  32.0   27.9    0.0   0.0   0.2     1.0 |  95.9  42.7   528   528    44.3
+ 2154    47.2    46.1  28.4   25.8    0.0   0.0   0.2     1.0 | 102.8  42.7   639   639    45.4
+```
+
+The remaining spikes of the new build are the same saturated frames, shorter: the old Snap frames of 47-58 ms with a 25-37 ms SYNC_FULL wait and a busiest worker at 34-53 ms become 39-44 ms frames (wkMax 25-36 ms) in which the emulation thread renders 7-16 ms of the work itself;
+the one 72 ms frame (no gfx task, 70 ms of emulation-thread CPU) is the CPU/RSP side and is unchanged. The DK64 frames 2137 (58 ms, wkSum 52 ms) and 2239 are heavy enough that three workers and a helper still need 40+ ms.
+
+#### Not waiting at all: `DeferSync` (tried, removed)
+
+paraLLEl-RDP only submits the GPU work at `SYNC_FULL` and leaves it to the integration to wait, so the same idea was tried here: an opt-in `DeferSync` that raised the DP interrupt at `SYNC_FULL` without waiting for the workers (waiting only for the frame before) and made the VI wait only for the frames up to the last `SYNC_FULL`.
+It was removed again. The frame rate did not move (Pokemon Snap 44.2 -> 43.6 fps on the A53, 46.9 -> 47.0 on the A55, the other games sit at the cap): the emulation thread's wait left the `SYNC_FULL` but reappeared in the VI drain a few hundred microseconds of emulated time later,
+because a game swaps the buffer in the DP interrupt handler and the VI shows it at the next retrace, so in a throughput-bound game the workers are the bottleneck however the waiting is arranged. It was not exact either: nothing tells the plugin that the CPU or the RSP does not read the frame buffer or the Z buffer
+behind the interrupt (the core's frame-buffer hooks are off under the dynarec), and Ocarina of Time frames differed from the default build (frames 2400 and 2700 on both devices, 398 / 3671 and 464 / 3754 pixels). The helper gets most of the stall back with none of that risk.
+
+**Tried and left out.**
+
+| variant | outcome |
+|---|---|
+| the emulation thread as a fourth *static* owner (stripes `% (N + 1)`, rendered only at barriers) | not built: its quarter of the frame would start at the barrier, so the tail would be W/4 where it is now W/3 minus what the workers did while the parser parsed -- worse in the saturated frames |
+| the helper rendering between commands while the parser parses | not built: it delays the parser, which is the critical path of the frame |
+| a worker claiming all its idle home classes for a job in one go ("bundles", one `render_job` per job as before) | no stealing window: the classes of a busy worker are all busy until the job ends, the helper never finds an idle class; per-class tasks cost nothing measurable (`nh` = old) |
+| scanning the job ring for the next job with rows in a class instead of per-class queues | a class that is idle for long keeps a stale position; the ring wraps over the jobs it would read (aliasing: a newer job's mask taken for an old one). Per-class queues have no such state |
+| 3 or 4 classes per worker | replay 0.752 / 0.753 (A53), 0.796 / 0.801 (A55) of the old time against 0.753 / 0.788 with 2 |
+
 ### In-game frame rate
 
 | game (VI frames ending at) | M2 scalar | NEON | NEON + 1 worker | NEON + 2 | NEON + 3 |
@@ -1461,7 +1696,7 @@ src/parser.c          DP command list reader, command dispatch, state-setting co
 src/setup.c           primitive setup: triangle / texrect / fillrect -> canonical 44-word record -> per-primitive constants + walker record (setup_walk)
 src/walk.h            the edge walker for one row from the walker record (walk_row: NEON, walk_row_c: portable)
 src/raster.c          row loop (walk_row per owned row) and span -> pixel-batch builder (NEON: fixed-size ramps, edge-zone coverage; portable reference builder), worker row ownership
-src/mt.c              worker pool: job ring (walker record + constants), state / TMEM snapshots, hazards and barriers
+src/mt.c              worker pool: job ring (walker record + constants), per-class job queues and claiming, the emulation thread as a helper, state / TMEM snapshots, hazards and barriers
 src/tmem.c            TMEM model, LOAD_TILE/BLOCK/TLUT (word-wise fast path), texel readback
 src/framelog.c        FOIR_FRAMELOG per-frame binary record (-DFOIR_FRAMELOG builds only) (mmap), format in framelog.h; decoder tools/framelog.py
 src/kernels_scalar.c  scalar reference kernels (combiner, Z, blender, FB store, FILL, COPY)
@@ -1534,6 +1769,11 @@ python3 ../../tools/vitest.py ./foir-replay                           # interlac
   operands of the kernel's shape instead of writing a key (`foir_shape_apply`); the batch constants the operand table points at are copied into the fuzzer's batch (`foir_shape_export`).
 * `mtfuzz.py` random scenes (see above) now take half of their combiner / blender modes from the variant lists, so the
   variants run in the multi-threaded, row-ownership stress scenes too; it prints the share of specialised pixels it reached.
+* `mtfuzz.py --variants nohelper,g1,g3,g4` runs every scene also under the pool settings (`FOIR_HELPER`, `FOIR_MT_CLASSES`); `--stress` makes long scenes with hundreds of
+  order-sensitive primitives, many of them a single stripe class tall, a render state change in nearly every job, SYNC_FULLs, render-target switches and textures from the frame buffer; `--lag` makes scenes with deliberately unbalanced class loads
+  and more jobs / snapshots than the job ring and the state / TMEM snapshot rings hold (a Z-buffered picture whose pixels come from random iterations, so a job rendered from an overwritten snapshot or job slot shows), which is what catches a
+  wrong `mt_floor()` (see [the mutations](#the-emulation-thread-as-a-helper-and-the-sync_full-wait)). `make check` runs 24 `--stress` and 20 `--lag` scenes (qemu) next to the original 60 + 40 + 40; `neoncheck.py` adds the helper-off and 4-class
+  settings to every scene at the maximum thread count.
 * `regress.py` compares the scalar renderer with angrylion-rdp-plus (needs `make ref`).
 * The offline tools replay with the accuracy-preserving knob settings; `foir-replay --fast` uses the plugin
   defaults, `-t N` selects the worker count, `--scalar` the reference kernels, `--setup-only` skips the pixel stage.
@@ -1555,7 +1795,7 @@ pixels, primitives and skipped frames.
 `UpdateScreen` (= per VI frame) into a shared mmap of the file (no syscall per frame, survives SIGKILL; put it on a tmpfs on the
 handhelds): CLOCK_MONOTONIC enter / leave stamps, the time inside `ProcessRDPList` (total, longest call, of which the `SYNC_FULL` wait for the
 workers, all worker-pool barrier waits), the `UpdateScreen` stages (drain, VI convert, present = buffer swap incl. its vsync wait), commands /
-primitives / pixels / texture loads / worker jobs of the interval, the workers' busy time (sum and busiest, timed per job only while the log is on)
+primitives / pixels / texture loads / worker jobs of the interval, the workers' busy time (sum and busiest, timed per task only while the log is on), the time the emulation thread rendered classes as the helper (`helper_ns`, 104-byte records, format version 2)
 and the emulation thread's own CPU time, page faults and context switches (a frame whose wall time far exceeds its thread CPU time was blocked or
 preempted, not computing). `tools/framelog.py FILE` prints the frame-time distribution and the ten slowest frames with their breakdown (`--csv`
 for everything). Measured cost on the RG35XX SP (A53, 1512 MHz): see `test-output/a53sweep2/README.txt`.

@@ -5,6 +5,7 @@ For every scene it replays the recorded RDP commands with foir-replay
 
     reference:  --scalar            (scalar C kernels, parser thread only)
     candidates: default kernels     (NEON on aarch64) with 0, 1, 2 and 3 worker threads
+                pool settings       with the max thread count: no helper, 4 classes per worker
                 generic kernels     (--nospec: the per-state specialised variants off) inline and with 3 threads
     and, on top of that, the plugin-default knobs (--fast: RelaxedPrecision on, which the scalar kernels do not
     have): specialised against generic, inline and with 3 threads
@@ -118,6 +119,17 @@ def main():
                 os.remove(out)
                 if not cov and 'specialised pixels' in info:
                     cov = info.split('specialised pixels:')[1].strip().split('\n')[0]
+            if max(threads) > 0:
+                # the worker pool's settings: the emulation thread as a helper at its barriers (default, above), no helper, 3 / 4 stripe
+                # classes per worker
+                for tag, e in (('nohelper', {'FOIR_HELPER': '0'}), ('g4', {'FOIR_MT_CLASSES': '4'})):
+                    out = os.path.join(tmp, 'cand.rdram')
+                    replay(args, path, out, ['-t', str(max(threads))], env=e)
+                    ok = sha(out) == href
+                    line.append('+%dt/%s:%s' % (max(threads), tag, 'ok' if ok else 'DIFF'))
+                    if not ok:
+                        bad += 1
+                    os.remove(out)
             if kern == 'neon':
                 # the combiner dispatch: shape kernels only (FOIR_SPEC_COMB=shape: exact variants off, shape kernels where
                 # one exists, else generic), exact variants only, generic only

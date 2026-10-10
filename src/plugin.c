@@ -74,7 +74,7 @@ static double l_cpu_all_base, l_cpu_emu_base;      /* CPU time (user + system, m
 static bool l_fl_on;
 static double l_fl_cb_ms, l_fl_cbmax_ms, l_fl_syncfull_base;
 static unsigned l_fl_lists, l_fl_loads_base;
-static uint64_t l_fl_cmds_base, l_fl_jobs_base, l_fl_mtsync_base, l_fl_busy_base[8];
+static uint64_t l_fl_cmds_base, l_fl_jobs_base, l_fl_mtsync_base, l_fl_help_base, l_fl_busy_base[8];
 static uint32_t l_fl_prims_base, l_fl_pix_base;
 static uint64_t l_fl_cpu;
 static struct rusage l_fl_ru;                    /* emulation thread's rusage at the previous record */
@@ -164,6 +164,7 @@ EXPORT m64p_error CALL PluginStartup(m64p_dynlib_handle core, void *context, voi
     ConfigSetDefaultString(l_cfg_foir, "FrameSkip", "0", "0 = off, N = fixed frame skip, auto = skip rendering to hold full speed");
     ConfigSetDefaultBool(l_cfg_foir, "InterlaceHack", l_cfg.interlace_hack, "Render one field and line-double instead of full interlace logic");
     ConfigSetDefaultInt(l_cfg_foir, "Threads", l_cfg.threads, "Number of rendering worker threads: 0 = auto (cores - 1), -1 = render on the emulation thread");
+    ConfigSetDefaultBool(l_cfg_foir, "SyncHelper", l_cfg.mt_helper, "The emulation thread renders for the workers while it waits for them (exact)");
     ConfigSetDefaultBool(l_cfg_foir, "Specialize", l_cfg.specialize, "Use the precompiled per-state pixel kernels; False = generic NEON kernels only (a stale JIT= entry in the config file is ignored)");
     ConfigSetDefaultBool(l_cfg_foir, "NEON", l_cfg.neon, "Use the NEON kernels when built in; False = scalar reference kernels");
     ConfigSetDefaultBool(l_cfg_foir, "VSync", l_cfg.vsync, "Wait for vertical sync when presenting");
@@ -208,6 +209,7 @@ static void read_foir_section(struct foir_config *c)
     c->relaxed_precision = ConfigGetParamBool(l_cfg_foir, "RelaxedPrecision") != 0;
     c->interlace_hack = ConfigGetParamBool(l_cfg_foir, "InterlaceHack") != 0;
     c->threads = ConfigGetParamInt(l_cfg_foir, "Threads");
+    c->mt_helper = ConfigGetParamBool(l_cfg_foir, "SyncHelper") != 0;
     c->specialize = ConfigGetParamBool(l_cfg_foir, "Specialize") != 0;
     c->neon = ConfigGetParamBool(l_cfg_foir, "NEON") != 0;
     c->vsync = ConfigGetParamBool(l_cfg_foir, "VSync") != 0;
@@ -230,6 +232,8 @@ static void load_config(void)
     /* environment overrides for testing and benchmarking */
     const char *ne = getenv("FOIR_NEON");
     if (ne && *ne) l_cfg.neon = atoi(ne) != 0;
+    const char *he = getenv("FOIR_HELPER");
+    if (he && *he) l_cfg.mt_helper = atoi(he) != 0;
     /* FOIR_KNOBS=exact (debug / testing): the accuracy-preserving setting of every speed knob */
     const char *ke = getenv("FOIR_KNOBS");
     if (ke && !strcmp(ke, "exact")) {
@@ -282,9 +286,9 @@ EXPORT int CALL RomOpen(void)
         mt_prof_enable(&l_rdp);
         getrusage(RUSAGE_THREAD, &l_fl_ru);
         { struct timespec tc; if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &tc) == 0) l_fl_cpu = (uint64_t)tc.tv_sec * 1000000000ull + (uint64_t)tc.tv_nsec; }
-        uint64_t jobs = 0, sy = 0;
-        mt_prof_read(&l_rdp, l_fl_busy_base, &jobs, &sy);
-        l_fl_jobs_base = jobs; l_fl_mtsync_base = sy;
+        uint64_t jobs = 0, sy = 0, hp = 0;
+        mt_prof_read(&l_rdp, l_fl_busy_base, &jobs, &sy, &hp);
+        l_fl_jobs_base = jobs; l_fl_mtsync_base = sy; l_fl_help_base = hp;
         foir_log(FOIR_LOG_INFO, "FOIR_FRAMELOG: per-frame record to %s", getenv("FOIR_FRAMELOG"));
     }
 #endif
@@ -347,8 +351,8 @@ static void fl_record(double ts, double ts1, double t0, double t1, double t2, co
     (void)v;
     struct fl_rec r;
     memset(&r, 0, sizeof r);
-    uint64_t busy[8] = { 0 }, jobs = 0, sy = 0, bsum = 0, bmax = 0;
-    int nw = mt_prof_read(&l_rdp, busy, &jobs, &sy);
+    uint64_t busy[8] = { 0 }, jobs = 0, sy = 0, hp = 0, bsum = 0, bmax = 0;
+    int nw = mt_prof_read(&l_rdp, busy, &jobs, &sy, &hp);
     for (int i = 0; i < nw; i++) {
         uint64_t d = busy[i] - l_fl_busy_base[i];
         l_fl_busy_base[i] = busy[i];
@@ -362,6 +366,7 @@ static void fl_record(double ts, double ts1, double t0, double t1, double t2, co
     r.cb_ns = sat32(MS_TO_NS(l_fl_cb_ms)); r.cb_max_ns = sat32(MS_TO_NS(l_fl_cbmax_ms));
     r.syncfull_ns = sat32(MS_TO_NS(l_rdp.sync_wait_ms - l_fl_syncfull_base));
     r.mtsync_ns = sat32(sy - l_fl_mtsync_base);
+    r.helper_ns = sat32(hp - l_fl_help_base);
     r.drain_ns = sat32(MS_TO_NS(ts1 - ts)); r.vi_ns = sat32(MS_TO_NS(t1 - t0)); r.present_ns = sat32(MS_TO_NS(t2 - t1));
     r.cmds = (uint32_t)(l_rdp.frame_cmds - l_fl_cmds_base);
     r.prims = l_rdp.stat_prims - l_fl_prims_base;
@@ -387,7 +392,7 @@ static void fl_record(double ts, double ts1, double t0, double t1, double t2, co
     }
     framelog_put(&r);
     l_fl_cb_ms = l_fl_cbmax_ms = 0; l_fl_lists = 0;
-    l_fl_syncfull_base = l_rdp.sync_wait_ms; l_fl_mtsync_base = sy; l_fl_jobs_base = jobs;
+    l_fl_syncfull_base = l_rdp.sync_wait_ms; l_fl_mtsync_base = sy; l_fl_help_base = hp; l_fl_jobs_base = jobs;
     l_fl_cmds_base = l_rdp.frame_cmds; l_fl_prims_base = l_rdp.stat_prims; l_fl_pix_base = pix; l_fl_loads_base = l_rdp.stat_loads;
 }
 #endif

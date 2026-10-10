@@ -40,7 +40,7 @@ bool framelog_open(void)
     struct timespec t, rt;
     clock_gettime(CLOCK_MONOTONIC, &t); clock_gettime(CLOCK_REALTIME, &rt);
     memcpy(l_hdr->magic, FL_MAGIC, 8);
-    l_hdr->rec_bytes = sizeof(struct fl_rec); l_hdr->capacity = cap; l_hdr->version = 1;
+    l_hdr->rec_bytes = sizeof(struct fl_rec); l_hdr->capacity = cap; l_hdr->version = 2;
     l_hdr->t0_ns = (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
     l_hdr->realtime_ns = (uint64_t)rt.tv_sec * 1000000000ull + (uint64_t)rt.tv_nsec;
     return true;

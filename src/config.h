@@ -14,6 +14,7 @@ struct foir_config {
     int  frame_skip;         /* FrameSkip: 0 = off, N = fixed, -1 = auto */
     bool interlace_hack;     /* InterlaceHack */
     int  threads;            /* Threads (0 = auto) */
+    bool mt_helper;          /* SyncHelper: the emulation thread renders for the workers while it waits at a barrier */
     bool specialize;         /* Specialize: use the precompiled per-state kernel variants (M3) */
     bool neon;               /* kernel selection: use NEON kernels when compiled in */
     bool debug_nopixels;     /* parse and set up primitives but skip the pixel pipeline (profiling) */
