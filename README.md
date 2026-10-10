@@ -1597,6 +1597,6 @@ for everything). Measured cost on the RG35XX SP (A53, 1512 MHz): see `test-outpu
 
 ## License
 
-**GPLv3 or later** (like the sibling plugins; foir no longer needs GNU Lightning, whose LGPLv3+ was the original reason for GPLv3+).
+**GPLv3 or later** (like the sibling plugins; foir no longer needs GNU Lightning, whose LGPLv3+ was the original reason for GPLv3+); full text in `LICENSE`. Exception: `src/foir_suxty.h`, the interface header shared with the GPLv2+ suxty plugin, is GPL-2.0-or-later.
 
 [angrylion-rdp-plus]: https://github.com/ata4/angrylion-rdp-plus

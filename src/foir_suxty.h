@@ -19,7 +19,7 @@
  * live options while the menu is open.  Once the ROM is open a call from another thread is refused (FOIR_SUXTY_E_THREAD).
  *
  * Copyright (C) 2026 foir contributors
- * SPDX-License-Identifier: GPL-3.0-or-later
+ * SPDX-License-Identifier: GPL-2.0-or-later
  */
 #ifndef FOIR_SUXTY_H
 #define FOIR_SUXTY_H
