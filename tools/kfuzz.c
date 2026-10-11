@@ -323,7 +323,7 @@ static int cmp_edges(const struct rdp *ra, const struct rdp *rb)
 }
 
 static int g_bad;
-static long g_checks;
+static long g_checks, g_early_batches;
 
 #define CHK(name, a, bb, i) do { if ((long)(a) != (long)(bb)) { if (g_bad < 12) fprintf(stderr, "  MISMATCH %s lane %d: neon=%ld scalar=%ld\n", name, i, (long)(a), (long)(bb)); g_bad++; } g_checks++; } while (0)
 
@@ -422,7 +422,7 @@ static int run_one(uint64_t seed, int mask, int verbose, long iter)
             rdp_update_derived(&ra);
         }
     }
-    struct px_batch *bref = malloc(sizeof(*bref)), *bn = malloc(sizeof(*bn)), *pre = malloc(sizeof(*pre));
+    struct px_batch *bref = malloc(sizeof(*bref)), *bn = malloc(sizeof(*bn)), *pre = malloc(sizeof(*pre)), *early = malloc(sizeof(*early));
     random_batch(&ra, bref, tilenum);
     shape_lod_chain(&ra);
     const struct foir_kernels *refk = &foir_kernels_scalar;
@@ -450,7 +450,7 @@ static int run_one(uint64_t seed, int mask, int verbose, long iter)
                     foir_spec_describe(vstage, &want->k, b2, sizeof b2));
             if (vstage == SPEC_SHAPE) dump_state(&ra);
             g_bad++;
-            free(rb.hidden); rdp_destroy(&ra); free(bref); free(bn); free(pre);
+            free(rb.hidden); rdp_destroy(&ra); free(bref); free(bn); free(pre); free(early);
             return 1;
         }
         g_spec_hits[vstage][vidx]++;
@@ -465,6 +465,7 @@ static int run_one(uint64_t seed, int mask, int verbose, long iter)
     int bad_before = g_bad;
     int n = bref->n;
     const char *stage = "";
+    memcpy(early, bref, sizeof(*early));        /* the batch as the builder leaves it, for the early-Z check below */
 
     if (ra.pf.need_tex) {
         memcpy(pre, bref, sizeof(*pre));
@@ -534,6 +535,46 @@ static int run_one(uint64_t seed, int mask, int verbose, long iter)
         if (g_bad != bad_before) { fprintf(stderr, "seed %llu: %s\n", (unsigned long long)seed, stage); dump_state(&ra); goto done; }
     }
 
+    /* early Z: in a state where om_early_z_safe() holds, the Z compare of the batch BEFORE texture / combine (what batch_flush runs first) must give what the
+     * compare after them gave. Both kernels sets are checked, so the rule itself (not a kernel) is under test. */
+    if ((mask & 4) && om_early_z_safe(&ra.om)) {
+        stage = "early zcmp";
+        memcpy(bn, early, sizeof(*bn));
+        nk->zcmp(&rb, bn);
+        memcpy(pre, early, sizeof(*pre));
+        refk->zcmp(&ra, pre);
+        for (int k2 = 0; k2 < 2; k2++) {
+            const struct px_batch *e = k2 ? pre : bn;
+            for (int i = 0; i < n; i++) {
+                CHK("early wen", !!e->wen[i], !!bref->wen[i], i);
+                CHK("early blend_en", !!e->blend_en[i], !!bref->blend_en[i], i);
+                CHK("early prewrap", !!e->prewrap[i], !!bref->prewrap[i], i);
+                CHK("early memcvg", e->memcvg[i], bref->memcvg[i], i);
+                CHK("early cvg", e->cvg[i], bref->cvg[i], i);
+                CHK("early sz", e->sz[i], bref->sz[i], i);
+                if (ra.om.real_blendshifts) {
+                    CHK("early blshifta", e->blshifta[i], bref->blshifta[i], i);
+                    CHK("early blshiftb", e->blshiftb[i], bref->blshiftb[i], i);
+                }
+                for (int c = 0; c < 4; c++) CHK("early mem", e->mem[c][i], bref->mem[c][i], i);
+            }
+        }
+        /* the combiner run after the early compare must see what it saw before it: coverage rewritten by the compare (interpenetrating Z) would change it */
+        memcpy(bn->tex0, bref->tex0, sizeof(bn->tex0)); memcpy(bn->tex1, bref->tex1, sizeof(bn->tex1)); memcpy(bn->tex0n, bref->tex0n, sizeof(bn->tex0n));
+        memcpy(bn->lodfrac, bref->lodfrac, sizeof(bn->lodfrac));
+        if (g_spec_mode) foir_shape_export(&rb, bn);
+        nk->combine(&rb, bn);
+        for (int i = 0; i < n; i++) {
+            for (int c = 0; c < 4; c++) CHK("early pixel", bn->pixel[c][i], bref->pixel[c][i], i);
+            CHK("early acalpha", bn->acalpha[i], bref->acalpha[i], i);
+            CHK("early shade_alpha", bn->shade_alpha[i], bref->shade_alpha[i], i);
+            CHK("early cdith", bn->cdith[i], bref->cdith[i], i);
+            CHK("early adith", bn->adith[i], bref->adith[i], i);
+        }
+        g_early_batches++;
+        if (g_bad != bad_before) { fprintf(stderr, "seed %llu: %s\n", (unsigned long long)seed, stage); dump_state(&ra); goto done; }
+    }
+
     memcpy(pre, bref, sizeof(*pre));
     refk->blend(&ra, bref);
     if (mask & 8) {
@@ -576,7 +617,7 @@ done:
     free(rb.hidden);
     free(hid_save);
     rdp_destroy(&ra);
-    free(bref); free(bn); free(pre);
+    free(bref); free(bn); free(pre); free(early);
     return g_bad != bad_before;
 }
 
@@ -947,6 +988,7 @@ int main(int argc, char **argv)
             printf("kfuzz LOD: lanes by LOD fraction: 0xff %ld, 0 %ld, 1..0xfe %ld, >= 0x100 %ld\n", g_lod_lf[0], g_lod_lf[1], g_lod_lf[2], g_lod_lf[3]);
         }
     }
+    if (g_early_batches) printf("kfuzz early Z: %ld batches in early-Z-safe states: Z compare before texture / combine gives the same Z result and combiner output as after\n", g_early_batches);
     printf("kfuzz: %ld iterations, %ld failing, %ld value checks\n", iters, failed, g_checks);
     return failed ? 1 : 0;
 }

@@ -11,6 +11,7 @@ void foir_config_defaults(struct foir_config *c)
     c->mt_helper = true;
     c->specialize = true;
     c->neon = true;
+    c->early_z = true;
     c->vsync = true;
     c->filter = false;
     c->widescreen = false;

@@ -116,6 +116,7 @@ void rdp_update_derived(struct rdp *r)
     pf->need_t1 = (uint8_t)(two && (refs1[0] || refs0[1]));
     pf->need_z = (uint8_t)(om->z_compare_en || om->z_update_en);
     pf->need_cz = pf->need_z;
+    pf->early_z = (uint8_t)(r->cfg.early_z && om_early_z_safe(om));
     pf->rng = (uint8_t)(noise || om->alpha_dither_sel == 2 || om->rgb_dither_sel == 2 || om->dither_alpha_en);
     r->state_dirty = false;
     r->rs_dirty = true;
@@ -396,6 +397,13 @@ void rdp_init(struct rdp *r, const struct foir_config *cfg)
                 r->spec_ok_mask &= ~(SPEC_BIT(SPEC_COMB) | SPEC_BIT(SPEC_BLEND));
             }
         }
+    }
+    /* early Z: on by default for the NEON kernels only (the scalar kernels are the reference and keep the original order, so the tests compare the two orders);
+     * FOIR_EARLYZ=0 off, 1 default, 2 on for the scalar kernels as well (testing) */
+    {
+        const char *e = getenv("FOIR_EARLYZ");
+        const int mode = (e && *e) ? atoi(e) : 1;
+        r->cfg.early_z = r->cfg.early_z && mode != 0 && (mode == 2 || r->kbase.zcmp != foir_kernels_scalar.zcmp);
     }
     foir_spec_init();
     r->ktab = r->kbase;

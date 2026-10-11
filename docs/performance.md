@@ -221,6 +221,43 @@ Both devices, rsp-hle + parallel-rsp fallback, `Threads = 3`, scripted input (Po
 
 On Pokemon Snap the emulation thread renders about 5.2 ms of every frame on the A53 (4.0 ms on the A55) that it used to spend asleep, and process CPU falls by 15 % because the workers idle less in their spin. The SYNC_FULL wait falls by 29-38 % in the other games. One open observation: Ocarina of Time on the RK3566 shows 32 -> 43 frames above 36 ms with identical fps and p50 / p95, a SYNC_FULL wait of only 0.5 ms (nothing for the helper to win in that scripted run), and overlapping run distributions; it was not explained. The remaining spikes are the same saturated frames, shorter: frames in which the busy times of the three workers add up to 50 ms or more still take 40+ ms even with the helper.
 
+## Early Z
+
+Batch-skip early Z ([design.md](design.md#pixel-stages)): the Z compare runs first where it cannot depend on the combiner, and a batch in which every lane failed Z skips texture, combine, blend and store. Output-neutral: RDRAM identical to the previous build on the 8 Pokemon Snap dumps below and on the 18 game dumps, NEON and scalar, 0 to 3 workers. Pokemon Snap's attract demo has a camera shot (VI frames about 1100-1340) with 11 layers per pixel on average, of which 58 % of the processed pixels fail Z.
+
+Replay, `--fast`, ms per run (pinned clocks, medians of 3 rounds of `-n 5`, old and new alternated, spread under 2 % on one thread). Both builds from `toolchains/rg35xxsp`, the same binaries on both devices:
+
+| Snap dump | RK3566 1 thread | | RK3566 3 workers | | H700 1 thread | | H700 3 workers | |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| | old -> new | change | old -> new | change | old -> new | change | old -> new | change |
+| 1101 (camera) | 110.3 -> 94.2 | -14.6 % | 30.9 -> 26.0 | -15.8 % | 115.8 -> 98.0 | -15.4 % | 31.7 -> 27.4 | -13.7 % |
+| 1201 (camera) | 107.9 -> 92.7 | -14.1 % | 29.2 -> 25.3 | -13.3 % | 114.2 -> 96.4 | -15.6 % | 31.9 -> 26.7 | -16.0 % |
+| 1301 (camera) | 94.5 -> 80.7 | -14.6 % | 25.8 -> 22.4 | -13.4 % | 99.9 -> 84.4 | -15.5 % | 27.4 -> 23.7 | -13.3 % |
+| 2101 (foliage) | 88.5 -> 84.6 | -4.4 % | 24.1 -> 23.3 | -3.3 % | 93.3 -> 88.5 | -5.1 % | 26.0 -> 24.7 | -5.0 % |
+| 701 | 66.6 -> 61.6 | -7.5 % | 18.4 -> 17.5 | -4.8 % | 68.5 -> 64.3 | -6.0 % | 20.3 -> 18.3 | -9.5 % |
+| 1701 (foliage) | 65.2 -> 61.1 | -6.4 % | 18.2 -> 17.3 | -5.3 % | 68.9 -> 63.9 | -7.2 % | 19.4 -> 18.8 | -2.9 % |
+| 3702 | 53.1 -> 50.2 | -5.3 % | 15.5 -> 15.1 | -2.6 % | 55.4 -> 52.5 | -5.4 % | 17.5 -> 16.2 | -7.3 % |
+| 4100 (no Z compare) | 9.31 -> 9.29 | -0.2 % | 3.19 -> 3.17 | -0.5 % | 9.90 -> 9.88 | -0.2 % | 3.13 -> 3.09 | -1.2 % |
+
+The 18 game dumps of `test-data` (Banjo-Kazooie, Donkey Kong 64, Super Mario 64, Paper Mario, Star Fox 64, GoldenEye, Rocket, Hydro Thunder, ...; one thread): geometric mean new / old 0.982 (RK3566) and 0.984 (H700); Rocket Robot on Wheels -19.6 % / -18.3 %, Donkey Kong 64 (2400) -5.2 % / -3.3 %, Pokemon Snap (300) -3.1 % / -3.2 %, GoldenEye (3 workers) -9 % on the RK3566; the others between 1.6 % faster and 1.3 % slower, which is about the noise (the slower ones are scenes with little Z fail: Super Mario 64, Star Fox 64, Paper Mario, F-Zero X, Banjo-Kazooie 3000). With three workers the geometric mean is 0.985 / 0.992. The prototype of this change that was measured first (same order, test build) took 92.7 ms on frame 1101 against 94.2 ms here; not explained (the stage order and the live-lane test are the same; code layout is the guess). Switching the batch-build prefetch off gives the same gain (109.3 -> 93.0 ms), so the earlier `zcmp` does not lose the prefetch's benefit.
+
+In game, Pokemon Snap attract demo with no input, `Core[RandomizeInterrupt]=False`, rsp-hle + parallel-rsp, 3 workers, FOIR_FRAMELOG on in both builds, pinned clocks (RK3566 performance governor, H700 Performance mode 1512 MHz), old and new alternated in sessions of three 75 s runs, 3 runs of each. Frame time is swap to swap; zoom window = VI frames [1100, 1340); median over the 3 runs (min-max):
+
+| | p50 | p95 | p99 | max | > 16.7 ms | > 33.3 ms | fps | worker busy / SYNC_FULL wait |
+|---|---|---|---|---|---|---|---|---|
+| RK3566 zoom, old | 35.4 (35.3-35.5) | 39.7 (37.4-40.3) | 42.5 (41.8-46.6) | 46.5 (45.8-47.8) | 100 % | 65 % (62-71) | 28.7 | 90.8 / 15.6 ms |
+| RK3566 zoom, new | 32.0 (31.8-32.0) | 36.0 (35.7-36.3) | 38.7 (38.6-38.9) | 42.1 (40.7-42.3) | 100 % | 10 % (10-15) | 31.7 | 80.9 / 12.1 ms |
+| RK3566 whole run, old | 19.3 (19.0-19.4) | 35.1 (35.1-35.2) | 36.5 (36.4-37.1) | 204.5 (boot) | 74 % | 6 % | 46.0 | 44.5 / 5.1 ms |
+| RK3566 whole run, new | 19.2 (19.1-19.3) | 32.0 (31.8-32.0) | 34.5 (34.3-34.6) | 204.9 (boot) | 79 % | 1 % | 47.4 | 42.8 / 4.4 ms |
+| H700 zoom, old | 37.3 (37.1-37.3) | 42.9 (42.5-42.9) | 47.8 (46.2-48.8) | 50.7 (49.7-51.9) | 100 % | 99 % (97-100) | 27.1 | 93.5 / 17.6 ms |
+| H700 zoom, new | 33.7 (33.6-34.0) | 38.2 (38.0-38.4) | 42.3 (41.2-43.6) | 48.8 (44.7-50.1) | 100 % | 56 % (55-60) | 29.9 | 83.4 / 14.2 ms |
+| H700 whole run, old | 21.3 (21.3-21.4) | 37.3 (37.3-37.4) | 39.6 (39.5-40.4) | 204.9 (boot) | 87 % | 10 % | 43.6 | 46.1 / 6.2 ms |
+| H700 whole run, new | 20.0 (19.9-20.2) | 33.9 (33.8-34.1) | 36.3 (36.1-36.3) | 204.0 (boot) | 88 % | 6 % | 45.2 | 43.8 / 5.3 ms |
+
+The whole run is the first 75 s (VI frames 100 to 3440 old / 3540 new on the RK3566, 3260 / 3380 on the H700: the new build gets further in the same time, so the two windows differ by about 3 % at the end); its maximum is the boot frame 137, then frame 2714 (a scene change with no RDP work, 70 ms in both builds). The ten slowest frames of the zoom window are all RDP-bound in both builds (`SYNC_FULL` wait 8-32 ms, workers busy 90-125 ms summed); the slowest new frame is 42.3 ms (RK3566) / 50.1 ms (H700) against 47.8 / 51.9 ms. The camera shot moves from "mostly above 30 fps pacing" to "mostly just below the 33.3 ms limit" on the RK3566 (65 % -> 10 % of the frames above it), and from 99 % to 56 % on the H700; it does not reach 60 fps.
+
+Other games (Super Mario 64, Banjo-Kazooie, Donkey Kong 64; scripted input, 50 s, frames from 1440; 2 runs each on the RK3566, 1 on the H700) are at their 60 fps cap in both builds (59.3-60.0 fps, p50 16.6 ms); the summed worker busy time is lower in the new build (SM64 9.9 -> 9.8 ms, Banjo-Kazooie 16.2 -> 15.8, Donkey Kong 64 19.1 -> 18.3 on the RK3566; 10.0 -> 9.8, 16.8 -> 16.3, 19.7 -> 18.7 on the H700). The upper percentiles of frame time at the cap shift in Donkey Kong 64 and Banjo-Kazooie on the RK3566 (p95 26.2 -> 30.4 and 30.4 -> 31.3 ms in both repeats, mean frame time unchanged at 16.65-16.88 ms); with vsync-locked pacing they follow the phase between the emulation thread and the swap more than the work, and the work (busy time, emulation-thread CPU 12.3 / 12.2 ms) did not rise. Not understood beyond that.
+
 ## Specialisation coverage
 
 Share of pixels per stage that ran in a specialised variant (statistics build, 184 captured 60-frame windows of 62 games, three windows of a game summed, mean over the games; the variant lists were made from the same statistics, so "after" is in-sample):
@@ -267,4 +304,4 @@ Each of these was built and measured with the same method; differences below abo
 - **Edge walker:** the portable C walker on aarch64 (+1 % on one thread, +2 % with three workers: jumping by multiplication in scalar code costs 190-320 ns a row on the A55), gathering rows into a worker-local span array first (+3.8 %), decoding the 44-word record on the workers (upper bound 2-8 % of the emulation thread's remaining RDP time, in exchange for decoding every primitive three times).
 - **LOD:** table lookups of the divide as lane loads (0 to +1 %), keeping the old divide for non-LOD kernels (+1.5 to +5 %), a vector reciprocal in place of the 128 KB divide table (needs 12 table registers), a NEON merge of mixed-tile groups (0.4-7 % of the groups).
 - **Helper and pool:** the emulation thread as a fourth static owner (its share would start at the barrier), the helper rendering while the parser parses (delays the critical path), a worker claiming all its classes at once (no stealing window), scanning the job ring instead of per-class queues (stale positions alias after wrap), three or four classes per worker (0.752 / 0.753 against 0.753 on the A53), and `DeferSync` ([design.md](design.md#threading)).
-- **Early Z (skipping texture / combiner for lanes the Z test rejected)** and a faster delta-Z path: at most 3-4 % in the best scenes, roughly 4 % of SM64's time respectively.
+- **A faster delta-Z path:** roughly 4 % of SM64's time. (Early Z, rejected here at first at 3-4 % in the best scenes, came back as the batch skip above, once Pokemon Snap's camera shot showed 58 % of its pixels failing Z.)

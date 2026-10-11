@@ -77,6 +77,9 @@ int main(int argc, char **argv)
         rdp_init(&r, &cfg);
         rdp_attach_memory(&r, rdram, h.rdram_size);
         rdp_start_workers(&r, threads > 0 ? threads : 0);
+#ifdef FOIR_OVERDRAW
+        od_reset(&r, h.vi[1]);
+#endif
         const uint32_t *p = cmds;
         double t0 = now_ms();
         for (uint32_t i = 0; i < h.ncmds; i++) {
@@ -118,6 +121,9 @@ int main(int argc, char **argv)
                 all > 0 ? 100.0 * (double)(cov[1] - cov[6]) / all : 0.0, all > 0 ? 100.0 * (double)cov[6] / all : 0.0,
                 all > 0 ? 100.0 * (double)(cov[5] - cov[1]) / all : 0.0);
     }
+#ifdef FOIR_OVERDRAW
+    { extern void od_report(FILE *); od_report(stderr); }
+#endif
 #ifdef FOIR_STAGETIME
     if (repeats > 0) {
         uint64_t freq, a, b2, sum = 0;

@@ -209,6 +209,13 @@ struct px_batch {
     ALIGN16 int16_t kc[SK_NKC][FOIR_LANES];     /* splatted constants (PRIM, ENV, K4, ...) in the extended form of their use */
 };
 
+/* The Z compare can run before texture / combine: it reads the batch's coverage, interpolated Z and the Z / colour buffers; the combiner rewrites the coverage
+ * only for cvg*alpha and the Z compare rewrites it only in the interpenetrating mode, and the compare result (wen) is never an input of texture / combine. */
+FOIR_INLINE int om_early_z_safe(const struct other_modes *om)
+{
+    return om->z_compare_en && !om->cvg_times_alpha && om->z_mode != ZMODE_INTERPENETRATING;
+}
+
 struct pipe_flags {
     uint8_t need_tex;
     uint8_t next_texel;        /* second (or only) combiner cycle reads TEXEL1: needs tex0n */
@@ -219,6 +226,7 @@ struct pipe_flags {
     uint8_t need_z;
     uint8_t need_cz;
     uint8_t rng;
+    uint8_t early_z;           /* the Z compare may run before texture / combine and a batch with no live lane skip them (see batch_flush) */
 };
 
 /* Where each variable operand comes from, as byte offsets into the px_batch the kernel runs on (so the table is valid for any batch). */
@@ -355,6 +363,12 @@ void setup_fillrect(struct rdp *r, const uint32_t *cmd);
 /* false when no scanline is visible; otherwise rows start..end (inclusive, <= 1023) are the ones to render */
 bool setup_walk(struct rdp *r, const int32_t *ew, struct prim_walk *pw, int *start, int *end);
 
+#ifdef FOIR_OVERDRAW
+void od_reset(struct rdp *r, uint32_t vi_origin);
+void od_stages(struct rdp *r, struct px_batch *b);
+void od_fill(struct rdp *r, int y, int x0, int x1);
+void od_copy(struct rdp *r, int y, const struct span *sp);
+#endif
 void foir_stats_batch(const struct rdp *r, int npix);
 void foir_stats_flush(void);   /* write the statistics to $FOIR_STATE_STATS_FILE (if set) */
 

@@ -135,6 +135,7 @@ CORE_SOURCE = \
 	$(SRCDIR)/raster.c \
 	$(SRCDIR)/mt.c \
 	$(SRCDIR)/stats.c \
+	$(SRCDIR)/overdraw.c \
 	$(SRCDIR)/tmem.c \
 	$(SRCDIR)/kernels_scalar.c \
 	$(SRCDIR)/kernels_tex.c \

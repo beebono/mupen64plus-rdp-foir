@@ -120,8 +120,33 @@ static inline uint64_t stage_tick(void)
     __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v) :: "memory");
     return v;
 }
+#define ST_LAP(i) do { const uint64_t t_ = stage_tick(); r->st_tk[i] += t_ - st_t; st_t = t_; } while (0)
+#define ST_TEX() do { r->st_n[0] += r->pf.need_tex; ST_LAP(0); } while (0)
+#define ST_COMB() do {                                                                                                         \
+        const int kind_ = !(r->spec_mask & SPEC_BIT(SPEC_COMB)) ? 2 : r->spec_comb_shape ? 1 : 0;                              \
+        const uint64_t t_ = stage_tick();                                                                                      \
+        r->st_tk[5 + kind_] += t_ - st_t; st_t = t_; r->st_n[5 + kind_]++; r->st_cpix[kind_] += (uint64_t)b->n;                \
+    } while (0)
+#else
+#define ST_LAP(i) ((void)0)
+#define ST_TEX() ((void)0)
+#define ST_COMB() ((void)0)
 #endif
 
+/* any lane of the first b->n still write-enabled (lanes past n are not written by every kernel) */
+static inline bool batch_has_live_lane(const struct px_batch *b)
+{
+    uint64_t acc = 0;
+    int i = 0;
+    for (; i + 8 <= b->n; i += 8) { uint64_t w; memcpy(&w, &b->wen[i], sizeof w); acc |= w; }
+    for (; i < b->n; i++) acc |= b->wen[i];
+    return acc != 0;
+}
+
+/* Pixel stages of one batch: texture -> combine -> zcmp -> blend -> store.
+ * Early Z (pf.early_z, see rdp_update_derived): when the Z compare does not read the combiner's output it runs first, and a batch with no live lane (every
+ * lane failed Z) skips texture, combine, blend and store. Exact: texture and combine only write texel, colour and dither arrays of the batch, the Z compare
+ * only reads coverage / Z / the buffers, and blend and store already ignore lanes with wen = 0, so the live lanes see the same inputs in either order. */
 static void batch_flush(struct rdp *r, struct px_batch *b)
 {
     if (b->n <= 0) return;
@@ -129,29 +154,37 @@ static void batch_flush(struct rdp *r, struct px_batch *b)
 #ifdef FOIR_STATS
     foir_stats_batch(r, b->n);
 #endif
-#ifdef FOIR_STAGETIME
-    uint64_t t0 = stage_tick(), t1, t2;
-    if (r->pf.need_tex) k->texture(r, b);
-    t1 = stage_tick();
-    k->combine(r, b);
-    t2 = stage_tick();
-    r->st_tk[0] += t1 - t0; r->st_n[0] += r->pf.need_tex;
-    {
-        const int kind = !(r->spec_mask & SPEC_BIT(SPEC_COMB)) ? 2 : r->spec_comb_shape ? 1 : 0;
-        r->st_tk[5 + kind] += t2 - t1; r->st_n[5 + kind]++; r->st_cpix[kind] += (uint64_t)b->n;
-    }
-    k->zcmp(r, b);
-    t0 = stage_tick(); r->st_tk[2] += t0 - t2;
-    k->blend(r, b);
-    t1 = stage_tick(); r->st_tk[3] += t1 - t0;
-    k->store(r, b);
-    t2 = stage_tick(); r->st_tk[4] += t2 - t1;
+#ifdef FOIR_OVERDRAW
+    od_stages(r, b);       /* measurement build: always the original order */
 #else
-    if (r->pf.need_tex) k->texture(r, b);
-    k->combine(r, b);
-    k->zcmp(r, b);
-    k->blend(r, b);
-    k->store(r, b);
+#ifdef FOIR_STAGETIME
+    uint64_t st_t = stage_tick();
+#endif
+    if (r->pf.early_z) {
+        k->zcmp(r, b);
+        ST_LAP(2);
+        if (batch_has_live_lane(b)) {
+            if (r->pf.need_tex) k->texture(r, b);
+            ST_TEX();
+            k->combine(r, b);
+            ST_COMB();
+            k->blend(r, b);
+            ST_LAP(3);
+            k->store(r, b);
+            ST_LAP(4);
+        }
+    } else {
+        if (r->pf.need_tex) k->texture(r, b);
+        ST_TEX();
+        k->combine(r, b);
+        ST_COMB();
+        k->zcmp(r, b);
+        ST_LAP(2);
+        k->blend(r, b);
+        ST_LAP(3);
+        k->store(r, b);
+        ST_LAP(4);
+    }
 #endif
     r->stat_pixels += (uint32_t)b->n;
     r->cov_pix[5] += (uint64_t)b->n;
@@ -552,6 +585,9 @@ FOIR_INLINE void render_job(struct rdp *r, const struct span *rows, int jlo, con
             if (x1 >= r->fb_width) x1 = r->fb_width - 1;   /* no wrap into the next row (owned by another worker) */
             if (x1 < x0) continue;
             k->fill(r, y, x0, x1);
+#ifdef FOIR_OVERDRAW
+            od_fill(r, y, x0, x1);
+#endif
             r->stat_pixels += (uint32_t)(x1 - x0 + 1);   /* FILL/COPY do not go through batch_flush */
         }
         return;
@@ -561,6 +597,9 @@ FOIR_INLINE void render_job(struct rdp *r, const struct span *rows, int jlo, con
         for (int y = FIRST_ROW(start); y <= end; y = NEXT_ROW_IDX(y)) {
             NEXT_ROW();
             k->copy(r, y, sp, r->pc.flip);
+#ifdef FOIR_OVERDRAW
+            od_copy(r, y, sp);
+#endif
             r->stat_pixels += (uint32_t)(sp->lx < sp->rx ? sp->rx - sp->lx : sp->lx - sp->rx) + 1;
         }
         return;

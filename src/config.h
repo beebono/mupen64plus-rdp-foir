@@ -14,6 +14,7 @@ struct foir_config {
     bool mt_helper;
     bool specialize;
     bool neon;
+    bool early_z;            /* batch-skip early Z (NEON kernels); FOIR_EARLYZ overrides */
     bool debug_nopixels;
 
     bool vsync;

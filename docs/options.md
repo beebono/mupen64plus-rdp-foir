@@ -42,6 +42,7 @@ Always available:
 | `FOIR_SPEC_COMB=auto\|exact\|shape\|generic` | Combiner dispatch: exact variant, then shape kernel, then generic kernel (`auto`), or only some of them. |
 | `FOIR_SPEC_TEX=auto\|exact\|shape\|generic` | Texture dispatch: exact variant, then "any format" kernel, then generic kernel (`shape` = "any format" kernels only). |
 | `FOIR_KNOBS=exact` | `RelaxedPrecision`, `FrameSkip` and `InterlaceHack` at their accuracy-preserving setting. |
+| `FOIR_EARLYZ=0\|1\|2` | Early Z ([design.md](design.md#pixel-stages)): `0` = off (original stage order), `1` = on for the NEON kernels (default; the scalar reference always keeps the original order), `2` = on for the scalar kernels too (testing). Exact in every position; for A/B timing and bisecting. |
 | `FOIR_NEON_MASK=bits` | Which stages use NEON, one bit each: texture 0x01, combine 0x02, zcmp 0x04, blend 0x08, store 0x10, fill 0x20, copy 0x40 (default `0x7f`). A stage that is not NEON is not specialised either; `0x3f` = everything but the NEON COPY kernel. |
 | `FOIR_NEON_VERIFY=1` | Run every NEON stage next to the scalar kernel and count mismatches; use with `FOIR_KNOBS=exact` ([testing.md](testing.md#in-plugin-verifier)). |
 | `FOIR_MT_STATS=1` | Print worker-pool counters (jobs, syncs, ring waits, helper tasks) when the plugin shuts down. |
