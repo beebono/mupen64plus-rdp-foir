@@ -79,6 +79,45 @@ Geometric mean of the per-dump speed-ups over the previous renderer (medians of 
 - **Colour / Z buffer access** (inlined, bounds check per batch, prefetch) is 3-7 % of every 3D frame.
 - **The texture "any format" tier and the complete Z-compare list** are the big win for games the lists did not know (Pilotwings 64 1.33x, Earthworm Jim 3D 1.17x, Mario Golf 1.31x together with the COPY kernel, Turok and Toy Story 2 about 1.06x) and a small cost (+0.9 % geometric mean) on frames that were covered already.
 
+### Z compare
+
+Pokemon Snap's attract-demo zoom shot (VI frames 1100-1340: 11.4 colour pixels processed per pixel, 58 % of them failing the Z compare) spent 19 % of the renderer in `zcmp`; frame 1101 on one thread: texture 38.5, combine 10.3, **zcmp 20.8**, blend 4.7, store 7.5 of 112.3 ms. Profile of that frame (RK3566, `perf`, `--fast`): 276 instructions and 336 cycles per 8-pixel group (IPC 0.82), 1.2 L1D refills and 0.8 branch mispredictions per group, 7 k L2 refills per frame: instruction bound, not miss bound. By code: 47 % arithmetic and stores, 28 % in the colour / Z read functions (they hold the per-lane loops for the 26 % of groups that are not one run: 22 % straddle two scanlines, 3 % have more runs, 1 % end a batch), 13 % in the vector windows, 5 % the contiguity test, 4 % the hidden-bit resolve. With exact settings the opaque compare takes the fast path only when all eight lanes overflow coverage, which 46 % of the opaque groups of this frame do; the rest run the 4-lane delta-Z comparator (11 % of the cycles; 410 cycles per group). All `zcmp` pixels were already in specialised variants (100 % in every dump, no entries added to `spec_zcmp.def`). Dead groups (no lane passes): 35 % of the opaque and 78 % of the transparent groups of the frame.
+
+What changed (`kneon_mem.c`, bit-exact; [design.md](design.md#pixel-stages)): a group that is two runs of consecutive pixels (end of a scanline, start of the next) is read as two windows merged by a lane mask instead of per lane; the buffer reads are issued before the arithmetic; the Z decode is `Q = 0x40000 - oz` in 16-bit lanes (`sz + Q < 0x40000`, farthest depth is `zpx >= 0xfffc`); `sz` saturation is `min` / `compare` / `and`; the hidden bits and memory coverage are resolved in 8-bit lanes; the blender shifts are saturating byte subtractions; masks are reduced with a 64-bit move instead of `uminv`; the exact path for partially covered pixels and the decal mode run on eight lanes (`z_compare8`). Instructions per group 276 -> 212 (`--fast`), 331 -> 247 (exact); cycles 336 -> 279 and 410 -> 313.
+
+One-thread replay, medians of 5 alternating rounds, ms per run (A55: RK3566, `performance` governor; A53: H700, 1512 MHz):
+
+| dump | A55 `--fast`: zcmp | A55 exact: zcmp | A53 `--fast` | A53 exact |
+|---|---|---|---|---|
+| Snap 1101 (zoom) | 20.78 -> 17.22 (-17 %), total -1.7 % | 24.60 -> 19.60 (-20 %), total -3.6 % | 20.79 -> 16.59 (-20 %), total -4.0 % | 25.43 -> 18.84 (-26 %), total -5.9 % |
+| Snap 1301 (zoom) | 17.91 -> 14.80 (-17 %), total -2.9 % | 21.53 -> 16.83 (-22 %), total -3.7 % | 18.04 -> 14.28 (-21 %), total -3.9 % | 21.91 -> 16.28 (-26 %), total -5.7 % |
+| Snap 2101 (foliage) | 15.98 -> 13.24 (-17 %), total -3.8 % | 19.29 -> 14.96 (-22 %), total -5.3 % | 16.18 -> 12.82 (-21 %), total -4.4 % | 19.58 -> 14.65 (-25 %), total -5.3 % |
+| Snap 701 | 11.42 -> 9.24 (-19 %), total -3.6 % | 13.37 -> 10.54 (-21 %), total -3.6 % | 11.48 -> 9.05 (-21 %), total -4.1 % | 13.77 -> 10.18 (-26 %), total -5.0 % |
+| Banjo-Kazooie 450 | 5.38 -> 4.50 (-16 %), total -4.3 % | 6.12 -> 4.86 (-21 %), total -4.0 % | 5.30 -> 4.34 (-18 %), total -4.7 % | 6.27 -> 4.83 (-23 %), total -5.9 % |
+| Donkey Kong 64 2400 | 4.57 -> 4.04 (-12 %), total -1.9 % | 5.08 -> 4.34 (-15 %), total -2.2 % | | |
+| Super Mario 64 650 | 3.19 -> 2.84 (-11 %), total -2.4 % | 3.20 -> 2.87 (-11 %), total -1.6 % | 3.29 -> 2.99 (-9 %), total -1.8 % | 3.28 -> 2.99 (-9 %), total -2.1 % |
+| Paper Mario 900 | 1.02 -> 0.85 (-17 %), total -2.2 % | 1.05 -> 0.84 (-20 %), total -2.1 % | 1.03 -> 0.83 (-20 %), total -2.0 % | 1.04 -> 0.83 (-20 %), total -1.9 % |
+| Kirby 64 600 | 5.48 -> 4.59 (-16 %), total -3.0 % | 5.90 -> 4.95 (-16 %), total -3.6 % | | |
+| Star Fox 64 1000 | 2.81 -> 2.44 (-13 %), total -2.8 % | 2.82 -> 2.49 (-11 %), total -2.0 % | | |
+| **geometric mean** | zcmp **-14.6 %**, total -2.5 % (25 dumps) | zcmp **-16.5 %**, total -2.6 % | zcmp **-19.3 %**, total -3.8 % (12 dumps) | zcmp **-22.8 %**, total -4.7 % |
+
+The other stages are unchanged (frame 1101, `--fast`: texture 38.5 -> 39.0, combine 10.3 -> 10.5, blend 4.7 -> 4.8, store 7.5 -> 7.5 ms). GoldenEye 007 (zcmp 0.5 ms) and Hydro Thunder (COPY cycles, no Z) do not move.
+
+In game, Pokemon Snap attract demo without input, `Core[RandomizeInterrupt] = False`, three workers, `FOIR_FRAMELOG`, 240 s (RK3566, `performance`) / 270 s (H700, 1512 MHz, started from the PyUI hand-over, cooled to 52 C between runs), old / new alternated, three runs each; median of the three (range in brackets), frame time = swap to swap in ms:
+
+| | window | p50 | p95 | p99 | max | > 33.3 ms | mean busy (sum of workers) |
+|---|---|---|---|---|---|---|---|
+| RK3566 old | zoom [1100, 1340) | 35.9 (35.7-36.1) | 39.6 (39.3-40.2) | 43.7 (43.3-46.5) | 48.9 (48.6-51.0) | 69.6 % (68.3-70.0) | 92.1 |
+| RK3566 new | zoom | **34.9** (34.8-34.9) | **38.4** (38.1-39.3) | **41.7** (41.5-41.9) | 44.8 (43.2-49.6) | 65.4 % (60.8-71.7) | 89.4 |
+| RK3566 old | whole run (frames > 100) | 17.0 | 32.1 (31.9-32.2) | 36.8 (36.8-36.9) | 206.9 | 3.7 % (3.6-3.8) | 26.1 |
+| RK3566 new | whole run | 17.0 | **31.1** (31.0-31.4) | **35.8** (35.6-35.8) | 204.7 | 3.3 % (3.2-3.4) | 25.7 |
+| H700 old | zoom | 37.3 (37.2-37.3) | 42.2 (41.4-42.6) | 45.5 (45.0-46.5) | 49.8 (46.9-51.4) | 97.1 % (95.8-97.9) | 93.7 |
+| H700 new | zoom | **36.2** (36.1-36.4) | **41.2** (40.8-41.2) | **44.5** (44.1-46.0) | 48.0 (46.8-49.2) | 82.9 % (82.1-89.6) | 90.5 |
+| H700 old | whole run (frames 100-12000, the frame log's cap) | 16.8 | 32.8 | 38.2 | 203.8 | 4.4 % (4.3-4.5) | 24.6 |
+| H700 new | whole run | 16.8 | **31.9** | **37.2** | 203.6 | 4.0 % (4.0-4.1) | 23.9 |
+
+The shot stays over 33.3 ms in both builds: 2.7 ms off the 92 ms the workers spend (0.9 ms off the busiest worker's 31) buys about 1 ms of frame time. The spikes are the same frames before and after (boot frame 137 at 204 ms, scene changes 2714 / 5865-5868 / 6169 with the emulation thread busy and no RDP work; the zoom shot's worst frames are the 1.18 Mpix frames with 28 ms of `SYNC_FULL` wait). The share over 16.7 ms is not meaningful here (vsync-locked frames sit at 16.8-17.0 ms).
+
 ### Batch builder
 
 The batch builder (`raster_render_job`) was 17-23 % of foir's CPU time in game and instruction bound (about 800 cycles per span plus 17 per pixel). The edge-zone coverage and the fixed-size ramps ([design.md](design.md#batch-builder)) took the instructions per span in `raster_render_job` from 708-1414 to 498-996 and its branch mispredictions per span from 6.3-18 to 2.4-5.6.
@@ -305,3 +344,4 @@ Each of these was built and measured with the same method; differences below abo
 - **LOD:** table lookups of the divide as lane loads (0 to +1 %), keeping the old divide for non-LOD kernels (+1.5 to +5 %), a vector reciprocal in place of the 128 KB divide table (needs 12 table registers), a NEON merge of mixed-tile groups (0.4-7 % of the groups).
 - **Helper and pool:** the emulation thread as a fourth static owner (its share would start at the barrier), the helper rendering while the parser parses (delays the critical path), a worker claiming all its classes at once (no stealing window), scanning the job ring instead of per-class queues (stale positions alias after wrap), three or four classes per worker (0.752 / 0.753 against 0.753 on the A53), and `DeferSync` ([design.md](design.md#threading)).
 - **A faster delta-Z path:** roughly 4 % of SM64's time. (Early Z, rejected here at first at 3-4 % in the best scenes, came back as the batch skip above, once Pokemon Snap's camera shot showed 58 % of its pixels failing Z.)
+- **Z compare:** an extra software prefetch of the next group's colour / Z windows inside `zcmp` (+6 % `zcmp` time; the stage is instruction bound, the batch builder's prefetch already covers the lines); the two-window merge generalised to any run structure and to the partial group at the end of a batch (a window per run, merged lane by lane: +1.4 % `zcmp` time against the per-lane path for the 3 % of groups it serves, dropped); `z_compare8` inlined into the loop (+1.7 % for the RelaxedPrecision loop through register allocation, so it is out of line); skipping the colour-buffer read and the memory-colour / coverage / shift / blend-enable stores of groups with no live lane (-8 % `zcmp`, -1.2 % total on frame 1101 with RelaxedPrecision, RDRAM identical on four dumps, not kept: blend and store never read those fields of a dead group, but `zcmp` would no longer write them, which `foir-kfuzz` and `FOIR_NEON_VERIFY` compare lane by lane).

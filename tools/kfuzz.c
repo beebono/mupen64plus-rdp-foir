@@ -130,6 +130,13 @@ static void random_memory(struct rdp *r, int zbias)
         if (mode == 2) v &= 0x0f0f0f0f;
         w[(FB_BASE >> 2) + i] = v;
         w[(Z_BASE >> 2) + i] = zbias ? (v & 0xfffcfffc) : v;
+        if (mode == 3) {        /* Z values at the edges of the format: farthest depth, the exponent steps, zero */
+            static const uint16_t zedge[8] = { 0xfffc, 0xffff, 0xfff8, 0x0000, 0x2000, 0xe000, 0xdffc, 0x7ffc };
+            uint32_t z = w[(Z_BASE >> 2) + i];
+            if (((v >> 8) & 3) == 0) z = (z & 0xffff0000u) | zedge[(v >> 10) & 7];
+            if (((v >> 20) & 3) == 0) z = (z & 0xffffu) | ((uint32_t)zedge[(v >> 22) & 7] << 16);
+            w[(Z_BASE >> 2) + i] = z;
+        }
     }
     for (uint32_t i = 0; i < 0x8000 / 4; i++) { w[i] = rnd(); w[(RDRAM_BYTES - 0x8000) / 4 + i] = rnd(); }
     for (uint32_t i = 0; i < 0x8000 / 2; i++) { r->hidden[i] = (uint8_t)rnd() & 0xf; r->hidden[(RDRAM_BYTES - 0x8000) / 2 + i] = (uint8_t)rnd() & 0xf; }
@@ -245,6 +252,11 @@ static void random_batch(struct rdp *r, struct px_batch *b, int tilenum)
         }
         b->cr[i] = rnd_coord(); b->cg[i] = rnd_coord(); b->cb[i] = rnd_coord(); b->ca[i] = rnd_coord();
         b->cz[i] = (int32_t)(rnd() >> (rndn(3) ? 2 : 0)) & (rndn(2) ? ~0 : 0x3fffffff);
+        {   /* bits 0-9 of cz reach no depth: a few lanes use them to pick a depth at an edge of the saturation (bits 18 / 17 of the 19-bit field) */
+            static const uint32_t zedge[8] = { 0x5ffff, 0x60000, 0x40000, 0x3ffff, 0x20000, 0x7ffff, 0x00000, 0x1ffff };
+            uint32_t u = (uint32_t)b->cz[i];
+            if ((u & 0x3ff) < 40) b->cz[i] = (int32_t)((zedge[u & 7] << 13) | (u & 0x1fff));
+        }
         uint8_t m = cvgmode == 0 ? 0xff : (uint8_t)rnd();
         if (cvgmode == 1 && rndn(4)) m = 0xff;
         int cnt = 0;
@@ -326,6 +338,30 @@ static int g_bad;
 static long g_checks, g_early_batches;
 
 #define CHK(name, a, bb, i) do { if ((long)(a) != (long)(bb)) { if (g_bad < 12) fprintf(stderr, "  MISMATCH %s lane %d: neon=%ld scalar=%ld\n", name, i, (long)(a), (long)(bb)); g_bad++; } g_checks++; } while (0)
+
+/* RelaxedPrecision has no scalar equivalent, so the relaxed Z compare (opaque / transparent mode) is checked against a model built on the scalar
+ * kernel's output: everything but wen / blend_en is the exact result; wen = (oz == max) | (sz < oz) on every lane, blend_en = force | (aa & !overflow & !(sz < oz)) */
+static void check_relaxed(const struct rdp *r, const struct px_batch *bn, const struct px_batch *sc, int n)
+{
+    const struct other_modes *om = &r->om;
+    for (int i = 0; i < n; i++) {
+        const uint32_t zv = rdram_rd16(r, (r->zb_address >> 1) + bn->fbidx[i]);
+        const int e = zv >> 13, sh = 6 - e > 0 ? 6 - e : 0;
+        const uint32_t oz = ((((zv >> 2) & 0x7ff) << sh) + (0x40000 - (0x40000u >> e))) & 0x3ffff;
+        const int infront = (uint32_t)sc->sz[i] < oz, ovf = !!sc->prewrap[i];
+        CHK("rel.wen", !!bn->wen[i], (oz == 0x3ffff) || infront, i);
+        CHK("rel.blend_en", !!bn->blend_en[i], om->force_blend || (om->antialias_en && !ovf && !infront), i);
+        CHK("rel.prewrap", !!bn->prewrap[i], ovf, i);
+        CHK("rel.memcvg", bn->memcvg[i], sc->memcvg[i], i);
+        CHK("rel.cvg", bn->cvg[i], sc->cvg[i], i);
+        CHK("rel.sz", bn->sz[i], sc->sz[i], i);
+        if (om->real_blendshifts) {
+            CHK("rel.blshifta", bn->blshifta[i], sc->blshifta[i], i);
+            CHK("rel.blshiftb", bn->blshiftb[i], sc->blshiftb[i], i);
+        }
+        for (int c = 0; c < 4; c++) CHK("rel.mem", bn->mem[c][i], sc->mem[c][i], i);
+    }
+}
 
 static void dump_state(const struct rdp *r)
 {
@@ -514,11 +550,18 @@ static int run_one(uint64_t seed, int mask, int verbose, long iter)
     }
 
     memcpy(pre, bref, sizeof(*pre));
+    struct px_batch *bsc = NULL;
+    if (relaxed && ra.om.z_compare_en && (ra.om.z_mode == ZMODE_OPAQUE || ra.om.z_mode == ZMODE_TRANSPARENT)) {
+        bsc = malloc(sizeof(*bsc));
+        memcpy(bsc, pre, sizeof(*bsc));
+        foir_kernels_scalar.zcmp(&ra, bsc);
+    }
     refk->zcmp(&ra, bref);
     if (mask & 4) {
         stage = "zcmp";
         memcpy(bn, pre, sizeof(*bn));
         nk->zcmp(&rb, bn);
+        if (bsc) check_relaxed(&ra, bn, bsc, n);
         for (int i = 0; i < n; i++) {
             CHK("wen", !!bn->wen[i], !!bref->wen[i], i);
             CHK("blend_en", !!bn->blend_en[i], !!bref->blend_en[i], i);
@@ -575,6 +618,7 @@ static int run_one(uint64_t seed, int mask, int verbose, long iter)
         if (g_bad != bad_before) { fprintf(stderr, "seed %llu: %s\n", (unsigned long long)seed, stage); dump_state(&ra); goto done; }
     }
 
+    free(bsc);
     memcpy(pre, bref, sizeof(*pre));
     refk->blend(&ra, bref);
     if (mask & 8) {

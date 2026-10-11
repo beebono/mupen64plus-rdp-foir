@@ -11,6 +11,12 @@
 #error "the NEON memory kernels assume a little-endian host with word-swapped RDRAM"
 #endif
 
+/* every lane of an 8-bit mask set: a 64-bit move and compare, not a (slow, long-latency) across-lanes reduction */
+FOIR_INLINE bool mask8_all(uint8x8_t m) { return vget_lane_u64(vreinterpret_u64_u8(m), 0) == ~0ull; }
+
+/* 0 / 0xffff lanes -> 0 / 1 bytes */
+FOIR_INLINE uint8x8_t mask_bit(uint16x8_t m) { return vshr_n_u8(vmovn_u16(m), 7); }
+
 FOIR_INLINE bool grp_contig(const struct px_batch *b, int o)
 {
     static const uint32_t iota0[4] = { 0, 1, 2, 3 }, iota1[4] = { 4, 5, 6, 7 };
@@ -21,12 +27,39 @@ FOIR_INLINE bool grp_contig(const struct px_batch *b, int o)
     return vminvq_u32(vandq_u32(e0, e1)) == 0xffffffffu;
 }
 
-FOIR_INLINE uint8x8_t hv_resolve(uint8x8_t h, uint16x8_t px)
+/* How a group of eight lanes lies in the colour / Z buffer: one run of consecutive pixels (kind 1), the end of one scanline and the start of the
+ * next, i.e. two runs (kind 2), or anything else (kind 0, per-lane access). Kind 2 reads a window at lane 0's pixel and one placed so that lane k
+ * is the first pixel of the second run, and takes lanes < k from the first. */
+struct grp { int kind; uint32_t a, bk; uint16x8_t lt; };
+
+FOIR_INLINE void grp_classify(const struct px_batch *b, int o, int cnt, struct grp *g)
+{
+    g->kind = 0;
+    if (cnt < 8) return;
+    static const uint32_t iota0[4] = { 0, 1, 2, 3 }, iota1[4] = { 4, 5, 6, 7 };
+    static const uint16_t iota16[8] = { 0, 1, 2, 3, 4, 5, 6, 7 };
+    const uint32_t a0 = b->fbidx[o];
+    const uint32x4_t base = vdupq_n_u32(a0);
+    const uint32x4_t d0 = vsubq_u32(vld1q_u32(&b->fbidx[o]), vaddq_u32(base, vld1q_u32(iota0)));
+    const uint32x4_t d1 = vsubq_u32(vld1q_u32(&b->fbidx[o + 4]), vaddq_u32(base, vld1q_u32(iota1)));
+    const uint64_t brk = vget_lane_u64(vreinterpret_u64_u8(vmovn_u16(vcombine_u16(vmovn_u32(vtstq_u32(d0, d0)), vmovn_u32(vtstq_u32(d1, d1))))), 0);
+    if (FOIR_LIKELY(!brk)) { g->kind = 1; g->a = a0; return; }
+    const int k = __builtin_ctzll(brk) >> 3;                          /* first lane that is not consecutive: 1..7 */
+    const uint32_t b0 = b->fbidx[o + k];
+    const uint32x4_t dl = vdupq_n_u32(b0 - (a0 + (uint32_t)k));
+    const uint16x8_t eq = vcombine_u16(vmovn_u32(vceqq_u32(d0, dl)), vmovn_u32(vceqq_u32(d1, dl)));
+    const uint16x8_t ge = vcgeq_u16(vld1q_u16(iota16), vdupq_n_u16((uint16_t)k));
+    if (vget_lane_u64(vreinterpret_u64_u8(vmovn_u16(vbicq_u16(ge, eq))), 0)) return;   /* a lane >= k is off the second run */
+    g->kind = 2; g->a = a0; g->bk = b0 - (uint32_t)k; g->lt = vmvnq_u16(ge);
+}
+
+/* hidden bits of eight pixels: the stored ones when the byte is valid and its LSB copy matches the pixel's, else both equal the pixel's LSB; *l4 = LSB << 2 */
+FOIR_INLINE uint8x8_t hv_resolve(uint8x8_t h, uint16x8_t px, uint8x8_t *l4)
 {
     uint8x8_t lsb = vand_u8(vmovn_u16(px), vdup_n_u8(1));
-    uint8x8_t valid = vtst_u8(h, vdup_n_u8(8));
-    uint8x8_t match = vceq_u8(vand_u8(vshr_n_u8(h, 2), vdup_n_u8(1)), lsb);
-    return vbsl_u8(vand_u8(valid, match), vand_u8(h, vdup_n_u8(3)), vmul_u8(lsb, vdup_n_u8(3)));
+    *l4 = vshl_n_u8(lsb, 2);
+    uint8x8_t use = vceq_u8(vand_u8(veor_u8(h, *l4), vdup_n_u8(0xc)), vdup_n_u8(8));      /* bit 3 set, bit 2 equal to the LSB */
+    return vbsl_u8(use, vand_u8(h, vdup_n_u8(3)), vmul_u8(lsb, vdup_n_u8(3)));
 }
 
 FOIR_INLINE void batch_range(const struct px_batch *b, uint32_t *lo, uint32_t *hi)
@@ -78,31 +111,47 @@ FOIR_INLINE uint8x8_t hidden_new(uint16x8_t px, uint8x8_t hv)
     return vorr_u8(vorr_u8(vdup_n_u8(8), vshl_n_u8(vand_u8(vmovn_u16(px), vdup_n_u8(1)), 2)), vand_u8(hv, vdup_n_u8(3)));
 }
 
-FOIR_INLINE uint16x8_t fast_z_load(const struct rdp *r, uint32_t base16, const struct px_batch *b, int o, int cnt, bool contig, bool ok)
+FOIR_INLINE uint16x8_t win16_grp(const struct rdp *r, uint32_t base16, const struct grp *g)
 {
-    if (ok && contig) return win16_ld(r, base16 + b->fbidx[o]);
+    uint16x8_t w = win16_ld(r, base16 + g->a);
+    if (g->kind == 2) w = vbslq_u16(g->lt, w, win16_ld(r, base16 + g->bk));
+    return w;
+}
+
+FOIR_INLINE uint8x8_t hid_grp(const struct rdp *r, uint32_t base16, const struct grp *g)
+{
+    uint8x8_t h = vld1_u8(r->hidden + (base16 + g->a));
+    if (g->kind == 2) h = vbsl_u8(vmovn_u16(g->lt), h, vld1_u8(r->hidden + (base16 + g->bk)));
+    return h;
+}
+
+FOIR_INLINE uint16x8_t px16_load(const struct rdp *r, uint32_t base16, const struct px_batch *b, int o, int cnt, const struct grp *g, bool ok)
+{
+    if (ok && g->kind) return win16_grp(r, base16, g);
     uint16_t pa[8] ALIGN16;
     memset(pa, 0, sizeof(pa));
     for (int l = 0; l < cnt; l++) pa[l] = rdram_rd16(r, base16 + b->fbidx[o + l]);
     return vld1q_u16(pa);
 }
 
-FOIR_INLINE void ld16(const struct rdp *r, uint32_t base16, const struct px_batch *b, int o, int cnt, bool contig, bool ok,
-                      uint16x8_t *px, uint8x8_t *hv)
+/* the pixels and the raw hidden bytes of a group (hv_resolve() turns them into the hidden bits); a per-lane read hands back hidden bytes that resolve to what it read */
+FOIR_INLINE void ld16_raw(const struct rdp *r, uint32_t base16, const struct px_batch *b, int o, int cnt, const struct grp *g, bool ok,
+                          uint16x8_t *px, uint8x8_t *hraw)
 {
-    if (ok && contig) {
-        const uint32_t i0 = base16 + b->fbidx[o];
-        uint16x8_t P = win16_ld(r, i0);
-        *px = P;
-        *hv = hv_resolve(vld1_u8(r->hidden + i0), P);
+    if (ok && g->kind) {
+        *px = win16_grp(r, base16, g);
+        *hraw = hid_grp(r, base16, g);
         return;
     }
     uint16_t pa[8] ALIGN16;
     uint8_t ha[8] ALIGN16;
     memset(pa, 0, sizeof(pa)); memset(ha, 0, sizeof(ha));
-    for (int l = 0; l < cnt; l++) rdram_rd_pair16(r, base16 + b->fbidx[o + l], &pa[l], &ha[l]);
+    for (int l = 0; l < cnt; l++) {
+        rdram_rd_pair16(r, base16 + b->fbidx[o + l], &pa[l], &ha[l]);
+        ha[l] |= (uint8_t)(8 | ((pa[l] & 1) << 2));
+    }
     *px = vld1q_u16(pa);
-    *hv = vld1_u8(ha);
+    *hraw = vld1_u8(ha);
 }
 
 FOIR_INLINE void st16(struct rdp *r, uint32_t base16, const struct px_batch *b, int o, int cnt, bool contig, bool ok,
@@ -181,6 +230,20 @@ struct zs {
     int relaxed;
 };
 
+/* Q = 0x40000 - oz for the Z memory value, oz being its decoded 18-bit depth. The format (exponent e, mantissa m) gives oz = 0x40000 - ((base - m) << max(6 - e, 0)),
+ * base = 0x1000, or 0x800 for e = 7; so sz < oz <=> sz + Q < 0x40000, and oz == 0x3ffff (the farthest depth) <=> zpx >= 0xfffc. Eight lanes in 16-bit arithmetic. */
+FOIR_INLINE void z_dist8(uint16x8_t zpx, uint32x4_t *qlo, uint32x4_t *qhi)
+{
+    const uint16x8_t e = vshrq_n_u16(zpx, 13);
+    const uint16x8_t mant = vandq_u16(vshrq_n_u16(zpx, 2), vdupq_n_u16(0x7ff));
+    const int16x8_t sh = vmaxq_s16(vsubq_s16(vdupq_n_s16(6), vreinterpretq_s16_u16(e)), vdupq_n_s16(0));
+    const uint16x8_t pw = vshlq_u16(vdupq_n_u16(1), sh);
+    const uint16x8_t base = vsubq_u16(vdupq_n_u16(0x1000), vandq_u16(vceqq_u16(e, vdupq_n_u16(7)), vdupq_n_u16(0x800)));
+    const uint16x8_t mp = vsubq_u16(base, mant);
+    *qlo = vmull_u16(vget_low_u16(mp), vget_low_u16(pw));
+    *qhi = vmull_high_u16(mp, pw);
+}
+
 FOIR_INLINE void z_compare4(const struct rdp *r, const struct zs *S, uint32x4_t sz, uint32x4_t zval, uint32x4_t hval,
                             uint32x4_t cvg, uint32x4_t memcvg, struct z4_out *o)
 {
@@ -251,6 +314,60 @@ FOIR_INLINE void z_compare4(const struct rdp *r, const struct zs *S, uint32x4_t 
     (void)zero;
 }
 
+/* The Z compare of eight lanes for the opaque, transparent and decal modes, in 16-bit arithmetic wherever the values fit (the interpenetrating mode also
+ * rewrites the coverage and stays on z_compare4). Same decisions as z_compare4, with oz replaced by Q = 0x40000 - oz (see z_dist8). Out of line: it only serves
+ * the exact path for partially covered pixels and the decal mode, and inlined it costs the RelaxedPrecision loop 1-2 % in register allocation. */
+static __attribute__((noinline)) void z_compare8(const struct rdp *r, const struct zs *S, struct px_batch *b, int o, const uint32x4_t szv[2], uint16x8_t zpx,
+                                                  uint8x8_t zhv, uint16x8_t ovf16, uint16x8_t lanemask)
+{
+    const int32_t dzpixenc = r->pc.dzpixenc;
+    const uint16x8_t one = vdupq_n_u16(1);
+    /* the memory pixel's delta-Z exponent and the blender shifts it implies */
+    const uint8x8_t rd8 = vorr_u8(vshl_n_u8(vand_u8(vmovn_u16(zpx), vdup_n_u8(3)), 2), zhv);
+    const uint8x8_t enc8 = vdup_n_u8((uint8_t)dzpixenc), four = vdup_n_u8(4);
+    vst1_u8((uint8_t *)&b->blshifta[o], vmin_u8(vqsub_u8(enc8, rd8), four));
+    vst1_u8((uint8_t *)&b->blshiftb[o], vmin_u8(vqsub_u8(rd8, enc8), four));
+
+    /* delta-Z of the memory pixel, widened for the low precision exponents, ORed with the primitive's; its highest bit is the compare's delta-Z */
+    const uint16x8_t e = vshrq_n_u16(zpx, 13);
+    uint16x8_t dzmem = vshlq_u16(one, vreinterpretq_s16_u16(vmovl_u8(rd8)));
+    const uint16x8_t lt3 = vcltq_u16(e, vdupq_n_u16(3));
+    const uint16x8_t is8000 = vceqq_u16(dzmem, vdupq_n_u16(0x8000));
+    const uint16x8_t dz2 = vmaxq_u16(vshlq_n_u16(dzmem, 1), vshlq_u16(vdupq_n_u16(16), vnegq_s16(vreinterpretq_s16_u16(e))));
+    const uint16x8_t force_cop = vandq_u16(lt3, is8000);
+    dzmem = vbslq_u16(lt3, vbslq_u16(is8000, vdupq_n_u16(0xffff), dz2), dzmem);
+    const uint16x8_t dzor = vorrq_u16(vdupq_n_u16((uint16_t)r->pc.dzpix), dzmem);
+    const uint16x8_t dznot = vshlq_u16(one, vsubq_s16(vdupq_n_s16(15), vreinterpretq_s16_u16(vclzq_u16(dzor))));
+    uint32x4_t ql, qh;
+    z_dist8(zpx, &ql, &qh);
+    const uint32x4_t lim = vdupq_n_u32(0x40000);
+    const uint32x4_t tl = vaddq_u32(szv[0], ql), th = vaddq_u32(szv[1], qh);                       /* sz + Q: sz < oz <=> sz + Q < 0x40000 */
+    const uint32x4_t dnl = vshll_n_u16(vget_low_u16(dznot), 3), dnh = vshll_high_n_u16(dznot, 3);  /* delta-Z of the compare << 3 */
+    const uint16x8_t infront = vcombine_u16(vmovn_u32(vcltq_u32(tl, lim)), vmovn_u32(vcltq_u32(th, lim)));
+    const uint16x8_t maxz = vcgeq_u16(zpx, vdupq_n_u16(0xfffc));
+    const uint16x8_t farther = vorrq_u16(force_cop, vcombine_u16(vmovn_u32(vcgeq_u32(vaddq_u32(tl, dnl), lim)), vmovn_u32(vcgeq_u32(vaddq_u32(th, dnh), lim))));
+    const uint16x8_t nearer = vorrq_u16(force_cop, vcombine_u16(vmovn_u32(vcleq_s32(vsubq_s32(vreinterpretq_s32_u32(tl), vreinterpretq_s32_u32(dnl)), vreinterpretq_s32_u32(lim))),
+                                                                 vmovn_u32(vcleq_s32(vsubq_s32(vreinterpretq_s32_u32(th), vreinterpretq_s32_u32(dnh)), vreinterpretq_s32_u32(lim)))));
+    uint16x8_t wen;
+    switch (S->zmode) {
+    case ZMODE_OPAQUE:
+        wen = vorrq_u16(maxz, vbslq_u16(ovf16, infront, nearer));
+        break;
+    case ZMODE_TRANSPARENT:
+        wen = vorrq_u16(infront, maxz);
+        break;
+    default:
+        wen = vbicq_u16(vandq_u16(farther, nearer), maxz);
+        break;
+    }
+    uint8x8_t ben8 = vdup_n_u8(0);
+    if (S->force) ben8 = vdup_n_u8(1);
+    else if (S->aa) ben8 = mask_bit(vbicq_u16(farther, ovf16));
+    vst1_u8(&b->wen[o], mask_bit(vandq_u16(wen, lanemask)));
+    vst1_u8(&b->blend_en[o], ben8);
+    vst1_u8(&b->prewrap[o], mask_bit(ovf16));
+}
+
 FOIR_INLINE void zcmp_body(struct rdp *r, struct px_batch *b, const struct zs S)
 {
     NEON_HANDLED(2);
@@ -265,62 +382,74 @@ FOIR_INLINE void zcmp_body(struct rdp *r, struct px_batch *b, const struct zs S)
     const int fast_z = S.zc && (S.zmode == ZMODE_OPAQUE || S.zmode == ZMODE_TRANSPARENT);
     const int need_shifts = S.shifts;
     const int relaxed_z = S.relaxed;
+    const int z_hidden = S.zc && (need_shifts || !fast_z || !relaxed_z);      /* the delta-Z bits are read (shifts, or the exact path for partially covered pixels) */
     uint32_t pmin, pmax;
     batch_range(b, &pmin, &pmax);
     const bool fb_ok = win16_safe(r, fb16, pmin, pmax), z_ok = win16_safe(r, zb16, pmin, pmax);
 
-    for (int g = 0; g < ng; g++) {
-        const int o = g * 8;
+    for (int gi = 0; gi < ng; gi++) {
+        const int o = gi * 8;
         const int cnt = n - o < 8 ? n - o : 8;
-        const bool contig = cnt == 8 && grp_contig(b, o);
-        const uint16x8_t lanemask = vcltq_u16(iota, vdupq_n_u16((uint16_t)cnt));
+        struct grp g;
+        grp_classify(b, o, cnt, &g);
+        const bool contig = g.kind == 1;
+        const uint16x8_t lanemask = cnt == 8 ? vdupq_n_u16(0xffff) : vcltq_u16(iota, vdupq_n_u16((uint16_t)cnt));
         const uint8x8_t cvg8 = vld1_u8(&b->cvg[o]);
 
-        int32x4_t szv[2];
+        /* the buffer reads first: the A55 does not reorder, so their latency hides behind the arithmetic that follows */
+        uint16x8_t fbpx = vdupq_n_u16(0), zpx = vdupq_n_u16(0);
+        uint8x8_t fbh = vdup_n_u8(0), zh = vdup_n_u8(0);
+        if (S.rd && is16) {
+            if (S.rgba) ld16_raw(r, fb16, b, o, cnt, &g, fb_ok, &fbpx, &fbh);
+            else fbpx = px16_load(r, fb16, b, o, cnt, &g, fb_ok);
+        }
+        if (S.zc) {
+            if (z_hidden) ld16_raw(r, zb16, b, o, cnt, &g, z_ok, &zpx, &zh);
+            else zpx = px16_load(r, zb16, b, o, cnt, &g, z_ok);
+        }
+
+        uint32x4_t szv[2];
         {
-            int32x4_t v0 = vandq_s32(vshrq_n_s32(vld1q_s32(&b->cz[o]), 10), vdupq_n_s32(0x3fffff));
-            int32x4_t v1 = vandq_s32(vshrq_n_s32(vld1q_s32(&b->cz[o + 4]), 10), vdupq_n_s32(0x3fffff));
-            if (vminv_u8(cvg8) == 8) {
-                szv[0] = vshrq_n_s32(v0, 3); szv[1] = vshrq_n_s32(v1, 3);
+            /* sz = 19-bit field of the interpolated Z (bits 17 / 18: 2 -> 0x3ffff, 3 -> 0, else the low 18 bits) */
+            const uint32x4_t m19 = vdupq_n_u32(0x7ffff);
+            uint32x4_t s0, s1;
+            if (mask8_all(vceq_u8(cvg8, vdup_n_u8(8)))) {
+                s0 = vshrq_n_u32(vreinterpretq_u32_s32(vld1q_s32(&b->cz[o])), 13);
+                s1 = vshrq_n_u32(vreinterpretq_u32_s32(vld1q_s32(&b->cz[o + 4])), 13);
             } else {
+                int32x4_t v0 = vandq_s32(vshrq_n_s32(vld1q_s32(&b->cz[o]), 10), vdupq_n_s32(0x3fffff));
+                int32x4_t v1 = vandq_s32(vshrq_n_s32(vld1q_s32(&b->cz[o + 4]), 10), vdupq_n_s32(0x3fffff));
                 uint16x8_t ox = vmovl_u8(vld1_u8(&b->offx[o])), oy = vmovl_u8(vld1_u8(&b->offy[o]));
                 int32x4_t oxl = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(ox)));
                 int32x4_t oxh = vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(ox)));
                 int32x4_t oyl = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(oy)));
                 int32x4_t oyh = vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(oy)));
-                szv[0] = vshrq_n_s32(vmlaq_n_s32(vmlaq_n_s32(vshlq_n_s32(v0, 2), oxl, pc->cdz), oyl, pc->dzdy), 5);
-                szv[1] = vshrq_n_s32(vmlaq_n_s32(vmlaq_n_s32(vshlq_n_s32(v1, 2), oxh, pc->cdz), oyh, pc->dzdy), 5);
+                s0 = vandq_u32(vreinterpretq_u32_s32(vshrq_n_s32(vmlaq_n_s32(vmlaq_n_s32(vshlq_n_s32(v0, 2), oxl, pc->cdz), oyl, pc->dzdy), 5)), m19);
+                s1 = vandq_u32(vreinterpretq_u32_s32(vshrq_n_s32(vmlaq_n_s32(vmlaq_n_s32(vshlq_n_s32(v1, 2), oxh, pc->cdz), oyh, pc->dzdy), 5)), m19);
             }
-            for (int h = 0; h < 2; h++) {
-                int32x4_t t = vandq_s32(vshrq_n_s32(szv[h], 17), vdupq_n_s32(3));
-                int32x4_t masked = vandq_s32(szv[h], vdupq_n_s32(0x3ffff));
-                int32x4_t r2 = vbslq_s32(vceqq_s32(t, vdupq_n_s32(2)), vdupq_n_s32(0x3ffff), masked);
-                szv[h] = vbslq_s32(vceqq_s32(t, vdupq_n_s32(3)), vdupq_n_s32(0), r2);
-            }
-            vst1q_s32(&b->sz[o], szv[0]); vst1q_s32(&b->sz[o + 4], szv[1]);
+            const uint32x4_t lim = vdupq_n_u32(0x60000), top = vdupq_n_u32(0x3ffff);
+            szv[0] = vandq_u32(vminq_u32(s0, top), vcltq_u32(s0, lim));
+            szv[1] = vandq_u32(vminq_u32(s1, top), vcltq_u32(s1, lim));
+            vst1q_u32((uint32_t *)&b->sz[o], szv[0]); vst1q_u32((uint32_t *)&b->sz[o + 4], szv[1]);
         }
 
         uint8x8_t memcvg8 = vdup_n_u8(7);
         if (S.rd) {
             int16x8_t mr, mg, mb, ma;
             if (is16) {
-                uint16x8_t px; uint8x8_t hv;
-                ld16(r, fb16, b, o, cnt, contig, fb_ok, &px, &hv);
-                int16x8_t f = vreinterpretq_s16_u16(px);
-                int16x8_t low = vorrq_s16(vshlq_n_s16(vandq_s16(f, vdupq_n_s16(1)), 2),
-                                          vreinterpretq_s16_u16(vmovl_u8(hv)));
+                const uint16x8_t px = fbpx;
+                uint8x8_t l4, low8;
                 if (S.rgba) {
+                    low8 = vorr_u8(hv_resolve(fbh, px, &l4), l4);                   /* memory coverage: LSB, hidden bits */
                     mr = vreinterpretq_s16_u16(vandq_u16(vshrq_n_u16(px, 8), vdupq_n_u16(0xf8)));
                     mg = vreinterpretq_s16_u16(vshrq_n_u16(vandq_u16(px, vdupq_n_u16(0x7c0)), 3));
                     mb = vreinterpretq_s16_u16(vshlq_n_u16(vandq_u16(px, vdupq_n_u16(0x3e)), 2));
-                    memcvg8 = vmovn_u16(vreinterpretq_u16_s16(low));
-                    ma = vshlq_n_s16(low, 5);
                 } else {
+                    low8 = vmovn_u16(vandq_u16(vshrq_n_u16(px, 5), vdupq_n_u16(7)));
                     mr = mg = mb = vreinterpretq_s16_u16(vshrq_n_u16(px, 8));
-                    low = vandq_s16(vshrq_n_s16(f, 5), vdupq_n_s16(7));
-                    memcvg8 = vmovn_u16(vreinterpretq_u16_s16(low));
-                    ma = vshlq_n_s16(low, 5);
                 }
+                memcvg8 = low8;
+                ma = vreinterpretq_s16_u16(vshll_n_u8(low8, 5));
             } else {
                 uint32x4_t lo, hi;
                 ld32(r, fb32, b, o, cnt, contig, &lo, &hi);
@@ -347,41 +476,31 @@ FOIR_INLINE void zcmp_body(struct rdp *r, struct px_batch *b, const struct zs S)
         uint32x4_t wen[2], ben[2], pre[2], ncvg[2];
         int32x4_t sha[2], shb[2];
         const uint16x8_t ovf16 = vtstq_u16(vaddq_u16(memcvg16, cvg16), vdupq_n_u16(8));
-        if (fast_z && (relaxed_z || vminvq_u16(vorrq_u16(ovf16, vmvnq_u16(lanemask))) == 0xffff)) {
+        if (fast_z && (relaxed_z || mask8_all(vmovn_u16(vorrq_u16(ovf16, vmvnq_u16(lanemask)))))) {
             /* exact when every lane has overflowing coverage (delta-Z only matters for partially covered memory pixels); RelaxedPrecision drops the delta-Z terms for the rest too */
-            uint16x8_t zpx;
-            uint8x8_t zhv = vdup_n_u8(0);
-            if (need_shifts) ld16(r, zb16, b, o, cnt, contig, z_ok, &zpx, &zhv);
-            else zpx = fast_z_load(r, zb16, b, o, cnt, contig, z_ok);
-            uint32x4_t wl, wh, il, ih;
-            for (int h = 0; h < 2; h++) {
-                uint32x4_t zv = vmovl_u16(h ? vget_high_u16(zpx) : vget_low_u16(zpx));
-                int32x4_t e = vreinterpretq_s32_u32(vshrq_n_u32(zv, 13));
-                uint32x4_t mant = vandq_u32(vshrq_n_u32(zv, 2), vdupq_n_u32(0x7ff));
-                uint32x4_t add = vsubq_u32(vdupq_n_u32(0x40000), vshlq_u32(vdupq_n_u32(0x40000), vnegq_s32(e)));
-                uint32x4_t oz = vaddq_u32(vshlq_u32(mant, vmaxq_s32(vsubq_s32(vdupq_n_s32(6), e), vdupq_n_s32(0))), add);
-                uint32x4_t inf = vcltq_u32(vreinterpretq_u32_s32(szv[h]), oz);
-                uint32x4_t w = vorrq_u32(vceqq_u32(oz, vdupq_n_u32(0x3ffff)), inf);
-                if (h) { wh = w; ih = inf; } else { wl = w; il = inf; }
-            }
-            uint16x8_t w16 = vandq_u16(vcombine_u16(vmovn_u32(wl), vmovn_u32(wh)), lanemask);
+            uint8x8_t l4_;
+            const uint8x8_t zhv = need_shifts ? hv_resolve(zh, zpx, &l4_) : vdup_n_u8(0);
+            uint32x4_t ql, qh;
+            z_dist8(zpx, &ql, &qh);
+            const uint32x4_t lim = vdupq_n_u32(0x40000);
+            const uint16x8_t inf16 = vcombine_u16(vmovn_u32(vcltq_u32(vaddq_u32(szv[0], ql), lim)), vmovn_u32(vcltq_u32(vaddq_u32(szv[1], qh), lim)));
+            const uint16x8_t w16 = vandq_u16(vorrq_u16(inf16, vcgeq_u16(zpx, vdupq_n_u16(0xfffc))), lanemask);
 #ifdef FOIR_STATS
             if (vmaxvq_u16(w16) == 0) NEON_HANDLED(7); else NEON_FALLBACK(7);
 #endif
-            vst1_u8(&b->wen[o], vmovn_u16(vandq_u16(w16, vdupq_n_u16(1))));
-            uint16x8_t ben16 = vdupq_n_u16(0);
-            if (S.force) ben16 = vdupq_n_u16(1);
+            vst1_u8(&b->wen[o], mask_bit(w16));
+            uint8x8_t ben8 = vdup_n_u8(0);
+            if (S.force) ben8 = vdup_n_u8(1);
             else if (relaxed_z && S.aa)
-                ben16 = vandq_u16(vandq_u16(vmvnq_u16(ovf16), vmvnq_u16(vcombine_u16(vmovn_u32(il), vmovn_u32(ih)))), vdupq_n_u16(1));
-            vst1_u8(&b->blend_en[o], vmovn_u16(ben16));
-            vst1_u8(&b->prewrap[o], vmovn_u16(vandq_u16(ovf16, vdupq_n_u16(1))));
+                ben8 = veor_u8(mask_bit(vorrq_u16(ovf16, inf16)), vdup_n_u8(1));
+            vst1_u8(&b->blend_en[o], ben8);
+            vst1_u8(&b->prewrap[o], mask_bit(ovf16));
             if (need_shifts) {
-                int16x8_t rd = vreinterpretq_s16_u16(vorrq_u16(vshlq_n_u16(vandq_u16(zpx, vdupq_n_u16(3)), 2), vmovl_u8(zhv)));
-                int16x8_t enc16 = vdupq_n_s16((int16_t)dzpixenc);
-                int16x8_t sha8 = vminq_s16(vmaxq_s16(vsubq_s16(enc16, rd), vdupq_n_s16(0)), vdupq_n_s16(4));
-                int16x8_t shb8 = vminq_s16(vmaxq_s16(vsubq_s16(rd, enc16), vdupq_n_s16(0)), vdupq_n_s16(4));
-                vst1_s8(&b->blshifta[o], vmovn_s16(sha8));
-                vst1_s8(&b->blshiftb[o], vmovn_s16(shb8));
+                /* rd = delta-Z exponent of the memory pixel (0..15); the shifts are its saturating differences to the primitive's, capped at 4 */
+                uint8x8_t rd8 = vorr_u8(vshl_n_u8(vand_u8(vmovn_u16(zpx), vdup_n_u8(3)), 2), zhv);
+                uint8x8_t enc8 = vdup_n_u8((uint8_t)dzpixenc), four = vdup_n_u8(4);
+                vst1_u8((uint8_t *)&b->blshifta[o], vmin_u8(vqsub_u8(enc8, rd8), four));
+                vst1_u8((uint8_t *)&b->blshiftb[o], vmin_u8(vqsub_u8(rd8, enc8), four));
             } else {
                 vst1_s8(&b->blshifta[o], vdup_n_s8(0));
                 vst1_s8(&b->blshiftb[o], vdup_n_s8(0));
@@ -390,14 +509,19 @@ FOIR_INLINE void zcmp_body(struct rdp *r, struct px_batch *b, const struct zs S)
             continue;
         }
         if (S.zc) NEON_FALLBACK(6);
+        if (S.zc && S.zmode != ZMODE_INTERPENETRATING) {
+            uint8x8_t l4_;
+            z_compare8(r, &S, b, o, szv, zpx, hv_resolve(zh, zpx, &l4_), ovf16, lanemask);
+            continue;
+        }
         if (S.zc) {
-            uint16x8_t zpx; uint8x8_t zhv;
-            ld16(r, zb16, b, o, cnt, contig, z_ok, &zpx, &zhv);
+            uint8x8_t l4_;
+            const uint8x8_t zhv = hv_resolve(zh, zpx, &l4_);
             uint16x8_t hv16 = vmovl_u8(zhv);
             struct z4_out z0, z1;
-            z_compare4(r, &S, vreinterpretq_u32_s32(szv[0]), vmovl_u16(vget_low_u16(zpx)), vmovl_u16(vget_low_u16(hv16)),
+            z_compare4(r, &S, szv[0], vmovl_u16(vget_low_u16(zpx)), vmovl_u16(vget_low_u16(hv16)),
                        vmovl_u16(vget_low_u16(cvg16)), vmovl_u16(vget_low_u16(memcvg16)), &z0);
-            z_compare4(r, &S, vreinterpretq_u32_s32(szv[1]), vmovl_u16(vget_high_u16(zpx)), vmovl_u16(vget_high_u16(hv16)),
+            z_compare4(r, &S, szv[1], vmovl_u16(vget_high_u16(zpx)), vmovl_u16(vget_high_u16(hv16)),
                        vmovl_u16(vget_high_u16(cvg16)), vmovl_u16(vget_high_u16(memcvg16)), &z1);
             wen[0] = z0.wen; wen[1] = z1.wen; ben[0] = z0.blend_en; ben[1] = z1.blend_en;
             pre[0] = z0.prewrap; pre[1] = z1.prewrap; ncvg[0] = z0.cvg; ncvg[1] = z1.cvg;
