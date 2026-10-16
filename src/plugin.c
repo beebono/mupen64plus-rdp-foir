@@ -36,7 +36,6 @@
 static ptr_ConfigOpenSection ConfigOpenSection;
 static ptr_ConfigSaveSection ConfigSaveSection;
 static ptr_ConfigSetParameter ConfigSetParameter;
-static ptr_ConfigGetParameterType ConfigGetParameterType;
 static ptr_ConfigSetDefaultInt ConfigSetDefaultInt;
 static ptr_ConfigSetDefaultBool ConfigSetDefaultBool;
 static ptr_ConfigSetDefaultString ConfigSetDefaultString;
@@ -136,7 +135,6 @@ EXPORT m64p_error CALL PluginStartup(m64p_dynlib_handle core, void *context, voi
     SYM(ConfigOpenSection, ptr_ConfigOpenSection, "ConfigOpenSection");
     SYM(ConfigSaveSection, ptr_ConfigSaveSection, "ConfigSaveSection");
     SYM(ConfigSetParameter, ptr_ConfigSetParameter, "ConfigSetParameter");
-    SYM(ConfigGetParameterType, ptr_ConfigGetParameterType, "ConfigGetParameterType");
     SYM(ConfigSetDefaultInt, ptr_ConfigSetDefaultInt, "ConfigSetDefaultInt");
     SYM(ConfigSetDefaultBool, ptr_ConfigSetDefaultBool, "ConfigSetDefaultBool");
     SYM(ConfigSetDefaultString, ptr_ConfigSetDefaultString, "ConfigSetDefaultString");
@@ -172,17 +170,6 @@ EXPORT m64p_error CALL PluginStartup(m64p_dynlib_handle core, void *context, voi
     ConfigSetDefaultBool(l_cfg_foir, "VIGamma", l_cfg.vi_gamma, "Apply the VI's gamma correction when the game enables it; costs emulation-thread time");
     ConfigSetDefaultBool(l_cfg_foir, "CropOverscanH", l_cfg.crop_h, "Crop 8 VI pixels off the left and right edges of the image (hides edge artefacts; display only)");
     ConfigSetDefaultBool(l_cfg_foir, "CropOverscanV", l_cfg.crop_v, "Crop 12 VI lines off the top and bottom edges of the image (hides edge artefacts; display only)");
-    {   /* the single VIFilters key of the first version: if a config file still holds it set, all four new keys are turned on and it is cleared */
-        m64p_type t;
-        if (ConfigGetParameterType(l_cfg_foir, "VIFilters", &t) == M64ERR_SUCCESS && t == M64TYPE_BOOL) {
-            int on = ConfigGetParamBool(l_cfg_foir, "VIFilters") != 0, off = 0;
-            if (on) {
-                static const char *const keys[] = { "VIAntiAliasing", "VIDivot", "VIDedither", "VIGamma" };
-                for (unsigned i = 0; i < 4; i++) ConfigSetParameter(l_cfg_foir, keys[i], M64TYPE_BOOL, &on);
-            }
-            ConfigSetParameter(l_cfg_foir, "VIFilters", M64TYPE_BOOL, &off);
-        }
-    }
     ConfigSaveSection("Video-General");
     ConfigSaveSection("Video-Foir");
 
@@ -570,9 +557,9 @@ static const struct foir_suxty_option l_opts[OPT_COUNT] = {
     [OPT_CROP_H]     = { "CropOverscanH", "Crop Overscan H", "Hide edge artefacts: crop 8 VI pixels off the left and right", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 0 },
     [OPT_CROP_V]     = { "CropOverscanV", "Crop Overscan V", "Hide edge artefacts: crop 12 VI lines off the top and bottom", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 0 },
     [OPT_VIAA]       = { "VIAntiAliasing", "VI Anti-Aliasing", "Edge anti-aliasing as the VI does, where the game uses it (costs time)", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 0 },
-    [OPT_VIDIVOT]    = { "VIDivot", "VI Divot", "Divot filter as the VI does, where the game uses it (costs time)", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 0 },
+    [OPT_VIDIVOT]    = { "VIDivot", "VI Divot", "Divot filter as the VI does, where the game uses it (costs time)", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 1 },
     [OPT_VIDEDITHER] = { "VIDedither", "VI Dither Restore", "Dither restore as the VI does, where the game uses it (costs time)", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 0 },
-    [OPT_VIGAMMA]    = { "VIGamma", "VI Gamma", "Gamma correction as the VI does, where the game uses it (costs time)", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 0 },
+    [OPT_VIGAMMA]    = { "VIGamma", "VI Gamma", "Gamma correction as the VI does, where the game uses it (costs time)", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 1 },
 };
 
 static bool l_staged_set[OPT_COUNT];

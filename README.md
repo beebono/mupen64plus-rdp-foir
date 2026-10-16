@@ -62,7 +62,8 @@ Main `[Video-Foir]` options (all of them, the environment variables and the suxt
 | `VSync` | `True` | Wait for vertical sync when presenting |
 | `Threads` | `0` | Worker threads: `0` = auto (cores - 1), `-1` = none (render on the emulation thread), `1`..`7` |
 | `FrameSkip` | `0` | `0` = off, `N` = render one frame in `N+1`, `auto` = skip to hold full speed |
-| `VIAntiAliasing`, `VIDivot`, `VIDedither`, `VIGamma` | `False` | Apply that VI filter when the game enables it (anti-aliasing from the coverage bits, divot, dither restore, gamma); 0.3-0.85 ms per frame each (about 3.5 ms for AA in an edge-heavy scene), all four 1.4-1.9 ms |
+| `VIDivot`, `VIGamma` | `True` | Apply that VI filter when the game enables it (anti-aliasing from the coverage bits, divot, dither restore, gamma); 0.2-0.5 ms per frame each; filtered 16-bit images use the same full-range colour as unfiltered ones (white 255, unlike angrylion's 248) |
+| `VIAntiAliasing`, `VIDedither` | `False` | Same for the VI's anti-aliasing (0.3-0.6 ms, about 3.5 ms in an edge-heavy scene) and dither restore (0.7-0.85 ms); all four together 1.4-1.9 ms |
 | `CropOverscanH`, `CropOverscanV` | `False` | Crop 8 columns (left and right) / 12 lines (top and bottom) of VI pixels off the image, to hide edge artefacts; display only |
 | `InterlaceHack` | `True` | Show only the freshest field of field-rendered interlaced frames |
 | `RelaxedPrecision` | `False` | `True` = faster Z compare for opaque/transparent modes (about 3 % of pixel-worker time); not exact (see Status) |
@@ -79,7 +80,7 @@ offline on captured frames of 62 games. Known gaps (full list in [docs/design.md
 
 - **`RelaxedPrecision` (off by default) is not exact when turned on**: it drops the delta-Z terms of the opaque/transparent depth compare for partially covered
   pixels, which affects only coplanar edge cases, and saves about 3 % of pixel-worker time (0.1-0.6 ms/frame). The default is exact.
-- **VI filters are opt-in** (`VIAntiAliasing`, `VIDivot`, `VIDedither`, `VIGamma`, off by default: 1.4-1.9 ms per frame for all four on the handhelds, about 4.4-4.8 ms in a scene full of edges): anti-aliasing, divot, dither restore and gamma
+- **VI filters**: `VIDivot` and `VIGamma` are on by default, `VIAntiAliasing` and `VIDedither` opt-in (all four: 1.4-1.9 ms per frame on the handhelds, about 4.4-4.8 ms in a scene full of edges): anti-aliasing, divot, dither restore and gamma
   as the game enables them and the option allows, bit-exact with angrylion at the source pixels (not the VI's own resampling, not gamma-dither noise); otherwise the VI stage crops, converts and
   scales the framebuffer, with `InterlaceHack` for field-rendered interlaced frames. `FBRead` / `FBWrite` only drain the workers, so there is no framebuffer emulation for CPU effects.
 - **One-cycle perspective LOD with a max level above 0** is not angrylion-exact in the far part of a plane (the scalar reference differs, and the NEON path follows it).

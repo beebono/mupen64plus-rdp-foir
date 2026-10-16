@@ -9,9 +9,9 @@ foir reads its settings from the `[Video-Foir]` section of `mupen64plus.cfg` (wr
 | `Widescreen` | `False` | Stretch the image to the whole window instead of keeping 4:3. |
 | `Filter` | `False` | Bilinear filtering when scaling the VI image to the window (off = nearest neighbour). |
 | `VIAntiAliasing` | `False` | Apply the VI's coverage anti-aliasing when the game enables it (`aa_mode` 0 or 1 in `VI_STATUS`). A filter runs only when the game bit **and** the option are set (details and exactness in [design.md](design.md#vi-filter-pass)). Runs the filter pass: 0.3-0.6 ms per frame over the plain conversion in a typical scene, about 3.5 ms in a scene with many edges (Pokemon Snap). Applies at once. |
-| `VIDivot` | `False` | Apply the VI's divot filter when the game enables it (`divot_enable`). About 0.5 ms per frame. Applies at once. |
+| `VIDivot` | `True` | Apply the VI's divot filter when the game enables it (`divot_enable`). About 0.5 ms per frame. Applies at once. |
 | `VIDedither` | `False` | Apply the VI's dither restore when the game enables it (`dither_filter_enable`); smooths the 4x4 dither pattern. About 0.7-0.85 ms per frame. Applies at once. |
-| `VIGamma` | `False` | Apply the VI's gamma correction when the game enables it (`gamma_enable`). About 0.5 ms per frame. Applies at once. |
+| `VIGamma` | `True` | Apply the VI's gamma correction when the game enables it (`gamma_enable`). About 0.5 ms per frame. Applies at once. |
 | `CropOverscanH` | `False` | Crop 8 VI pixels off both the left and the right edge of the image (16 each for a hi-res image, 512 or more pixels wide) before it is scaled. Hides the edge garbage some games leave in the outermost columns, which a TV's overscan would hide. Display only. Applies at once. |
 | `CropOverscanV` | `False` | Crop 12 lines off both the top and the bottom edge (24 each for a frame of 360 or more lines). Same purpose; display only. Applies at once. |
 | `VSync` | `True` | Wait for vertical sync when presenting. |
@@ -107,7 +107,7 @@ foir exports one extra function, `FoirSuxtyGetInterface()` (declared in `src/foi
 | 14 | `VIDedither` | bool | at once |
 | 15 | `VIGamma` | bool | at once |
 
-Id 12 was the single `VIFilters` bool of the first version (never released); it now is `VIAntiAliasing`. suxty keys options by name (`[foir] <Key>` in `suxty.cfg` or a game file), so a stale `VIFilters` line there is ignored; in `mupen64plus.cfg` a `VIFilters = True` is migrated at the next start (all four new keys set to `True`, `VIFilters` set to `False`).
+Id 12 was the single `VIFilters` bool of the first version (never released); it now is `VIAntiAliasing`; there is no migration of the old key.
 
 *Why these are live.* `Widescreen` and `Filter` are read when the frame is drawn, `CropOverscanH`, `CropOverscanV`, `VIAntiAliasing`, `VIDivot`, `VIDedither` and `VIGamma` by the VI conversion (they are copied into the RDP's config at once, like `InterlaceHack`), `InterlaceHack` by the VI conversion and `FrameSkip` by the `SYNC_FULL` hook, all on the emulation thread and none in the workers' private copy of the config. *Why the others are not.* `Threads`, `NEON`, `Specialize` and `FastCombiner` choose the kernel tables and the worker pool at start; `RelaxedPrecision` is part of the specialisation key and is copied into every worker; `VSync` is applied when the window is created. Changing them mid-game would mean rebuilding the pipeline.
 

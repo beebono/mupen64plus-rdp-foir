@@ -9,7 +9,10 @@
  *
  * vi_filter_row_ref() is a straight port of the oracle (it reads RDRAM through the same accessors); vi_filter_row()
  * is the NEON version for 16-bit frame buffers and falls back to the reference for 32-bit ones.  Output pixels are
- * RGBA8888 with angrylion's 5-to-8 bit conversion (the 5 bits shifted up, white is 248).
+ * RGBA8888.  Intentional divergence from angrylion: for 16-bit buffers the 8-bit result of the whole pass (after AA, divot,
+ * dither restore and gamma, which all work on the 5-bit values shifted up by 3 as in the oracle) is expanded to full range as
+ * v + (v >> 5), clamped to 255, the same mapping the plain conversion has (5-bit replication, white = 255), where angrylion leaves
+ * white at 248.  32-bit buffers already hold 8-bit values and are output as they are.
  *
  * Copyright (C) 2026 foir contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -215,6 +218,12 @@ static void row_out(const struct vi_filter_ctx *c, const struct px *p, int n, ui
     for (int i = 0; i < n; i++) {
         uint32_t rr = (uint32_t)p[i].r, gg = (uint32_t)p[i].g, bb = (uint32_t)p[i].b;
         if (c->gamma) { rr = g_gamma[rr]; gg = g_gamma[gg]; bb = g_gamma[bb]; }
+        if (!c->t32) {   /* full-range expansion of 16-bit buffers, see the header */
+            rr = rr + (rr >> 5); gg = gg + (gg >> 5); bb = bb + (bb >> 5);
+            if (rr > 255) rr = 255;
+            if (gg > 255) gg = 255;
+            if (bb > 255) bb = 255;
+        }
         dst[i] = 0xff000000u | (bb << 16) | (gg << 8) | rr;
     }
 }
@@ -396,6 +405,7 @@ void vi_filter_row(const struct rdp *r, const struct vi_filter_ctx *c, int sy, i
             cr = vbslq_u8(full, cr, dr); cg = vbslq_u8(full, cg, dg); cb = vbslq_u8(full, cb, db);
         }
         if (c->gamma) { cr = GAMMA(cr); cg = GAMMA(cg); cb = GAMMA(cb); }
+        cr = vqaddq_u8(cr, vshrq_n_u8(cr, 5)); cg = vqaddq_u8(cg, vshrq_n_u8(cg, 5)); cb = vqaddq_u8(cb, vshrq_n_u8(cb, 5));   /* full range, as row_out() */
         uint8x16x4_t o = { { cr, cg, cb, vdupq_n_u8(0xff) } };
         if (i + 16 <= n) vst4q_u8((uint8_t *)(dst + i), o);
         else {

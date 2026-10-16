@@ -6,13 +6,15 @@ filter and gamma, the same buffer read as RGBA8888, buffers that were not render
 combinations for a status with every filter on, as 16-bit and RGBA8888 buffers) it requires
   * a filter runs when the game bit and the option are both set: angrylion is given the status with the other filters' bits cleared (AA off = aa_mode 2);
     foir's "filter pass" flag must be set exactly when a filter is left (otherwise the plain conversion is taken, which expands 5 bits by replication,
-    so the 16-bit oracle value o is compared as o | o >> 5);
+    so the 16-bit oracle value o is compared through full_range()).
+Divergence from angrylion, intended: for 16-bit buffers the filtered path ends in the same full-range 5-to-8 bit expansion as the plain path (angrylion's
+white is 248, foir's 255), so every 16-bit oracle value is compared through full_range(), which is written down here independently of foir's code;
   * foir's NEON code (under qemu with --qreplay) to give exactly the frame of the scalar reference (foir-replay --vi-variants, interlaced and
     rescaled dumps included);
   * the reference to give, at every source pixel the VI reads exactly (even columns of the 640-wide oracle output at x_scale 0x200, y_scale 0x400,
     away from the 4 pixels the oracle blanks at each end; no interlaced or rescaled dumps), the bytes angrylion's VI gives (ref-angrylion -V).
 gamma_dither_enable is cleared in these variants, because angrylion adds random noise that foir does not; the dump's own status is also compared with
-the noise bit set, where foir must equal the oracle or be one lower per channel.  Pixels within the filter's reach of a pixel that foir's RDP renders
+the noise bit set, where foir must equal the oracle or be one lower per channel (before the full-range mapping).  Pixels within the filter's reach of a pixel that foir's RDP renders
 differently from angrylion (Kirby 64's known 107) are exempt.
 Run from projects/unix after `make all replay ref NEON=0` (and the aarch64 build for the NEON check)."""
 import argparse, glob, lzma, os, re, struct, subprocess, sys, tempfile
@@ -59,6 +61,12 @@ def variants_for(st, org):
         v.append(('options %x partly on aa1 dither' % m, base | t | (1 << 8) | DFILT, org, m))
         v.append(('options %x aa0 gamma' % m, base | t | GAMMA, org, m))
     return v
+
+
+def full_range(v):
+    """foir's deliberate divergence from angrylion for 16-bit buffers: angrylion's 8-bit channel (5 bits << 3, after the filters; white 248) is mapped
+    to full range, v + v // 32 capped at 255 (white 255; for the unfiltered values c << 3 this is 5-bit replication).  32-bit buffers are left alone."""
+    return min(255, v + v // 32)
 
 
 def read_ppm(p):
@@ -116,7 +124,7 @@ def main():
                 print('FAIL %s: ref-angrylion: %s' % (name, rr.stderr.strip())); bad += 1; continue
             hres, hs_a, vs_a = hen - hst, hst - 108, (vst - 34) // 2
 
-            def diffs(fn, on, expand=False):
+            def diffs(fn, on, expand=False):   # expand: 16-bit buffer, the oracle goes through full_range()
                 fw, fh, fp = read_ppm(fn)
                 ow, oh, op = read_ppm(on)
                 out, n = [], 0
@@ -126,12 +134,12 @@ def main():
                     for i in range(4, min(fw, (hres - 8) // 2 + 1)):
                         n += 1
                         f, o = (j * fw + i) * 3, ((vs_a + j) * ow + hs_a + 2 * i) * 3
-                        if (fp[f:f + 3] != bytes(x | (x >> 5) for x in op[o:o + 3])) if expand else (fp[f:f + 3] != op[o:o + 3]):
+                        if (fp[f:f + 3] != bytes(full_range(x) for x in op[o:o + 3])) if expand else (fp[f:f + 3] != op[o:o + 3]):
                             out.append((i, j))
                 return n, out
 
             def plain16(k):
-                return not exp_pass[k] and variants[k][1] & 3 == 2
+                return variants[k][1] & 3 == 2
 
             def near_of(vname):
                 k = [i for i, (vn, _, _, _) in enumerate(variants) if vn == vname][0]
@@ -165,7 +173,7 @@ def main():
                     for i in range(4, min(fw, (hres - 8) // 2 + 1)):
                         f, o = (j * fw + i) * 3, ((vs_a + j) * ow + hs_a + 2 * i) * 3
                         n += 1
-                        if (i, j) not in near and any(op[o + c] - fp[f + c] not in ((0, 1) if fp[f + c] < 255 else (0,)) for c in range(3)):
+                        if (i, j) not in near and any(fp[f + c] not in ((full_range(op[o + c]), full_range(op[o + c] - 1)) if st & 3 == 2 else (op[o + c], op[o + c] - 1)) for c in range(3)):
                             nd += 1
                 checks += 1
                 bad += nd != 0
