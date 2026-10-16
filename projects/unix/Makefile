@@ -142,7 +142,8 @@ CORE_SOURCE = \
 	$(SRCDIR)/kernels_neon.c \
 	$(NEON_SOURCE) \
 	$(SRCDIR)/spec.c \
-	$(SRCDIR)/vi.c
+	$(SRCDIR)/vi.c \
+	$(SRCDIR)/vi_filter.c
 
 PLUGIN_SOURCE = \
 	$(SRCDIR)/plugin.c \

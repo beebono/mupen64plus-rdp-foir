@@ -8,6 +8,7 @@ foir reads its settings from the `[Video-Foir]` section of `mupen64plus.cfg` (wr
 |---|---|---|
 | `Widescreen` | `False` | Stretch the image to the whole window instead of keeping 4:3. |
 | `Filter` | `False` | Bilinear filtering when scaling the VI image to the window (off = nearest neighbour). |
+| `VIFilters` | `False` | Apply the VI filters the game enables in `VI_STATUS`: anti-aliasing from the coverage bits, divot, dither restore and gamma (details and exactness in [design.md](design.md#vi-filter-pass)). Costs 1.2-1.6 ms per frame on the handhelds (about 4 ms in a scene with many partially covered pixels), so it is off by default. Applies at once. |
 | `CropOverscanH` | `False` | Crop 8 VI pixels off both the left and the right edge of the image (16 each for a hi-res image, 512 or more pixels wide) before it is scaled. Hides the edge garbage some games leave in the outermost columns, which a TV's overscan would hide. Display only. Applies at once. |
 | `CropOverscanV` | `False` | Crop 12 lines off both the top and the bottom edge (24 each for a frame of 360 or more lines). Same purpose; display only. Applies at once. |
 | `VSync` | `True` | Wait for vertical sync when presenting. |
@@ -86,8 +87,9 @@ foir exports one extra function, `FoirSuxtyGetInterface()` (declared in `src/foi
 | 9 | `RelaxedPrecision` | bool | next launch |
 | 10 | `CropOverscanH` | bool | at once |
 | 11 | `CropOverscanV` | bool | at once |
+| 12 | `VIFilters` | bool | at once |
 
-*Why these are live.* `Widescreen` and `Filter` are read when the frame is drawn, `CropOverscanH` / `CropOverscanV` by the VI conversion (they are copied into the RDP's config at once, like `InterlaceHack`), `InterlaceHack` by the VI conversion and `FrameSkip` by the `SYNC_FULL` hook, all on the emulation thread and none in the workers' private copy of the config. *Why the others are not.* `Threads`, `NEON`, `Specialize` and `FastCombiner` choose the kernel tables and the worker pool at start; `RelaxedPrecision` is part of the specialisation key and is copied into every worker; `VSync` is applied when the window is created. Changing them mid-game would mean rebuilding the pipeline.
+*Why these are live.* `Widescreen` and `Filter` are read when the frame is drawn, `CropOverscanH`, `CropOverscanV` and `VIFilters` by the VI conversion (they are copied into the RDP's config at once, like `InterlaceHack`), `InterlaceHack` by the VI conversion and `FrameSkip` by the `SYNC_FULL` hook, all on the emulation thread and none in the workers' private copy of the config. *Why the others are not.* `Threads`, `NEON`, `Specialize` and `FastCombiner` choose the kernel tables and the worker pool at start; `RelaxedPrecision` is part of the specialisation key and is copied into every worker; `VSync` is applied when the window is created. Changing them mid-game would mean rebuilding the pipeline.
 
 *Thread safety.* `get()` / `set()` must be called on the emulation thread, not from inside a foir call. suxty's menu runs inside the buffer swap, which `UpdateScreen()` issues last, after the workers have been drained and the frame uploaded: nothing else touches the live options while the menu is open, and the next `ProcessRDPList()` starts after the menu returns. Once the ROM is open a call from another thread is refused.
 

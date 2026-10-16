@@ -375,6 +375,22 @@ So 1-17 % of the Z-compare pixels (typically 3-10 %) are partially covered, whic
 
 Limits: the generic build carried `-DFOIR_FRAMELOG` in both settings (the overhead is the same in both); the 3-worker pool hides part of the saving in wall time; runs of the same game differ in the scene reached by the scripted input (Ocarina True run 1, Pilotwings False run 1), which is why the medians are quoted; audio was the dummy plugin.
 
+## VI filter pass
+
+`foir-replay --vi-bench 100`, rgdsplus (4x A55, `performance` governor, 1.58 GHz real) and rg35xxsp (4x A53, `cpu_perf.sh on`, 1512 MHz), the glibc 2.31 build of foir-todo, 100 frames per mode, ms per VI frame (rg35xxsp: three runs per dump, which agree within 1 %; rgdsplus: one run of this build, three runs of the first build agreed within 1 %) of the already rendered dump frame (VI conversion only; modes alternate inside each run). The "aa0 + divot + dither restore" row is the usual 0x13016 set of status bits.
+
+| mode (RK3566, A55) | Banjo 292x213 | DKR | Paper Mario | Snap |
+|---|---|---|---|---|
+| unfiltered conversion | 0.17 | 0.20 | 0.20 | 0.20 |
+| filter pass, nothing enabled | 0.41 | 0.47 | 0.47 | 0.47 |
+| dither restore | 0.92 | 1.06 | 1.06 | 1.06 |
+| divot | 0.61 | 0.69 | 0.69 | 0.69 |
+| gamma | 0.60 | 0.68 | 0.68 | 0.68 |
+| aa0 + divot + dither restore | 1.20 | 1.60 | 1.39 | 4.11 |
+| scalar reference, same | 7.9 | 9.8 | 9.6 | 12.4 |
+
+The H700 (A53) numbers are within 5 % of these in every row except Snap's last (4.6 ms). Partially covered pixels: Banjo 0 %, Paper Mario 0 %, DKR 1 %, Snap 21 % (44 % of the 16-pixel groups). Cost of the first version (3-line reload per output line, 16-bit planes, scalar AA from RDRAM): 1.9-2.8 ms typical and 7.2 ms for Snap; the line cache, 8-bit planes and AA from the converted lines halved it. What it would still take: the restore filter is operation bound (24 compares and 24 adds per 16 pixels and channel; computing each neighbour pair once would save about a third), the scalar AA filter costs about 165 ns per partially covered pixel, and the pass could run on the idle workers (they are drained at the VI scan-out). **Decision:** `VIFilters` stays off by default: 1.2-1.6 ms is 7-10 % of a 60 fps frame on the emulation thread, 4 ms (25 %) in an edge-heavy 3D scene, for a quality gain most people notice only on the dither pattern and on Banjo-Kazooie-style jagged logos. The option is live and can be set per game from suxty.
+
 ## Tried and rejected
 
 Each of these was built and measured with the same method; differences below about 1 % are noise.

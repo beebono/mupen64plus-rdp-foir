@@ -23,7 +23,9 @@ int main(int argc, char **argv)
 {
     const char *in = NULL, *out_rdram = NULL, *out_ppm = NULL;
     int repeats = 1;
-    bool neon = true, nopix = false, fast = false, weave = false, spec = true, crop_h = false, crop_v = false;
+    bool neon = true, nopix = false, fast = false, weave = false, spec = true, crop_h = false, crop_v = false, vi_filters = false;
+    const char *vi_variants = NULL;
+    int vi_bench = 0;
     int force_field = -1;
     int threads = 0;
     for (int i = 1; i < argc; i++) {
@@ -37,13 +39,16 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--fast")) fast = true;
         else if (!strcmp(argv[i], "--weave")) weave = true;
         else if (!strcmp(argv[i], "--field") && i + 1 < argc) force_field = atoi(argv[++i]) & 1;
+        else if (!strcmp(argv[i], "--vi-filters")) vi_filters = true;
+        else if (!strcmp(argv[i], "--vi-bench") && i + 1 < argc) vi_bench = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--vi-variants") && i + 1 < argc) vi_variants = argv[++i];
         else if (!strcmp(argv[i], "--crop-h")) crop_h = true;
         else if (!strcmp(argv[i], "--crop-v")) crop_v = true;
         else if (!strcmp(argv[i], "-t") && i + 1 < argc) threads = atoi(argv[++i]);
         else if (argv[i][0] != '-') in = argv[i];
         else { fprintf(stderr, "unknown option %s\n", argv[i]); return 2; }
     }
-    if (!in) { fprintf(stderr, "usage: %s dump.fdump [-o out.rdram] [-p out.ppm] [-n repeats] [--scalar] [--nospec] [-t threads] [--fast] [--weave] [--crop-h] [--crop-v] [--field 0|1]\n", argv[0]); return 2; }
+    if (!in) { fprintf(stderr, "usage: %s dump.fdump [-o out.rdram] [-p out.ppm] [-n repeats] [--scalar] [--nospec] [-t threads] [--fast] [--weave] [--crop-h] [--crop-v] [--field 0|1] [--vi-filters] [--vi-variants s0,s1,..] [--vi-bench N]\n", argv[0]); return 2; }
 
     FILE *fp = fopen(in, "rb");
     if (!fp) { perror(in); return 1; }
@@ -69,6 +74,7 @@ int main(int argc, char **argv)
     /* the reference comparison runs with the accuracy-preserving knob settings; --fast turns RelaxedPrecision on */
     cfg.relaxed_precision = fast;
     if (weave) cfg.interlace_hack = false;
+    cfg.vi_filters = vi_filters;
     cfg.crop_h = crop_h; cfg.crop_v = crop_v;
 
     static struct rdp r;
@@ -188,6 +194,79 @@ int main(int argc, char **argv)
             fputc(px & 0xff, o); fputc((px >> 8) & 0xff, o); fputc((px >> 16) & 0xff, o);
         }
         fclose(o);
+    }
+    if (vi_variants && out_ppm) {
+        /* VI filter test hook: show the rendered frame again with each VI_STATUS in the list, with the reference code (written to
+         * out.ppm.<k>.ppm) and with the NEON code, and count the differing pixels between the two */
+        static struct vi_frame fa, fb;
+        char list[1024];
+        snprintf(list, sizeof list, "%s", vi_variants);
+        int k = 0, bad = 0;
+        r.cfg.vi_filters = true;
+        for (char *tok = strtok(list, ","); tok; tok = strtok(NULL, ","), k++) {
+            char *colon = strchr(tok, ':');   /* status[:origin] */
+            struct vi_regs v = { (uint32_t)strtoul(tok, NULL, 0), colon ? (uint32_t)strtoul(colon + 1, NULL, 0) : h.vi[1], h.vi[2], h.vi[3], h.vi[4], h.vi[5], h.vi[6] };
+            r.cfg.neon = false; vi_render(&r, &v, &fa);
+            r.cfg.neon = true;  vi_render(&r, &v, &fb);
+            int diff = fa.width != fb.width || fa.height != fb.height;
+            for (int i = 0; !diff && i < fa.width * fa.height; i++) diff += fa.pixels[i] != fb.pixels[i];
+            bad += diff != 0;
+            printf("vi variant %d status %#x: %dx%d, NEON vs reference: %d differing\n", k, v.status, fa.width, fa.height, diff);
+            char name[1024];
+            snprintf(name, sizeof name, "%s.%d.ppm", out_ppm, k);
+            FILE *o = fopen(name, "wb");
+            if (!o) { perror(name); return 1; }
+            fprintf(o, "P6\n%d %d\n255\n", fa.width, fa.height);
+            for (int i = 0; i < fa.width * fa.height; i++) { uint32_t px = fa.pixels[i]; fputc(px & 0xff, o); fputc((px >> 8) & 0xff, o); fputc((px >> 16) & 0xff, o); }
+            fclose(o);
+        }
+        if (bad) { fprintf(stderr, "foir-replay: %d VI variants differ between NEON and the reference\n", bad); return 1; }
+        out_ppm = NULL;
+    }
+    if (vi_bench > 0) {
+        /* time of the VI conversion of the rendered frame: unfiltered, then the filter pass with the dump's own status and with AA + divot + dither
+         * restore forced on (the usual 0x13016 set), NEON build and (r.cfg.neon off) the reference code */
+        static struct vi_frame fr;
+        struct vi_regs v0 = { h.vi[0], h.vi[1], h.vi[2], h.vi[3], h.vi[4], h.vi[5], h.vi[6] };
+        {
+            int w = (int)((((h.vi[3] & 0x3ff) - ((h.vi[3] >> 16) & 0x3ff)) * (h.vi[5] & 0xfff)) >> 10), hh = (int)(((((h.vi[4] & 0x3ff) - ((h.vi[4] >> 16) & 0x3ff)) >> 1) * (h.vi[6] & 0xfff)) >> 10);
+            long part = 0, tot = 0, grp = 0;
+            for (int y = 0; y < hh; y++)
+                for (int x = 0; x < w; x += 16) {
+                    int any = 0;
+                    for (int k = 0; k < 16 && x + k < w; k++) {
+                        uint16_t p; uint8_t hv;
+                        rdram_rd_pair16(&r, ((h.vi[1] & 0xffffff) >> 1) + (uint32_t)(y * (h.vi[2] & 0xfff) + x + k), &p, &hv);
+                        int partial = (((p & 1) << 2) | hv) != 7;
+                        part += partial; tot++; any |= partial;
+                    }
+                    grp += any;
+                }
+            printf("vi bench coverage: %.2f %% of the pixels below full coverage, %.1f %% of the 16-pixel groups hold one\n", 100.0 * part / tot, 100.0 * grp / ((tot + 15) / 16));
+        }
+        static const struct { const char *name; uint32_t add; bool filt, neon; } modes[] = {
+            { "unfiltered", 0, false, true },
+            { "pass only (aa2, nothing on)", 0x200, true, true },
+            { "dither restore (aa2)", 0x10200, true, true },
+            { "divot (aa2)", 0x210, true, true },
+            { "gamma (aa2)", 0x208, true, true },
+            { "aa0 + divot + dither restore", 0x10010, true, true },
+            { "reference code, same", 0x10010, true, false },
+        };
+        for (unsigned mode = 0; mode < sizeof modes / sizeof modes[0]; mode++) {
+            r.cfg.vi_filters = modes[mode].filt;
+            r.cfg.neon = modes[mode].neon;
+            struct vi_regs v = v0;
+            v.status = (h.vi[0] & ~0x1031cu) | modes[mode].add;
+            if (mode == 0) v = v0;
+            struct timespec t0, t1;
+            vi_render(&r, &v, &fr);
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            for (int k = 0; k < vi_bench; k++) vi_render(&r, &v, &fr);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            double ms = ((t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) * 1e-6) / vi_bench;
+            printf("vi bench %-32s %dx%d  %.3f ms/frame\n", modes[mode].name, fr.width, fr.height, ms);
+        }
     }
     rdp_destroy(&r);
     free(snap); free(rdram); free(cmds);

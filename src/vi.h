@@ -24,6 +24,18 @@ struct vi_frame {
     float screen_w, screen_h;
 };
 
+/* VI filter pass (VIFilters): AA from coverage, divot, dither restore and gamma, as angrylion-rdp-plus does at an exact source pixel */
+struct vi_filter_ctx {
+    uint32_t base, stride;     /* first pixel (in 16 or 32-bit units) and the line width */
+    bool t32, divot, gamma, dither;
+    int aa;                    /* VI_STATUS aa_mode */
+    uint32_t gen;              /* one per setup (per frame): invalidates the converted-line cache */
+};
+bool vi_filter_setup(const struct rdp *r, const struct vi_regs *regs, struct vi_filter_ctx *c);
+/* n output pixels of source line sy starting at source column x0 */
+void vi_filter_row(const struct rdp *r, const struct vi_filter_ctx *c, int sy, int x0, int n, uint32_t *dst);
+void vi_filter_row_ref(const struct rdp *r, const struct vi_filter_ctx *c, int sy, int x0, int n, uint32_t *dst);
+
 void vi_render(const struct rdp *r, const struct vi_regs *regs, struct vi_frame *out);
 void vi_render_ex(const struct rdp *r, const struct vi_regs *regs, struct vi_frame *out, bool allow_raw16);
 

@@ -123,7 +123,9 @@ void vi_render_ex(const struct rdp *r, const struct vi_regs *regs, struct vi_fra
     /* InterlaceHack: the buffer holds one fresh field; weaving it would mix in the previous one, so show its rows twice */
     bool fieldhack = r->cfg.interlace_hack && (regs->status & 0x40) && r->scfield && h >= 2;
     int field = r->sckeepodd & 1;
-    const bool raw = allow_raw16 && type == 2;
+    struct vi_filter_ctx fc;
+    const bool filt = r->cfg.vi_filters && vi_filter_setup(r, regs, &fc);
+    const bool raw = allow_raw16 && type == 2 && !filt;
     for (int y = 0; y < oh; y++) {
         int yy = y + cy;       /* line of the uncropped image; cy is even, so line pairs stay together */
         int sy = fieldhack ? ((yy & ~1) | field) : yy;
@@ -135,6 +137,7 @@ void vi_render_ex(const struct rdp *r, const struct vi_regs *regs, struct vi_fra
         }
         uint32_t *dst = &out->pixels[y * ow];
         if (fieldhack && (yy & 1)) { memcpy(dst, dst - ow, (size_t)ow * 4); continue; }
+        if (filt) { vi_filter_row(r, &fc, sy, cx, ow, dst); continue; }
         if (type == 2) row16(r, (origin >> 1) + (uint32_t)(sy * stride + cx), ow, dst);
         else           row32(r, (origin >> 2) + (uint32_t)(sy * stride + cx), ow, dst);
     }

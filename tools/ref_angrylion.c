@@ -1,4 +1,4 @@
-/* ref-angrylion dump.fdump -o out.rdram [-p out.ppm]: runs a dump through the angrylion-rdp-plus n64video core (MAME-licensed, linked from the sibling checkout, kept out of the plugin) */
+/* ref-angrylion dump.fdump -o out.rdram [-p out.ppm] [-V vi_status]...: runs a dump through the angrylion-rdp-plus n64video core (MAME-licensed, linked from the sibling checkout, kept out of the plugin) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,13 +14,17 @@ static void intr_cb(void) {}
 
 #define RDRAM_TOTAL 0x1000000u
 #define SCRATCH     0x800000u
+#define h_origin_unset 0xffffffffu
 
 int main(int argc, char **argv)
 {
     const char *in = NULL, *out_rdram = NULL, *out_ppm = NULL;
+    uint32_t vstat[64], vorg[64];
+    int nvstat = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-o") && i + 1 < argc) out_rdram = argv[++i];
         else if (!strcmp(argv[i], "-p") && i + 1 < argc) out_ppm = argv[++i];
+        else if (!strcmp(argv[i], "-V") && i + 1 < argc && nvstat < 64) { char *c = strchr(argv[i + 1], ':'); vorg[nvstat] = c ? (uint32_t)strtoul(c + 1, NULL, 0) : h_origin_unset; vstat[nvstat++] = (uint32_t)strtoul(argv[++i], NULL, 0); }
         else in = argv[i];
     }
     if (!in) { fprintf(stderr, "usage: ref-angrylion dump.fdump -o out.rdram [-p out.ppm]\n"); return 2; }
@@ -44,6 +48,7 @@ int main(int argc, char **argv)
     vi_regs[VI_STATUS] = h.vi[0]; vi_regs[VI_ORIGIN] = h.vi[1]; vi_regs[VI_WIDTH] = h.vi[2];
     vi_regs[VI_H_START] = h.vi[3]; vi_regs[VI_V_START] = h.vi[4];
     vi_regs[VI_X_SCALE] = h.vi[5]; vi_regs[VI_Y_SCALE] = h.vi[6];
+    vi_regs[VI_V_SYNC] = 525;   /* NTSC; without it the oracle's VI draws nothing */
     for (int i = 0; i < VI_NUM_REG; i++) vi_ptr[i] = &vi_regs[i];
     uint32_t dp_regs[DP_NUM_REG] = { 0 };
     uint32_t *dp_ptr[DP_NUM_REG];
@@ -86,10 +91,14 @@ int main(int argc, char **argv)
         fwrite(rdram, 1, h.rdram_size, o);
         fclose(o);
     }
-    if (out_ppm) {
+    /* the frame is rendered once; each -V shows it again with another VI_STATUS (the filter bits), to out.ppm.<k>.ppm */
+    for (int k = (nvstat ? 0 : -1); k < nvstat && out_ppm; k++) {
+        char name[1024];
+        if (k >= 0) { vi_regs[VI_STATUS] = vstat[k]; vi_regs[VI_ORIGIN] = vorg[k] == h_origin_unset ? h.vi[1] : vorg[k]; snprintf(name, sizeof name, "%s.%d.ppm", out_ppm, k); }
+        else snprintf(name, sizeof name, "%s", out_ppm);
         struct n64video_frame_buffer fb = { 0 };
         n64video_update_screen(&fb);
-        FILE *o = fopen(out_ppm, "wb");
+        FILE *o = fopen(name, "wb");
         int w = fb.valid ? (int)fb.width : 320, hh = fb.valid ? (int)fb.height : 240;
         fprintf(o, "P6\n%d %d\n255\n", w, hh);
         for (int y = 0; y < hh; y++)

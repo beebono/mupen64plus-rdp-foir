@@ -159,9 +159,24 @@ An earlier plan was to compile pipeline variants at run time with GNU Lightning.
 
 ## VI output
 
-- foir emulates no VI filters. It crops the active framebuffer region and converts it to RGBA8888 with NEON (about 0.2 ms for 320x237), uploads it as **one texture** through the core's video extension (GLES2; about 0.7 ms including draw and swap on the RK3566), and scales it to the window (`Filter` selects bilinear, `Widescreen` stretches instead of keeping 4:3). `CropOverscanH` / `CropOverscanV` drop a fixed number of VI pixels off each edge during that conversion (see [options.md](options.md#overscan-crop)).
+- By default foir emulates no VI filters (`VIFilters`, [below](#vi-filter-pass)). It crops the active framebuffer region and converts it to RGBA8888 with NEON (about 0.2 ms for 320x237), uploads it as **one texture** through the core's video extension (GLES2; about 0.7 ms including draw and swap on the RK3566), and scales it to the window (`Filter` selects bilinear, `Widescreen` stretches instead of keeping 4:3). `CropOverscanH` / `CropOverscanV` drop a fixed number of VI pixels off each edge during that conversion (see [options.md](options.md#overscan-crop)).
 - `InterlaceHack`: for interlaced output of frames the game rendered one field at a time (`SET_SCISSOR` field bits), only the freshest field is scanned out, line doubled, instead of weaving it with the previous field.
 - A front-end or plugin that overrides VidExt, such as mupen64plus-input-suxty, can draw its overlay on top of that texture.
+
+### VI filter pass
+
+`VIFilters` (live, default off) runs the filters the game enables in `VI_STATUS` over the converted image, from `src/vi_filter.c`. It follows angrylion-rdp-plus (`n64video/vi/`), for the pixels the VI reads at an exact source position (what angrylion's `x_scale` 0x200 / `y_scale` 0x400 output shows in every second column):
+
+- **Anti-aliasing** (`aa_mode` 0 and 1): a pixel whose coverage (the pixel's low bit plus the two hidden bits, with the RDP's fallback of replicating the low bit where the hidden bits are missing) is below 7 is blended with the min / max of itself and the full-coverage pixels among its six neighbours (`video_filter16/32`). `aa_mode` 2 and 3 treat every pixel as fully covered.
+- **Dither restore** (`dither_filter_enable`): a fully covered pixel gets +1 / -1 per channel for each of its eight neighbours that is brighter / darker in the 5-bit channel (`restore_filter16/32`); this is what smooths the 4x4 dither pattern.
+- **Divot**: a pixel with a not fully covered pixel among itself and its left and right neighbours is replaced channel by channel by the median-like pick of `divot_filter`.
+- **Gamma** (`gamma_enable`): the sqrt table of the VI.
+- The 5-bit to 8-bit conversion of the filtered path is angrylion's (the 5 bits shifted up, white is 248), not the bit replication of the unfiltered path.
+- Left out: the VI's own resampling between source pixels (the scale to the window does that; the `Filter` option), the random noise `gamma_dither_enable` adds (as for the RDP's dither, it does not follow the hardware sequence), and the glitch angrylion models for `aa_mode` 3 with a small `H_START`.
+
+`vi_filter_row_ref()` is a literal port of the oracle code (it reads RDRAM through the same accessors, so out-of-range and wrapped reads agree). `vi_filter_row()` is the NEON version for 16-bit colour buffers (32-bit ones use the reference): each source line is converted once per frame into planes of 5-bit channels plus the coverage (a four-line cache), the restore filter runs on 16 pixels at a time in 8-bit lanes on every pixel as if it were fully covered, lanes with coverage below 7 are redone with the AA filter on the converted lines, then divot, gamma (four `tbl` lookups) and the RGBA8888 store. With the filters on the `raw16` upload path is not used.
+
+Cost, `foir-replay --vi-bench` on the RK3566 (A55, `performance`, 1.58 GHz) and the H700 (A53, 1512 MHz), ms per 320x237 frame, three runs each within 1 %: unfiltered 0.20, filter pass with nothing enabled 0.47, dither restore +0.55, divot +0.2, gamma +0.2; the usual AA + divot + dither restore set 1.2-1.6 ms when few pixels are partially covered (Banjo-Kazooie, Paper Mario, Diddy Kong Racing) and 4.1 (A55) / 4.6 (A53) in Pokemon Snap, where 21 % of the pixels (44 % of the 16-pixel groups) are partially covered and the scalar AA filter dominates. The scalar reference takes 8-12 ms.
 
 ## Source layout
 
@@ -190,7 +205,7 @@ test-data/            captured frames for the tests (not in the repository, see 
 
 ## Known gaps
 
-- **VI.** No VI filters (anti-aliasing, divot, gamma, dither) and no 480i deinterlacing beyond `InterlaceHack`. `FBRead` / `FBWrite` only drain the workers: no framebuffer emulation for CPU effects (the core's frame-buffer hooks are off under the dynarec).
+- **VI.** The VI filters are opt-in (`VIFilters`) and skip the VI's resampling between source pixels, gamma-dither noise and the aa_mode 3 glitch; no 480i deinterlacing beyond `InterlaceHack`. `FBRead` / `FBWrite` only drain the workers: no framebuffer emulation for CPU effects (the core's frame-buffer hooks are off under the dynarec).
 - **Exactness.**
   - `RelaxedPrecision` (default off since 2026-10-16) is not exact when turned on. `FastCombiner` and everything else are; with exact settings the output is identical to the scalar reference.
   - One-cycle perspective LOD with a max level above 0 is not angrylion-exact in the far part of the plane (angrylion's `tclod_1cycle_current` has span-edge cases the scalar kernel does not model; the NEON path follows the scalar reference). Detail and sharpen occur in no captured frame; they are covered by the fuzzers and synthetic scenes only.
@@ -212,4 +227,4 @@ test-data/            captured frames for the tests (not in the repository, see 
 - The batch builder is still about 500 instructions per span, mostly the 45 vector stores of a piece, the per-piece prefetch and the edge-zone pixels.
 - Skipping texture / combiner work for lanes the Z test already rejected: 5-15 % of the Z-tested groups in the 3D games are dead, and an early Z pass costs about as much as it saves below roughly 10 %.
 - Fusing stages to keep the 8-pixel working set in registers.
-- VI filters; a faster delta-Z path for interpenetrating states (about 4 % of Super Mario 64's time).
+- Spreading the VI filter pass over the (idle) workers, and a vector AA filter; a faster delta-Z path for interpenetrating states (about 4 % of Super Mario 64's time).
