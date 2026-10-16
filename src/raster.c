@@ -6,6 +6,8 @@
  */
 #include "rdp.h"
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include "mt.h"
 #include "spec.h"
 #include "walk.h"
@@ -644,40 +646,198 @@ void raster_render_job_ref(struct rdp *r, const struct span *rows, int jlo, int 
 
 void rdp_fb_history_reset(struct rdp *r)
 {
-    memset(r->fb_hist_addr, 0xff, sizeof r->fb_hist_addr);
-    memset(r->fb_hist_skipped, 0, sizeof r->fb_hist_skipped);
+    memset(r->fb_hist, 0, sizeof r->fb_hist);
+    for (int i = 0; i < FOIR_FB_HIST; i++) r->fb_hist[i].addr = 0xffffffffu;
+    memset(r->scan_addr, 0xff, sizeof r->scan_addr);
     r->fb_hist_last = r->fb_hist_next = 0;
+    r->scan_next = 0;
+    r->period = r->period_prims = 0;
+    r->period_rendered = false;
+    r->last_rendered = 0xffffffffu;
+    r->good_addr = 0xffffffffu;
+    r->vi_since = false;
 }
 
-static void fb_history_note(struct rdp *r)
+static int fb_history_find(struct rdp *r)
 {
     int i = r->fb_hist_last;
-    if (r->fb_hist_addr[i] != r->fb_address) {
-        for (i = 0; i < 4 && r->fb_hist_addr[i] != r->fb_address; i++) ;
-        if (i == 4) {
+    if (r->fb_hist[i].addr != r->fb_address) {
+        const int nh = r->cfg.skip_legacy ? 4 : FOIR_FB_HIST;   /* the legacy mode keeps the original four entries */
+        for (i = 0; i < nh && r->fb_hist[i].addr != r->fb_address; i++) ;
+        if (i == nh) {
             i = r->fb_hist_next;
-            r->fb_hist_next = (i + 1) & 3;
-            r->fb_hist_addr[i] = r->fb_address;
+            r->fb_hist_next = (i + 1) % nh;
+            memset(&r->fb_hist[i], 0, sizeof r->fb_hist[i]);
+            r->fb_hist[i].addr = r->fb_address;
         }
         r->fb_hist_last = i;
     }
-    r->fb_hist_skipped[i] = r->skip_pixels;
+    return i;
+}
+
+/* the VI origin may start a few lines into the buffer: a colour image at or below it, within 64 KB */
+static bool scan_hit(const struct rdp *r, uint32_t addr)
+{
+    for (int i = 0; i < 8; i++)
+        if (r->scan_addr[i] != 0xffffffffu && r->scan_addr[i] >= addr && r->scan_addr[i] - addr < 0x10000) return true;
+    return false;
+}
+
+void rdp_note_scanout(struct rdp *r, uint32_t vi_origin)
+{
+    vi_origin &= 0xffffff;
+    for (int i = 0; i < 8; i++) if (r->scan_addr[i] == vi_origin) return;
+    r->scan_addr[r->scan_next] = vi_origin;
+    r->scan_next = (r->scan_next + 1) & 7;
+}
+
+void rdp_vi_scanned(struct rdp *r)
+{
+    r->vi_since = true;
 }
 
 bool rdp_fb_skipped(const struct rdp *r, uint32_t vi_origin)
 {
-    /* the VI origin may start a few lines into the buffer: take the nearest colour image at or below it */
     uint32_t o = vi_origin & 0xffffff, best = 0x10000;
     int bi = -1;
-    for (int i = 0; i < 4; i++)
-        if (r->fb_hist_addr[i] <= o && o - r->fb_hist_addr[i] < best) { best = o - r->fb_hist_addr[i]; bi = i; }
-    return bi >= 0 && r->fb_hist_skipped[bi];
+    for (int i = 0; i < FOIR_FB_HIST; i++)
+        if (r->fb_hist[i].addr <= o && o - r->fb_hist[i].addr < best) { best = o - r->fb_hist[i].addr; bi = i; }
+    return bi >= 0 && r->fb_hist[bi].skipped;
+}
+
+void rdp_fb_skip_log(struct rdp *r, uint32_t vi_origin, bool stale)
+{
+    char line[1024];
+    int n = snprintf(line, sizeof line, "skiplog: vi origin %06x %s (refills %u);", vi_origin & 0xffffff, stale ? "HELD (stale)" : "shown", r->stat_repairs);
+    for (int i = 0; i < FOIR_FB_HIST && n < (int)sizeof line - 120; i++) {
+        struct fb_hist_ent *e = &r->fb_hist[i];
+        if (e->addr == 0xffffffffu) continue;
+        if (e->drawn || e->skip_tri || e->skip_fill || e->skip_copy)
+            n += snprintf(line + n, sizeof line - (size_t)n, " [%06x w%d s%d %s%s drawn %u skipped tri %u fill %u copy %u]", e->addr, e->width, e->size,
+                          scan_hit(r, e->addr) ? "scan" : "offscreen", e->skipped ? " skip-frame" : "", e->drawn, e->skip_tri, e->skip_fill, e->skip_copy);
+        e->drawn = e->skip_tri = e->skip_fill = e->skip_copy = 0;
+    }
+    /* a hash of every scanned-out buffer's lines, to see when one changes without a frame starting in it */
+    n = (int)strlen(line);
+    n += snprintf(line + n, sizeof line - (size_t)n, " | hashes:");
+    for (int i = 0; i < 8 && n < (int)sizeof line - 40; i++) {
+        uint32_t a = r->scan_addr[i];
+        if (a == 0xffffffffu) continue;
+        uint32_t best = 0x10000;
+        for (int j = 0; j < FOIR_FB_HIST; j++)
+            if (r->fb_hist[j].addr <= a && a - r->fb_hist[j].addr < best) best = a - r->fb_hist[j].addr;
+        if (best == 0x10000) continue;
+        a -= best;       /* the colour image holding the scan origin */
+        uint32_t hsh = 2166136261u;
+        for (uint32_t k = 0; k < 0x25800 && a + k + 4 <= r->rdram_size; k += 4) hsh = (hsh ^ *(const uint32_t *)(r->rdram + a + k)) * 16777619u;
+        n += snprintf(line + n, sizeof line - (size_t)n, " %06x=%08x", r->scan_addr[i], hsh);
+    }
+    foir_log(FOIR_LOG_INFO, "%s", line);
+    if (getenv("FOIR_RDRAM_BLOCKS")) {     /* bisecting: a hash of each 32 KB block of RDRAM, to compare a skipped run with a full one */
+        char *blk = malloc((size_t)r->rdram_size / 0x8000 * 5 + 64);
+        int m = 0;
+        for (uint32_t b = 0; blk && b + 0x8000 <= r->rdram_size; b += 0x8000) {
+            uint32_t hsh = 2166136261u;
+            for (uint32_t k = 0; k < 0x8000; k += 4) hsh = (hsh ^ *(const uint32_t *)(r->rdram + b + k)) * 16777619u;
+            m += sprintf(blk + m, "%04x ", hsh & 0xffff);
+        }
+        if (blk) { foir_log(FOIR_LOG_INFO, "blocks: %s", blk); free(blk); }
+    }
+}
+
+/* FrameSkip drops primitives, but not those into an off-screen target (a later primitive may texture from it), and not fills and copies
+ * (cheap, and the only thing that ever repaints a border or a backdrop): a skipped frame is the triangles and texture rectangles that
+ * go to a buffer the VI scans out */
+static bool skip_this(struct rdp *r, struct fb_hist_ent *e)
+{
+    if (r->cfg.skip_opts & 32) return false;     /* dry run: all the bookkeeping, no skipping */
+    if (!r->skip_pixels) return false;
+    if (r->cfg.skip_legacy) return true;
+    if (!(r->cfg.skip_opts & 8) && (r->om.cycle_type == CYCLE_TYPE_FILL || r->om.cycle_type == CYCLE_TYPE_COPY)) return false;
+    if (!(r->cfg.skip_opts & 4) && !scan_hit(r, r->fb_address)) return false;
+    return true;
+}
+
+/* A frame, for FrameSkip, starts with the first primitive into a scanned-out colour image after the game switched to another one or the VI
+ * scanned this one out.  Counting SYNC_FULLs instead lets a game that syncs twice per frame (an off-screen target, then the screen) put every
+ * screen frame on the same side of the skip pattern. */
+/* A rendered frame that follows a skipped one into the same buffer starts from a buffer that lacks the skipped frame.  A game that
+ * redraws everything does not care; one that draws on top of what is there (a pause menu over a frozen scene, a HUD) would keep the hole.
+ * So the buffer is refilled with the last frame that was rendered, which is what the game's own picture was one frame ago. */
+static void repair_from_good(struct rdp *r)
+{
+    if (r->good_addr == 0xffffffffu || r->good_addr == r->fb_address || (r->fb_size != 2 && r->fb_size != 3) || r->fb_width <= 0) return;
+    int rows = (r->clip.yl + 3) >> 2;
+    if (rows < 1 || rows > 576) rows = 240;
+    const size_t bpp = r->fb_size == 3 ? 4 : 2, n = (size_t)r->fb_width * bpp * (size_t)rows;
+    const uint32_t dst = r->fb_address & RDRAM_MASK, src = r->good_addr & RDRAM_MASK;
+    if ((size_t)dst + n > r->rdram_size || (size_t)src + n > r->rdram_size) return;
+    if ((dst < src ? src - dst : dst - src) < n) return;     /* overlapping images: not two buffers */
+    if (r->mt) mt_sync(r);                                  /* the previous frame's workers must be done writing the source */
+    memcpy(r->rdram + dst, r->rdram + src, n);
+    if (r->fb_size == 2 && r->hidden) memcpy(r->hidden + (dst >> 1), r->hidden + (src >> 1), n >> 1);
+    r->stat_repairs++;
+}
+
+/* FrameSkip N renders one frame in N + 1; auto follows skip_level (set from the achieved frame rate by the plugin).  A frame that follows a
+ * light one is not worth skipping, and 2D / menu frames are the ones that draw on top of what is already in the buffer. */
+void rdp_skip_decide(struct rdp *r)
+{
+    const int fs = r->cfg.frame_skip;
+    bool skip = false;
+    r->skip_frames++;
+    if (fs > 0) skip = (r->skip_frames % (unsigned)(fs + 1)) != 0;
+    else if (fs == FOIR_FRAMESKIP_AUTO) {
+        if (r->skip_level == 1) skip = (r->skip_frames & 1) != 0;
+        else if (r->skip_level == 2) skip = (r->skip_frames % 3) != 0;
+    }
+    if (skip && !r->cfg.skip_legacy && !r->skip_eligible) skip = false;
+    if (skip) r->stat_skipped++;
+    r->skip_pixels = skip;
+}
+
+/* The frame FrameSkip decides on is a VI period: everything drawn into scanned-out buffers between two scan-outs.  Counting SYNC_FULLs
+ * (or buffer switches) instead lets a game that syncs twice per frame, or draws a frame in two passes into two buffers (the second pass
+ * textures from the first), put the passes on different sides of the skip pattern. */
+static void frame_boundary(struct rdp *r)
+{
+    if (r->cfg.skip_legacy || !r->frame_start_cb || !r->vi_since || !scan_hit(r, r->fb_address)) return;
+    r->vi_since = false;
+    if (r->period_rendered && r->last_rendered != 0xffffffffu) r->good_addr = r->last_rendered;   /* the period that just ended was rendered */
+    r->skip_eligible = ((int)r->period_prims >= r->cfg.skip_min_prims && !r->scfield) || (r->cfg.skip_opts & 2);   /* a field-rendered frame draws half the lines */
+    r->period_prims = 0;
+    r->period++;
+    r->frame_start_cb(r->frame_end_ctx);
+    r->period_rendered = !r->skip_pixels;
+    if (r->cfg.skip_log)
+        foir_log(FOIR_LOG_INFO, "skiplog: period %u starts with a primitive into %06x (field-rendered %d): heavy %d -> %s, good %06x", r->period, r->fb_address, r->scfield,
+                 r->skip_eligible, r->skip_pixels ? "SKIP" : "render", r->good_addr & 0xffffff);
 }
 
 void raster_draw(struct rdp *r, const struct prim_walk *pw, int start, int end)
 {
-    fb_history_note(r);
-    if (r->cfg.debug_nopixels || r->skip_pixels) return;
+    frame_boundary(r);
+    struct fb_hist_ent *e = &r->fb_hist[fb_history_find(r)];
+    if (!r->cfg.skip_legacy && scan_hit(r, r->fb_address)) {
+        if (e->period != r->period) {      /* the first drawing into this buffer in this period */
+            e->period = r->period;
+            if (!r->skip_pixels && e->skipped && !(r->cfg.skip_opts & 1)) repair_from_good(r);
+            e->skipped = r->skip_pixels;
+        }
+        r->period_prims++;
+        if (!r->skip_pixels) r->last_rendered = r->fb_address;
+    } else {
+        e->skipped = r->skip_pixels;
+    }
+    e->width = r->fb_width; e->size = r->fb_size;
+    if (r->cfg.debug_nopixels) return;
+    if (skip_this(r, e)) {
+        if (r->om.cycle_type == CYCLE_TYPE_FILL) e->skip_fill++;
+        else if (r->om.cycle_type == CYCLE_TYPE_COPY) e->skip_copy++;
+        else e->skip_tri++;
+        return;
+    }
+    e->drawn++;
     prim_prepare(r);
     if (r->mt) {
         mt_submit(r, pw, start, end);

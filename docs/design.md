@@ -159,9 +159,24 @@ An earlier plan was to compile pipeline variants at run time with GNU Lightning.
 
 ## VI output
 
-- foir emulates no VI filters. It crops the active framebuffer region and converts it to RGBA8888 with NEON (about 0.2 ms for 320x237), uploads it as **one texture** through the core's video extension (GLES2; about 0.7 ms including draw and swap on the RK3566), and scales it to the window (`Filter` selects bilinear, `Widescreen` stretches instead of keeping 4:3).
+- By default foir emulates no VI filters (`VIAntiAliasing`, `VIDivot`, `VIDedither`, `VIGamma`, [below](#vi-filter-pass)). It crops the active framebuffer region and converts it to RGBA8888 with NEON (about 0.2 ms for 320x237), uploads it as **one texture** through the core's video extension (GLES2; about 0.7 ms including draw and swap on the RK3566), and scales it to the window (`Filter` selects bilinear, `Widescreen` stretches instead of keeping 4:3). `CropOverscanH` / `CropOverscanV` drop a fixed number of VI pixels off each edge during that conversion (see [options.md](options.md#overscan-crop)).
 - `InterlaceHack`: for interlaced output of frames the game rendered one field at a time (`SET_SCISSOR` field bits), only the freshest field is scanned out, line doubled, instead of weaving it with the previous field.
 - A front-end or plugin that overrides VidExt, such as mupen64plus-input-suxty, can draw its overlay on top of that texture.
+
+### VI filter pass
+
+Four live options (`VIDivot` and `VIGamma` default on, `VIAntiAliasing` and `VIDedither` default off), each allow one filter when the game enables it in `VI_STATUS` (game bit AND option), over the converted image, from `src/vi_filter.c`. `vi_filter_setup()` builds the context from both: with `VIAntiAliasing` off an `aa_mode` 0 or 1 buffer is read as `aa_mode` 2 (every pixel fully covered), and a filter whose option is off is dropped. When none is left (no option on, or the game enables none of the allowed ones) it returns false and `vi_render()` takes the plain conversion, including the `raw16` upload path, at 0.2 ms instead of the 0.4 ms filter pass. The output is then the one angrylion gives for the status with the other filters' bits cleared, except for the 5-bit to 8-bit expansion (below, an intended divergence). It follows angrylion-rdp-plus (`n64video/vi/`), for the pixels the VI reads at an exact source position (what angrylion's `x_scale` 0x200 / `y_scale` 0x400 output shows in every second column):
+
+- **Anti-aliasing** (`aa_mode` 0 and 1): a pixel whose coverage (the pixel's low bit plus the two hidden bits, with the RDP's fallback of replicating the low bit where the hidden bits are missing) is below 7 is blended with the min / max of itself and the full-coverage pixels among its six neighbours (`video_filter16/32`). `aa_mode` 2 and 3 treat every pixel as fully covered.
+- **Dither restore** (`dither_filter_enable`): a fully covered pixel gets +1 / -1 per channel for each of its eight neighbours that is brighter / darker in the 5-bit channel (`restore_filter16/32`); this is what smooths the 4x4 dither pattern.
+- **Divot**: a pixel with a not fully covered pixel among itself and its left and right neighbours is replaced channel by channel by the median-like pick of `divot_filter`.
+- **Gamma** (`gamma_enable`): the sqrt table of the VI.
+- **Intended divergence from angrylion: full-range colour.** angrylion converts the 5-bit channels of a 16-bit buffer by shifting them up (`c << 3`, white 248) and runs the filters on that; the plain conversion here replicates the bits (white 255), which is closer to what a display shows, so the filtered path does the same and a game looks equally bright whether or not the pass runs. The filters themselves are unchanged: AA, divot, dither restore and gamma work on angrylion's 8-bit values (`c << 3`, wrapping to 8 bits, restore adding +-1 per neighbour, gamma through the sqrt table). The expansion is the last step, on the final 8-bit channel `v` of each pixel after all of them, for 16-bit buffers only: `out = min(255, v + (v >> 5))`. For an unfiltered value `c << 3` that is exactly the bit replication (`c << 3 | c >> 2`, 248 becomes 255); for filtered values it keeps the ordering and ends at 255 (gamma turns 248 into 250, which becomes 255). RGBA8888 buffers hold real 8-bit values and are output as they are. Scalar reference (`row_out()`) and NEON (`vqaddq_u8`) do the same. `tools/vicheck.py` compares against angrylion's output passed through the same mapping, written down independently in the script, and a build keeping angrylion's 248 white fails it.
+- Left out: the VI's own resampling between source pixels (the scale to the window does that; the `Filter` option), the random noise `gamma_dither_enable` adds (as for the RDP's dither, it does not follow the hardware sequence), and the glitch angrylion models for `aa_mode` 3 with a small `H_START`.
+
+`vi_filter_row_ref()` is a literal port of the oracle code (it reads RDRAM through the same accessors, so out-of-range and wrapped reads agree). `vi_filter_row()` is the NEON version for 16-bit colour buffers (32-bit ones use the reference): each source line is converted once per frame into planes of 5-bit channels plus the coverage (a four-line cache), the restore filter runs on 16 pixels at a time in 8-bit lanes on every pixel as if it were fully covered, lanes with coverage below 7 are redone with the AA filter on the converted lines, then divot, gamma (four `tbl` lookups) and the RGBA8888 store. With the filters on the `raw16` upload path is not used.
+
+Cost, `foir-replay --vi-bench` on the RK3566 (A55, `performance`, 1.58 GHz) and the H700 (A53, 1512 MHz), ms per 320x237 frame, three runs each within 1 %: unfiltered 0.20, filter pass with nothing enabled 0.47, dither restore +0.55, divot +0.2, gamma +0.2; the usual AA + divot + dither restore set 1.2-1.6 ms when few pixels are partially covered (Banjo-Kazooie, Paper Mario, Diddy Kong Racing) and 4.1 (A55) / 4.6 (A53) in Pokemon Snap, where 21 % of the pixels (44 % of the 16-pixel groups) are partially covered and the scalar AA filter dominates. The scalar reference takes 8-12 ms.
 
 ## Source layout
 
@@ -188,11 +203,29 @@ tools/                foir-replay, kfuzz, walkfuzz, ref-angrylion, neoncheck.py,
 test-data/            captured frames for the tests (not in the repository, see test-data/README.md)
 ```
 
+## Frame skip
+
+`FrameSkip` drops the rendering of some frames while the commands are still parsed (state, TMEM loads, syncs). What it may drop is decided in `raster_draw()` (`raster.c`), the pattern in `rdp_skip_decide()`; the options-level rules are in [options.md](options.md#frame-skip). The code, in the order a frame meets it:
+
+- **Frame boundary.** `frame_boundary()` starts a *VI period* with the first primitive into a scanned-out colour image after a scan-out (`rdp_vi_scanned()` from `UpdateScreen`; `rdp_note_scanout()` remembers the last eight VI origins, and a colour image holds one when the origin lies at most 64 KB above it). The skip decision (`FrameSkip` N: one period in N + 1; `auto`: the plugin's `skip_level`) and the eligibility rule (the previous period drew at least `skip_min_prims` primitives into scanned-out buffers and was not field-rendered) are applied there.
+- **What is dropped.** `skip_this()`: with the period skipped, a triangle or texture rectangle into a scanned-out buffer. Fill and copy rectangles and everything into other colour images are drawn.
+- **History.** 16 entries (address, size, whether the last frame into it was skipped). `rdp_fb_skipped()` tells `UpdateScreen` that the buffer the VI scans out was left holding a skipped frame, which is then not presented (the previous picture stays).
+- **Refill.** The first drawing into a buffer in a rendered period, if its last frame was skipped, copies the last rendered frame's colour image (and its coverage bits) over it (`repair_from_good()`, `mt_sync` first), so incremental drawing starts from a whole picture.
+- **Diagnostics.** `FOIR_SKIPLOG` / `FOIR_FRAMEHASH` / `FOIR_SKIP_*` ([options.md](options.md#environment-variables)).
+
+How the three playtest artefacts were found (rgdsplus and rg35xxsp, the scripted pad `input-det` of arMLEt's `tools/equiv`, `FOIR_FRAMEHASH` of every presented frame compared between a run without FrameSkip and runs with `FOIR_FRAMESKIP=1`, 50-60 s each; unskipped runs of Paper Mario and Mario Golf repeat their frame hashes exactly, Star Fox 64's did in the final comparison but an earlier pair differed from frame 20 on, so its numbers are less strict):
+
+- **Paper Mario** (title and first scenes): the old pattern counted `SYNC_FULL`s and the game syncs twice per frame (an off-screen target, then the screen), so every screen frame fell on the same side: 2,463 of 2,901 presented frames held, and the 438 shown ones had no backdrop (391 differ from the unskipped run: the backdrop is a copy rectangle and the old rule dropped it with everything else). Now 1,846 shown frames, none differs from the unskipped run (every shown frame identical, every held frame equal to the previous one).
+- **Star Fox 64** (mission menu and first scene): the screen buffers start with random RDRAM contents and the game clears each border once with a fill rectangle; that fill landed in skipped frames and was dropped, so the noise stayed on the borders until a mission redrew them. The fill is now drawn, and the borders are black (the legacy run keeps noise borders in the same frames; of 3,665 frames 24 shown ones still differ from the unskipped run).
+- **Mario Golf** (menus, course intro and fly-over): the game uses three scan buffers and three small off-screen targets per frame, six colour images against the four history entries, so the history forgot buffers whose last frame was skipped and showed them (flicker between an old and the current picture). That is fixed (1,286 shown frames differing from the unskipped run, 304 now). What remains is the CPU / RSP snapshot of the screen described under Known limit: the hash of RDRAM blocks shows the 160 KB region at 0x2e8000 differing from the unskipped run in every frame, and the frames that texture from it show stripes.
+
+Not an artefact of the rules but a property of dropping frames: a rendered frame cannot be right when it depends on content that only a skipped frame produces and that foir cannot see (a CPU read of the buffer, as above). `tools/skiptest.py` covers the cases foir can see.
+
 ## Known gaps
 
-- **VI.** No VI filters (anti-aliasing, divot, gamma, dither) and no 480i deinterlacing beyond `InterlaceHack`. `FBRead` / `FBWrite` only drain the workers: no framebuffer emulation for CPU effects (the core's frame-buffer hooks are off under the dynarec).
+- **VI.** The VI filters are opt-in (`VIAntiAliasing`, `VIDivot`, `VIDedither`, `VIGamma`) and skip the VI's resampling between source pixels, gamma-dither noise and the aa_mode 3 glitch; no 480i deinterlacing beyond `InterlaceHack`. `FBRead` / `FBWrite` only drain the workers: no framebuffer emulation for CPU effects (the core's frame-buffer hooks are off under the dynarec).
 - **Exactness.**
-  - `RelaxedPrecision` (default on) is not exact. `FastCombiner` and everything else are; with exact settings the output is identical to the scalar reference.
+  - `RelaxedPrecision` (default off since 2026-10-16) is not exact when turned on. `FastCombiner` and everything else are; with exact settings the output is identical to the scalar reference.
   - One-cycle perspective LOD with a max level above 0 is not angrylion-exact in the far part of the plane (angrylion's `tclod_1cycle_current` has span-edge cases the scalar kernel does not model; the NEON path follows the scalar reference). Detail and sharpen occur in no captured frame; they are covered by the fuzzers and synthetic scenes only.
   - In the captured Kirby 64 frame compared with angrylion, 25 pixels differ (inherited from the scalar reference). Some hidden-bit and COPY-mode details are still approximations.
   - The pseudo-random noise is not the hardware sequence.
@@ -204,7 +237,7 @@ test-data/            captured frames for the tests (not in the repository, see 
   - Groups of 8 pixels that straddle two scanlines (10-30 % of the groups, 45 % in Paper Mario) take the scalar per-pixel path in the colour / Z buffer access; a vector form was measured and does not pay on the Cortex-A55.
 - **Verification scope.** Frames were compared for the first minute of each ROM, not full playthroughs. The row-ownership rule of the NEON windows (an odd-aligned or COPY window must not leave its row) is tested for equal output only, because ThreadSanitizer cannot run the NEON kernels on x86_64. Flip-0 COPY spans and 8-bit colour buffers are exercised only by the fuzzers, where both sides take the scalar kernel.
 - **Platforms.** The parallel-rsp pairing was verified on aarch64 devices (RK3566, H700). The x86_64 build (scalar kernels) is for development and testing and is slow.
-- `FrameSkip=auto` is a simple window-based controller and does not know about render-to-texture frames.
+- `FrameSkip=auto` is a simple window-based controller. FrameSkip is invisible to a game that reads its own picture with the CPU / RSP (see [Frame skip](#frame-skip)).
 
 ## Ideas not done
 
@@ -212,4 +245,4 @@ test-data/            captured frames for the tests (not in the repository, see 
 - The batch builder is still about 500 instructions per span, mostly the 45 vector stores of a piece, the per-piece prefetch and the edge-zone pixels.
 - Skipping texture / combiner work for lanes the Z test already rejected: 5-15 % of the Z-tested groups in the 3D games are dead, and an early Z pass costs about as much as it saves below roughly 10 %.
 - Fusing stages to keep the 8-pixel working set in registers.
-- VI filters; a faster delta-Z path for interpenetrating states (about 4 % of Super Mario 64's time).
+- Spreading the VI filter pass over the (idle) workers, and a vector AA filter; a faster delta-Z path for interpenetrating states (about 4 % of Super Mario 64's time).

@@ -4,8 +4,9 @@ void foir_config_defaults(struct foir_config *c)
 {
     memset(c, 0, sizeof(*c));
     c->fast_combiner = true;
-    c->relaxed_precision = true;
+    c->relaxed_precision = false;
     c->frame_skip = 0;
+    c->skip_min_prims = 100;
     c->interlace_hack = true;
     c->threads = 0;
     c->mt_helper = true;
@@ -15,4 +16,8 @@ void foir_config_defaults(struct foir_config *c)
     c->vsync = true;
     c->filter = false;
     c->widescreen = false;
+    c->vi_aa = c->vi_dedither = false;
+    c->vi_divot = c->vi_gamma = true;
+    c->crop_h = false;
+    c->crop_v = false;
 }

@@ -56,8 +56,9 @@ static struct vi_frame l_frame;
 static int l_win_w = 640, l_win_h = 480;
 static bool l_fullscreen;
 static double l_rdp_ms, l_vi_ms, l_sync_ms, l_last_log_ms, l_present_ms, l_syncfull_base;
-static unsigned l_rdp_frames, l_skipped_frames, l_stale_frames;
-static int l_skip_level;                 /* 0 none, 1 skip every other frame, 2 render one in three */
+static unsigned l_stale_frames;
+static bool l_skiplog;                   /* FOIR_SKIPLOG */
+static bool l_framehash;                 /* FOIR_FRAMEHASH: a hash of every frame as it is presented (tests) */
 static double l_win_start_ms, l_last_us_ms;
 static unsigned l_win_frames;
 static unsigned l_frames, l_lists;
@@ -92,19 +93,17 @@ static double now_ms(void)
 static void (*l_debug_cb)(void *, int, const char *);
 static void *l_debug_ctx;
 
+/* the legacy mode decides at every SYNC_FULL, the default at the first primitive of a frame into a scanned-out buffer (raster.c) */
 static void on_rdp_frame_end(void *ctx)
 {
     (void)ctx;
-    int fs = l_cfg.frame_skip;
-    bool skip = false;
-    l_rdp_frames++;
-    if (fs > 0) skip = (l_rdp_frames % (unsigned)(fs + 1)) != 0;
-    else if (fs == FOIR_FRAMESKIP_AUTO) {
-        if (l_skip_level == 1) skip = (l_rdp_frames & 1) != 0;
-        else if (l_skip_level == 2) skip = (l_rdp_frames % 3) != 0;
-    }
-    if (skip) l_skipped_frames++;
-    l_rdp.skip_pixels = skip;
+    if (l_cfg.skip_legacy) rdp_skip_decide(&l_rdp);
+}
+
+static void on_rdp_frame_start(void *ctx)
+{
+    (void)ctx;
+    rdp_skip_decide(&l_rdp);
 }
 
 static void plugin_log(void *ctx, int level, const char *msg)
@@ -165,6 +164,12 @@ EXPORT m64p_error CALL PluginStartup(m64p_dynlib_handle core, void *context, voi
     ConfigSetDefaultBool(l_cfg_foir, "VSync", l_cfg.vsync, "Wait for vertical sync when presenting");
     ConfigSetDefaultBool(l_cfg_foir, "Filter", l_cfg.filter, "Use bilinear filtering when scaling the VI image to the window");
     ConfigSetDefaultBool(l_cfg_foir, "Widescreen", l_cfg.widescreen, "Stretch the image to the whole window instead of keeping 4:3");
+    ConfigSetDefaultBool(l_cfg_foir, "VIAntiAliasing", l_cfg.vi_aa, "Apply the VI's anti-aliasing when the game enables it; costs emulation-thread time");
+    ConfigSetDefaultBool(l_cfg_foir, "VIDivot", l_cfg.vi_divot, "Apply the VI's divot filter when the game enables it; costs emulation-thread time");
+    ConfigSetDefaultBool(l_cfg_foir, "VIDedither", l_cfg.vi_dedither, "Apply the VI's dither restore when the game enables it; costs emulation-thread time");
+    ConfigSetDefaultBool(l_cfg_foir, "VIGamma", l_cfg.vi_gamma, "Apply the VI's gamma correction when the game enables it; costs emulation-thread time");
+    ConfigSetDefaultBool(l_cfg_foir, "CropOverscanH", l_cfg.crop_h, "Crop 8 VI pixels off the left and right edges of the image (hides edge artefacts; display only)");
+    ConfigSetDefaultBool(l_cfg_foir, "CropOverscanV", l_cfg.crop_v, "Crop 12 VI lines off the top and bottom edges of the image (hides edge artefacts; display only)");
     ConfigSaveSection("Video-General");
     ConfigSaveSection("Video-Foir");
 
@@ -209,6 +214,12 @@ static void read_foir_section(struct foir_config *c)
     c->vsync = ConfigGetParamBool(l_cfg_foir, "VSync") != 0;
     c->filter = ConfigGetParamBool(l_cfg_foir, "Filter") != 0;
     c->widescreen = ConfigGetParamBool(l_cfg_foir, "Widescreen") != 0;
+    c->vi_aa = ConfigGetParamBool(l_cfg_foir, "VIAntiAliasing") != 0;
+    c->vi_divot = ConfigGetParamBool(l_cfg_foir, "VIDivot") != 0;
+    c->vi_dedither = ConfigGetParamBool(l_cfg_foir, "VIDedither") != 0;
+    c->vi_gamma = ConfigGetParamBool(l_cfg_foir, "VIGamma") != 0;
+    c->crop_h = ConfigGetParamBool(l_cfg_foir, "CropOverscanH") != 0;
+    c->crop_v = ConfigGetParamBool(l_cfg_foir, "CropOverscanV") != 0;
     const char *fs = ConfigGetParamString(l_cfg_foir, "FrameSkip");
     if (fs && !strcmp(fs, "auto")) c->frame_skip = FOIR_FRAMESKIP_AUTO;
     else c->frame_skip = fs ? atoi(fs) : 0;
@@ -227,6 +238,19 @@ static void load_config(void)
     if (ne && *ne) l_cfg.neon = atoi(ne) != 0;
     const char *he = getenv("FOIR_HELPER");
     if (he && *he) l_cfg.mt_helper = atoi(he) != 0;
+    const char *sl = getenv("FOIR_SKIPLOG");
+    l_skiplog = sl && *sl && atoi(sl) != 0;
+    l_cfg.skip_log = l_skiplog;
+    const char *fe = getenv("FOIR_FRAMESKIP");   /* tests: overrides FrameSkip (N or auto) */
+    if (fe && *fe) l_cfg.frame_skip = !strcmp(fe, "auto") ? FOIR_FRAMESKIP_AUTO : atoi(fe);
+    const char *sm = getenv("FOIR_SKIP_MINPRIMS");
+    if (sm && *sm) l_cfg.skip_min_prims = atoi(sm);
+    const char *so = getenv("FOIR_SKIP_OPTS");
+    if (so && *so) l_cfg.skip_opts = atoi(so);
+    const char *fh = getenv("FOIR_FRAMEHASH");
+    l_framehash = fh && *fh && atoi(fh) != 0;
+    const char *sg = getenv("FOIR_SKIP_LEGACY");
+    if (sg && *sg) l_cfg.skip_legacy = atoi(sg) != 0;
     const char *ke = getenv("FOIR_KNOBS");
     if (ke && !strcmp(ke, "exact")) {
         l_cfg.relaxed_precision = false; l_cfg.frame_skip = 0; l_cfg.interlace_hack = false;
@@ -261,10 +285,12 @@ EXPORT int CALL RomOpen(void)
     l_fl_on = framelog_open();
 #endif
     l_rdp.frame_end_cb = on_rdp_frame_end;
+    l_rdp.frame_start_cb = on_rdp_frame_start;
     l_rdp.skip_pixels = false;
     rdp_fb_history_reset(&l_rdp);
-    l_rdp_frames = l_skipped_frames = l_stale_frames = 0;
-    l_skip_level = 0;
+    l_stale_frames = 0;
+    l_rdp.skip_frames = l_rdp.stat_skipped = 0;
+    l_rdp.skip_level = 0;
     int nthreads = l_cfg.threads;
     const char *te = getenv("FOIR_THREADS");
     if (te && *te) nthreads = atoi(te);
@@ -400,12 +426,20 @@ EXPORT void CALL UpdateScreen(void)
     capture_frame(&l_rdp, &v);
     double t0 = now_ms();
     /* keep the last good frame on screen rather than a buffer FrameSkip left holding an older one */
+    rdp_note_scanout(&l_rdp, v.origin);
+    rdp_vi_scanned(&l_rdp);
     bool stale = rdp_fb_skipped(&l_rdp, v.origin);
+    if (l_skiplog) rdp_fb_skip_log(&l_rdp, v.origin, stale);
     l_stale_frames += stale;
     if (!stale) vi_render_ex(&l_rdp, &v, &l_frame, true);
     double t1 = now_ms();
     if (!stale) gl_out_present(l_frame.valid ? l_frame.pixels : NULL, l_frame.raw16, l_frame.width, l_frame.height, l_frame.screen_w, l_frame.screen_h, l_render_cb);
     double t2 = now_ms();
+    if (l_framehash) {
+        uint32_t hsh = 2166136261u;
+        for (int i = 0; l_frame.valid && i < l_frame.width * l_frame.height; i++) hsh = (hsh ^ l_frame.pixels[i]) * 16777619u;
+        foir_log(FOIR_LOG_INFO, "framehash %u %08x %s status %05x scfield %d", l_frames + 1, hsh, stale ? "held" : "shown", v.status, l_rdp.scfield);
+    }
     l_vi_ms += t1 - t0;
     l_present_ms += t2 - t1;
 #ifdef FOIR_FRAMELOG
@@ -415,8 +449,8 @@ EXPORT void CALL UpdateScreen(void)
         if (l_win_frames == 0) l_win_start_ms = t0;
         if (++l_win_frames >= 60) {
             double per = (t2 - l_win_start_ms) / l_win_frames;
-            if (per > 16.67 * 1.12 && l_skip_level < 2) l_skip_level++;
-            else if (per < 16.67 * 0.92 && l_skip_level > 0) l_skip_level--;
+            if (per > 16.67 * 1.12 && l_rdp.skip_level < 2) l_rdp.skip_level++;
+            else if (per < 16.67 * 0.92 && l_rdp.skip_level > 0) l_rdp.skip_level--;
             l_win_frames = 0;
         }
     }
@@ -434,7 +468,7 @@ EXPORT void CALL UpdateScreen(void)
         foir_log(FOIR_LOG_INFO, "frame %u: %.2f ms/frame wall, %.2f ms/frame RDP (%.2f parse+setup of which %.2f waiting at SYNC_FULL, %.2f drain; %u lists, %llu cmds, %u prims, %u px), %.2f ms/frame VI (%.2f convert + %.2f present), vi %dx%d type %u, skipped %u/%u level %d, held %u",
                  l_frames, per_frame, (l_rdp_ms + l_sync_ms) / 120, l_rdp_ms / 120, sfw / 120, l_sync_ms / 120, l_lists, (unsigned long long)(l_rdp.frame_cmds - l_cmds_base),
                  l_rdp.stat_prims - l_prims_base, pix - l_pix_base, (l_vi_ms + l_present_ms) / 120, l_vi_ms / 120, l_present_ms / 120,
-                 l_frame.width, l_frame.height, v.status & 3, l_skipped_frames, l_rdp_frames, l_skip_level, l_stale_frames);
+                 l_frame.width, l_frame.height, v.status & 3, l_rdp.stat_skipped, l_rdp.skip_frames, l_rdp.skip_level, l_stale_frames);
         {
             double all = cpu_ms(RUSAGE_SELF), emu = cpu_ms(RUSAGE_THREAD);
             foir_log(FOIR_LOG_INFO, "cpu: %.2f ms/frame in the process (%.2f on the emulation thread, %.2f on the other threads)",
@@ -507,7 +541,7 @@ static const char *const l_lbl_threads[] = { "None", "Auto", "1", "2", "3", "4",
 /* Option ids are the ABI: append only.  enum values: FrameSkip index 0..3 = skip level 0..3, 4 = auto; Threads index =
  * Threads + 1 (so -1 "None" = render on the emulation thread). */
 enum { OPT_WIDESCREEN, OPT_FILTER, OPT_INTERLACE, OPT_FRAMESKIP, OPT_VSYNC, OPT_THREADS, OPT_NEON, OPT_SPECIALIZE,
-       OPT_FASTCOMB, OPT_RELAXED, OPT_COUNT };
+       OPT_FASTCOMB, OPT_RELAXED, OPT_CROP_H, OPT_CROP_V, OPT_VIAA, OPT_VIDIVOT, OPT_VIDEDITHER, OPT_VIGAMMA, OPT_COUNT };
 
 static const struct foir_suxty_option l_opts[OPT_COUNT] = {
     [OPT_WIDESCREEN] = { "Widescreen", "Widescreen", "Stretch to the whole screen instead of 4:3", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 0 },
@@ -519,7 +553,13 @@ static const struct foir_suxty_option l_opts[OPT_COUNT] = {
     [OPT_NEON]       = { "NEON", "NEON Kernels", "Off = scalar reference kernels (slow)", FOIR_OPT_BOOL, 0, 0, 1, 1, NULL, 1 },
     [OPT_SPECIALIZE] = { "Specialize", "Specialised Kernels", "Per-state precompiled pixel kernels", FOIR_OPT_BOOL, 0, 0, 1, 1, NULL, 1 },
     [OPT_FASTCOMB]   = { "FastCombiner", "Fast Combiner", "Fast paths for common combiner/blender modes", FOIR_OPT_BOOL, 0, 0, 1, 1, NULL, 1 },
-    [OPT_RELAXED]    = { "RelaxedPrecision", "Relaxed Precision", "Forces lower accuracy depth values and calculations for speed", FOIR_OPT_BOOL, 0, 0, 1, 1, NULL, 1 },
+    [OPT_RELAXED]    = { "RelaxedPrecision", "Relaxed Precision", "Forces lower accuracy depth values and calculations for speed", FOIR_OPT_BOOL, 0, 0, 1, 1, NULL, 0 },
+    [OPT_CROP_H]     = { "CropOverscanH", "Crop Overscan H", "Hide edge artefacts: crop 8 VI pixels off the left and right", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 0 },
+    [OPT_CROP_V]     = { "CropOverscanV", "Crop Overscan V", "Hide edge artefacts: crop 12 VI lines off the top and bottom", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 0 },
+    [OPT_VIAA]       = { "VIAntiAliasing", "VI Anti-Aliasing", "Edge anti-aliasing as the VI does, where the game uses it (costs time)", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 0 },
+    [OPT_VIDIVOT]    = { "VIDivot", "VI Divot", "Divot filter as the VI does, where the game uses it (costs time)", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 1 },
+    [OPT_VIDEDITHER] = { "VIDedither", "VI Dither Restore", "Dither restore as the VI does, where the game uses it (costs time)", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 0 },
+    [OPT_VIGAMMA]    = { "VIGamma", "VI Gamma", "Gamma correction as the VI does, where the game uses it (costs time)", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 1 },
 };
 
 static bool l_staged_set[OPT_COUNT];
@@ -538,6 +578,12 @@ static int opt_load(const struct foir_config *c, unsigned i)
     case OPT_SPECIALIZE: return c->specialize;
     case OPT_FASTCOMB:   return c->fast_combiner;
     case OPT_RELAXED:    return c->relaxed_precision;
+    case OPT_CROP_H:     return c->crop_h;
+    case OPT_CROP_V:     return c->crop_v;
+    case OPT_VIAA:       return c->vi_aa;
+    case OPT_VIDIVOT:    return c->vi_divot;
+    case OPT_VIDEDITHER: return c->vi_dedither;
+    case OPT_VIGAMMA:    return c->vi_gamma;
     }
     return 0;
 }
@@ -555,6 +601,12 @@ static void opt_store(struct foir_config *c, unsigned i, int v)
     case OPT_SPECIALIZE: c->specialize = v != 0; break;
     case OPT_FASTCOMB:   c->fast_combiner = v != 0; break;
     case OPT_RELAXED:    c->relaxed_precision = v != 0; break;
+    case OPT_CROP_H:     c->crop_h = v != 0; break;
+    case OPT_CROP_V:     c->crop_v = v != 0; break;
+    case OPT_VIAA:       c->vi_aa = v != 0; break;
+    case OPT_VIDIVOT:    c->vi_divot = v != 0; break;
+    case OPT_VIDEDITHER: c->vi_dedither = v != 0; break;
+    case OPT_VIGAMMA:    c->vi_gamma = v != 0; break;
     }
 }
 
@@ -598,8 +650,14 @@ static int suxty_set(unsigned i, int value)
     case OPT_WIDESCREEN: gl_out_set_widescreen(value != 0); break;
     case OPT_FILTER:     gl_out_set_filter(value != 0); break;
     case OPT_INTERLACE:  l_rdp.cfg.interlace_hack = value != 0; break;
+    case OPT_CROP_H:     l_rdp.cfg.crop_h = value != 0; break;
+    case OPT_CROP_V:     l_rdp.cfg.crop_v = value != 0; break;
+    case OPT_VIAA:       l_rdp.cfg.vi_aa = value != 0; break;
+    case OPT_VIDIVOT:    l_rdp.cfg.vi_divot = value != 0; break;
+    case OPT_VIDEDITHER: l_rdp.cfg.vi_dedither = value != 0; break;
+    case OPT_VIGAMMA:    l_rdp.cfg.vi_gamma = value != 0; break;
     case OPT_FRAMESKIP:
-        l_skip_level = 0; l_win_frames = 0; l_rdp.skip_pixels = false; break;
+        l_rdp.skip_level = 0; l_win_frames = 0; l_rdp.skip_pixels = false; break;
     }
     return FOIR_SUXTY_APPLIED;
 }

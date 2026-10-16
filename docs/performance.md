@@ -331,6 +331,84 @@ Combiner pixels of the 39 unseen games, by kind of kernel:
 | + shape list made from the 23 test ROMs (out of sample) | 71.0 % | 13.5 % | **15.5 %** (median 2.5 %) | 4 |
 | + shape list from 62 games (shipped; in-sample) | 71.0 % | 29.0 % | 0.0 % | 0 |
 
+## What `RelaxedPrecision` saves
+
+Measured 2026-10-16 on rgdsplus (4x A55, `performance` governor, effective ~1.58 GHz), foir devel working tree built with `-DFOIR_FRAMELOG` (generic armv8-a -O3), rsp-hle + parallel-rsp as `RspFallback`, rsp-timing shim, `FOIR_THREADS=3`, scripted input (Pokemon Snap with no input), 75 s per run, frames after VI 1440 (about 2000-3000 frames per run). `RelaxedPrecision` is read at launch, so each setting is a separate launch; 10 games x 2 settings x 3 repeats = 60 runs in 20 sessions of 3 runs, the order alternating `True False True` / `False True False`, the lead flipped every other game. The frame-time source is the swap-to-swap time of `FOIR_FRAMELOG` (`tools/framelog.py`); "worker ms/frame" is the summed busy time of the pixel workers per frame, "RDP" is the emulation thread's time in `ProcessRDPList` (parse + setup + waits). Raw files and scripts: the session scratchpad (not in the repo). The in-game option was verified per run from the written config (`RelaxedPrecision = True / False`).
+
+Worker busy ms/frame, mean of 3 runs (half-range of the three run means), and the change of `False` against `True`:
+
+| game | worker True | worker False | delta | run-to-run noise | RDP (emu thread) delta | process CPU delta |
+|---|---|---|---|---|---|---|
+| Banjo-Kazooie | 15.12 +-0.01 | 15.47 +-0.03 | **+2.3 %** | 0.2 % | +0.5 % | +0.4 % |
+| Donkey Kong 64 | 17.92 +-0.05 | 18.53 +-0.08 | **+3.4 %** | 0.4 % | +1.9 % | +0.6 % |
+| Ocarina of Time | 7.07 +-0.77 (6.04 7.59 7.58) | 7.89 +-0.01 | +11.6 % (median-based **+4.0 %**) | 10.9 % (one True run was a different scene) | +5.2 % | +0.3 % |
+| Mario Kart 64 | 11.29 +-0.06 | 11.78 +-0.04 | **+4.3 %** | 0.6 % | +3.0 % | +0.1 % |
+| Paper Mario | 11.91 +-0.21 | 12.31 +-0.07 | **+3.3 %** | 1.7 % | +6.5 % | +2.3 % |
+| Pokemon Snap (no input) | 40.02 +-0.10 | 41.16 +-0.12 | **+2.8 %** | 0.3 % | +6.2 % | +2.6 % |
+| Star Fox 64 | 7.46 +-0.04 | 7.65 +-0.00 | **+2.5 %** | 0.5 % | +2.2 % | +0.9 % |
+| Super Mario 64 | 12.12 +-0.05 | 12.56 +-0.04 | **+3.6 %** | 0.4 % | +6.8 % | +0.9 % |
+| Toy Story 2 | 5.49 +-0.02 | 5.56 +-0.00 | +1.1 % | 0.4 % | +1.0 % | +0.3 % |
+| Pilotwings 64 | 4.62 +-0.06 (4.70 4.58 4.59) | 5.44 +-1.08 (6.87 4.73 4.72) | median-based **+3.0 %** (means +17.6 %, one False run was an outlier) | 19.8 % (outlier) | +2.5 % | -0.4 % |
+
+Median of the three runs per game and setting: `False` is slower in **10 of 10 games**, by +0.8 % (Toy Story 2) to +4.6 % (Mario Kart 64), mean +3.1 %, median +3.3 %. Excluding the two outlier runs the run-to-run noise is 0.2-1.7 % and every game except Toy Story 2 is clearly outside it (+2.2 to +4.6 %), and the sign agrees in each individual run pair (the slowest True run is faster than the fastest False run in all 10 games, in Toy Story 2 by 0.04 ms and in Pilotwings by 0.02 ms, i.e. barely). In absolute terms that is 0.1-0.6 ms of summed worker time per frame (about 0.04-0.2 ms of wall time per frame at three workers); the emulation thread's RDP time moves by +0.5 to +7 % of a 1-5 ms stage, and the whole process CPU time by 0-2.6 %.
+
+**No effect on frame rate, frame-time percentiles or spikes.** Every game is vsync-locked (59.2-59.9 fps; Pokemon Snap's attract demo 47.9 vs 47.2 fps and Toy Story 2 58.6 are limited by the emulation, not by `RelaxedPrecision`), p50 is identical (16.6 ms), p95 / p99 differ by -0.5 to +1.9 % apart from the noisy Ocarina (+5 / +8 %) and Pilotwings (outlier) runs, and the top-10 spike frames are the same frames at the same VI numbers in both settings (Banjo 1497 / 1526 / 3655, DK64 2137 / 3771, Mario Kart 1892, Toy Story 2 3224, ...); they are scene changes, boot / `SYNC_FULL` waits with no workers busy, and CPU / JIT stalls, dominated by emulation-thread work, not pixel work. The spikes that do carry worker load (DK64, Ocarina, Snap, 40-50 ms) are 40-50 ms with either setting.
+
+**Share of work on the relaxed path** (aarch64 `FOIR_STATS` build under qemu, `foir-replay --fast`, existing dumps; counters added in a scratch copy of `kneon_mem.c`, not in the tree). Pixels of Z-compare batches in the opaque / transparent Z modes ("fast-Z"), and of those the pixels that are only partially covered in memory after the new coverage is added (the only pixels where the delta-Z terms matter) and the 8-pixel groups with at least one such pixel (the groups that need the exact `z_compare4` path when `RelaxedPrecision = False`):
+
+| dump | Z-compare pixels | fast-Z share | partial pixels (of Z) | groups with a partial pixel (of fast-Z groups) |
+|---|---|---|---|---|
+| Banjo-Kazooie 450 / 1800 / 2400 / 3000 | 236k / 102k / 134k / 104k | 100 % | 1.1 / 3.4 / 3.5 / 5.3 % | 6.6 / 12.9 / 16.7 / 20.0 % |
+| Donkey Kong 64 800 / 2400 / 3000 | 50k / 128k / 117k | 100 / 99.5 / 95 % | 17.0 / 7.0 / 7.3 % | 48.8 / 25.9 / 25.2 % |
+| Pokemon Snap 300 | 457k | 100 % | 15.3 % | 38.2 % |
+| Kirby 64 600 | 117k | 100 % | 5.7 % | 23.6 % |
+| Rocket 1500 | 136k | 99.8 % | 9.9 % | 28.4 % |
+| Diddy Kong Racing 700 | 66k | 87 % | 3.4 % | 13.8 % |
+| Super Mario 64 650 | 42k | 0 % (interpenetrating / decal: not affected) | - | - |
+| Paper Mario 900, Star Fox 64 1000, F-Zero X, GoldenEye, Hydro Thunder, Jet Force Gemini | no Z-compare pixels in these dumps | | | |
+
+So 1-17 % of the Z-compare pixels (typically 3-10 %) are partially covered, which is where the exact path differs, and 7-49 % of the 8-pixel groups of the fast-Z modes contain at least one such pixel and fall to the exact path without the relaxation. That fits the measured gain: the relaxation is the difference between a vector compare and the slow path for those groups. (The dumps are one frame each; Mario Kart 64, Ocarina of Time, Toy Story 2 and Pilotwings 64 have no dump. SM64 uses the unaffected modes in this dump yet shows +3.6 % in game, so part of the gain comes from other scenes of the game.)
+
+**Verdict.** The gain is real but small: 2-5 % of the pixel worker time in 9 of 10 games (+0.8 % in Toy Story 2), 0.1-0.6 ms per frame, invisible in fps, frame-time percentiles and the spike frames of these vsync-locked sessions; it would only show up in a scene that is worker-bound beyond the frame budget (Pokemon Snap's heaviest windows, 40 ms of worker time per frame, +1.2 ms). The cost is that the default output is not bit-exact with angrylion for partially covered coplanar-edge pixels. Recommendation: the benefit is outside the noise but too small to matter on the target handhelds in the 10 games measured, so either choice is defensible; the exactness-first reading of the decision rule in FOIR-TODO item 3 ("within noise: make `False` the default") does not apply because the gain is not within noise. If the default is to stay `True`, document it as a ~3 % pixel-time optimisation; if exact-everywhere matters more than ~3 % of worker time, switching the default to `False` costs nothing visible in frame rate. The measurement alone supports keeping `True` for the speed-first project goal (speed over invisible accuracy gaps), with `FOIR_KNOBS=exact` / `RelaxedPrecision = False` as the exact setting.
+
+**Decision (2026-10-16).** The option stays, but its default is now `False` (exact everywhere): ~3 % of pixel-worker time is invisible in fps and tails on both handhelds, and exact-by-default needs no caveat when comparing with angrylion. `True` remains available per game (suxty menu) for worker-bound scenes.
+
+Limits: the generic build carried `-DFOIR_FRAMELOG` in both settings (the overhead is the same in both); the 3-worker pool hides part of the saving in wall time; runs of the same game differ in the scene reached by the scripted input (Ocarina True run 1, Pilotwings False run 1), which is why the medians are quoted; audio was the dummy plugin.
+
+## VI filter pass
+
+`foir-replay --vi-bench 100`, rgdsplus (4x A55, `performance` governor, 1.58 GHz real) and rg35xxsp (4x A53, `cpu_perf.sh on`, 1512 MHz), the glibc 2.31 build of foir-todo, 100 frames per mode, ms per VI frame (rg35xxsp: three runs per dump, which agree within 1 %; rgdsplus: one run of this build, three runs of the first build agreed within 1 %) of the already rendered dump frame (VI conversion only; modes alternate inside each run). The "aa0 + divot + dither restore" row is the usual 0x13016 set of status bits.
+
+| mode (RK3566, A55) | Banjo 292x213 | DKR | Paper Mario | Snap |
+|---|---|---|---|---|
+| unfiltered conversion | 0.17 | 0.20 | 0.20 | 0.20 |
+| filter pass, nothing enabled | 0.41 | 0.47 | 0.47 | 0.47 |
+| dither restore | 0.92 | 1.06 | 1.06 | 1.06 |
+| divot | 0.61 | 0.69 | 0.69 | 0.69 |
+| gamma | 0.60 | 0.68 | 0.68 | 0.68 |
+| aa0 + divot + dither restore | 1.20 | 1.60 | 1.39 | 4.11 |
+| scalar reference, same | 7.9 | 9.8 | 9.6 | 12.4 |
+
+The H700 (A53) numbers are within 5 % of these in every row except Snap's last (4.6 ms). Partially covered pixels: Banjo 0 %, Paper Mario 0 %, DKR 1 %, Snap 21 % (44 % of the 16-pixel groups). Cost of the first version (3-line reload per output line, 16-bit planes, scalar AA from RDRAM): 1.9-2.8 ms typical and 7.2 ms for Snap; the line cache, 8-bit planes and AA from the converted lines halved it. What it would still take: the restore filter is operation bound (24 compares and 24 adds per 16 pixels and channel; computing each neighbour pair once would save about a third), the scalar AA filter costs about 165 ns per partially covered pixel, and the pass could run on the idle workers (they are drained at the VI scan-out). **Decision (2026-10-16):** `VIDivot` and `VIGamma` default on (0.2 ms each), `VIAntiAliasing` and `VIDedither` default off (`VIFilters` was the first version's single switch): all four cost 1.4-1.9 ms, 7-10 % of a 60 fps frame on the emulation thread, and 4.4-4.8 ms (25-30 %) in an edge-heavy 3D scene, for a quality gain most people notice only on the dither pattern and on Banjo-Kazooie-style jagged logos. Each can be set per game from suxty. Costs per option are in the next table.
+
+**Per option (2026-10-16).** `foir-replay --vi-bench 200`, status with every filter enabled by the game (`aa_mode` 0, divot, dither restore, gamma) and the options set as listed; the glibc 2.17 build of foir-todo on both devices (rgdsplus `performance` 1.58 GHz real, rg35xxsp `cpu_perf.sh on` 1512 MHz), three rounds over the four dumps, medians in ms per VI frame (all spreads within 6 %, mostly 1 %). With no option on the plain conversion is taken (the first row), whatever the game enables; any one filter pays the pass's fixed ~0.35 ms plus its own work.
+
+| options | Banjo A55 | DKR A55 | Paper A55 | Snap A55 | Banjo A53 | DKR A53 | Paper A53 | Snap A53 |
+|---|---|---|---|---|---|---|---|---|
+| none (plain conversion) | 0.17 | 0.20 | 0.20 | 0.20 | 0.19 | 0.22 | 0.22 | 0.22 |
+| AA | 0.51 | 0.79 | 0.58 | 3.33 | 0.53 | 0.84 | 0.59 | 3.82 |
+| divot | 0.61 | 0.70 | 0.71 | 0.70 | 0.62 | 0.71 | 0.71 | 0.71 |
+| dither restore | 0.92 | 1.07 | 1.08 | 1.07 | 0.90 | 1.04 | 1.04 | 1.04 |
+| gamma | 0.60 | 0.69 | 0.69 | 0.69 | 0.62 | 0.71 | 0.71 | 0.71 |
+| AA + divot | 0.71 | 1.02 | 0.81 | 3.55 | 0.72 | 1.07 | 0.81 | 4.06 |
+| AA + dither restore | 1.02 | 1.38 | 1.18 | 3.94 | 1.00 | 1.40 | 1.14 | 4.37 |
+| divot + dither restore | 1.12 | 1.30 | 1.30 | 1.30 | 1.09 | 1.27 | 1.26 | 1.27 |
+| AA + divot + dither restore | 1.22 | 1.61 | 1.40 | 4.14 | 1.19 | 1.63 | 1.37 | 4.61 |
+| all four | 1.41 | 1.83 | 1.62 | 4.36 | 1.39 | 1.86 | 1.60 | 4.85 |
+| scalar reference, all four | 8.07 | 10.03 | 9.83 | 12.57 | 9.42 | 11.64 | 11.50 | 14.28 |
+
+The pass itself costs 0.41-0.47 ms with nothing enabled in the buffer (the earlier measurement above); on top of that AA adds about 0.1 ms in a scene with few partially covered pixels and 2.7-3.4 ms in Snap, divot and gamma about 0.2 ms each, dither restore about 0.5 ms. So in terms of the plain conversion each option alone costs 0.3-0.6 ms (AA; 3.1-3.6 in Snap), 0.5 (divot), 0.5 (gamma) and 0.7-0.85 (dither restore).
+
 ## Tried and rejected
 
 Each of these was built and measured with the same method; differences below about 1 % are noise.

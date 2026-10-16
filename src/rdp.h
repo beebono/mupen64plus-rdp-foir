@@ -258,6 +258,8 @@ void foir_neon_verify_report(char *buf, size_t n);
 unsigned foir_kernels_neon_mask(void);
 
 /* Every worker owns a context whose render state (rs_begin .. rs_end) is refreshed from the snapshots the parser takes when state changes, so the pixel stages read r->om, r->tile[] ... on any thread. */
+#define FOIR_FB_HIST 16
+
 struct rdp {
     uint8_t *rdram;
     uint32_t rdram_size;
@@ -322,14 +324,31 @@ struct rdp {
     uint64_t cov_pix[COV_N];       /* [0..4] pixels in a specialised variant per stage, [5] all, [6] combine pixels in a shape kernel, [7] texture pixels in an "any format" variant */
     uint64_t cov_tex_all;
     bool skip_pixels;
+    unsigned skip_frames, stat_skipped;   /* frames counted for the FrameSkip pattern, and skipped ones */
+    int skip_level;                 /* FrameSkip=auto: 0 none, 1 skip every other frame, 2 render one in three */
     /* FrameSkip: the colour images drawn lately and whether their last drawing was skipped, so that the VI does not show
      * a buffer that still holds a frame from before skipping began */
-    uint32_t fb_hist_addr[4];
-    bool fb_hist_skipped[4];
+    struct fb_hist_ent {
+        uint32_t addr;
+        bool skipped;               /* the last frame that drew into it was a skipped one */
+        int width, size;
+        uint32_t drawn, skip_tri, skip_fill, skip_copy;   /* primitives since the last VI scan-out (FOIR_SKIPLOG) */
+        uint32_t period;            /* the VI period of its last drawing */
+    } fb_hist[FOIR_FB_HIST];
     int fb_hist_last, fb_hist_next;
+    uint32_t scan_addr[8];          /* VI origins seen lately: a colour image holding one is scanned out, anything else is an off-screen target */
+    int scan_next;
     double sync_wait_ms;
     void (*frame_end_cb)(void *ctx);
     void *frame_end_ctx;
+    void (*frame_start_cb)(void *ctx);   /* the first primitive of a frame into a scanned-out buffer (FrameSkip decides here) */
+    uint32_t good_addr;             /* the scanned-out colour image of the last frame that was rendered, or 0xffffffff */
+    uint32_t stat_repairs;          /* buffers refilled from it (FOIR_SKIPLOG) */
+    bool skip_eligible;             /* the previous frame into this buffer was heavy enough to be worth skipping */
+    uint32_t period;                /* VI periods (scan-outs that were followed by drawing into a scanned-out buffer) so far */
+    uint32_t period_prims, last_rendered;   /* primitives into scanned-out buffers this period; the latest such buffer drawn while rendering */
+    bool period_rendered;
+    bool vi_since;                  /* the VI has scanned out since that frame began */
     struct px_batch batch;
     uint32_t stat_prims, stat_pixels;
 #ifdef FOIR_FRAMELOG
@@ -374,6 +393,10 @@ void foir_stats_flush(void);   /* write the statistics to $FOIR_STATE_STATS_FILE
 
 void raster_draw(struct rdp *r, const struct prim_walk *pw, int start, int end);
 void rdp_fb_history_reset(struct rdp *r);
+void rdp_skip_decide(struct rdp *r);                            /* a frame starts: skip it (r->skip_pixels) according to FrameSkip? */
+void rdp_vi_scanned(struct rdp *r);                            /* a scan-out happened (the next frame into the same buffer is a new one) */
+void rdp_note_scanout(struct rdp *r, uint32_t vi_origin);      /* the VI scanned out this origin */
+void rdp_fb_skip_log(struct rdp *r, uint32_t vi_origin, bool stale);   /* FOIR_SKIPLOG: one line per colour image, then the counters restart */
 bool rdp_fb_skipped(const struct rdp *r, uint32_t vi_origin);   /* the scanned-out buffer's last drawing was skipped */
 void raster_render_walk(struct rdp *w, const struct prim_walk *pw, int start, int end);
 void raster_render_job(struct rdp *w, const struct span *rows, int jlo, int start, int end);

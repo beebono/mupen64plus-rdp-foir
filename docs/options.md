@@ -8,23 +8,37 @@ foir reads its settings from the `[Video-Foir]` section of `mupen64plus.cfg` (wr
 |---|---|---|
 | `Widescreen` | `False` | Stretch the image to the whole window instead of keeping 4:3. |
 | `Filter` | `False` | Bilinear filtering when scaling the VI image to the window (off = nearest neighbour). |
+| `VIAntiAliasing` | `False` | Apply the VI's coverage anti-aliasing when the game enables it (`aa_mode` 0 or 1 in `VI_STATUS`). A filter runs only when the game bit **and** the option are set (details and exactness in [design.md](design.md#vi-filter-pass)). Runs the filter pass: 0.3-0.6 ms per frame over the plain conversion in a typical scene, about 3.5 ms in a scene with many edges (Pokemon Snap). Applies at once. |
+| `VIDivot` | `True` | Apply the VI's divot filter when the game enables it (`divot_enable`). About 0.5 ms per frame. Applies at once. |
+| `VIDedither` | `False` | Apply the VI's dither restore when the game enables it (`dither_filter_enable`); smooths the 4x4 dither pattern. About 0.7-0.85 ms per frame. Applies at once. |
+| `VIGamma` | `True` | Apply the VI's gamma correction when the game enables it (`gamma_enable`). About 0.5 ms per frame. Applies at once. |
+| `CropOverscanH` | `False` | Crop 8 VI pixels off both the left and the right edge of the image (16 each for a hi-res image, 512 or more pixels wide) before it is scaled. Hides the edge garbage some games leave in the outermost columns, which a TV's overscan would hide. Display only. Applies at once. |
+| `CropOverscanV` | `False` | Crop 12 lines off both the top and the bottom edge (24 each for a frame of 360 or more lines). Same purpose; display only. Applies at once. |
 | `VSync` | `True` | Wait for vertical sync when presenting. |
 | `Threads` | `0` | Rendering worker threads. `0` = auto (cores - 1: 3 on a 4-core chip; at most 7; one on a 2-core chip); `-1` = render on the emulation thread; `1`..`7` = that many. |
 | `FrameSkip` | `0` | `0` = off; `N` = render one frame in `N+1`; `auto` = skip when the achieved frame interval exceeds the VI period (see below). Skipped frames are still parsed (state, TMEM loads, syncs) but not rendered. |
 | `InterlaceHack` | `True` | Show only the freshest field of field-rendered interlaced frames, line doubled, instead of weaving it with the previous field. |
 | `SyncHelper` | `True` | The emulation thread renders pending stripe classes while it waits for the workers (`SYNC_FULL`, VI scan-out, hazard barriers, full job ring). Exact; `False` = it idles. |
-| `RelaxedPrecision` | `True` | Depth compare of the opaque / transparent Z modes without the delta-Z terms for partially covered pixels; affects only coplanar edge cases. **Not exact.** |
+| `RelaxedPrecision` | `False` | `True` = depth compare of the opaque / transparent Z modes without the delta-Z terms for partially covered pixels; affects only coplanar edge cases and saves about 3 % of pixel-worker time ([measurement](performance.md#what-relaxedprecision-saves)). **Not exact when on.** |
 | `FastCombiner` | `True` | Use the NEON combiner and blender (exact). Off: the scalar reference combiner and blender. |
 | `NEON` | `True` | Use the NEON kernels when built in. `False` = scalar reference kernels (slow). |
 | `Specialize` | `True` | Use the precompiled per-state pixel kernel variants; `False` = the generic NEON kernels only (bit-identical output, slower). Needs `NEON`. |
 
 `[Video-General]` holds the usual `Fullscreen` (default `False`), `ScreenWidth` (640) and `ScreenHeight` (480); foir registers them if they are not there yet.
 
-**Exact settings** (the output matches the scalar reference, and through it angrylion-rdp-plus): `RelaxedPrecision = False`, `FrameSkip = 0`, `InterlaceHack = False`; all other options are exact in either position. `FOIR_KNOBS=exact` forces these three.
+**Exact settings** (the output matches the scalar reference, and through it angrylion-rdp-plus): `RelaxedPrecision = False` (the default), `FrameSkip = 0` (the default), `InterlaceHack = False`; all other options are exact in either position. `FOIR_KNOBS=exact` forces these three (so only `InterlaceHack` differs from the defaults).
 
-**FrameSkip.** A fixed `N` renders the frames whose count is a multiple of `N+1`. In `auto` mode the achieved frame interval is measured over windows of 60 presented frames: above 112 % of the VI period (16.67 ms) the skip level goes up, below 92 % it goes down; level 1 renders every second frame, level 2 one frame in three. It is a simple controller and does not know about render-to-texture frames. Games rotate two or three framebuffers, and a
-fixed skip can leave one of them undrawn for as long as skipping lasts: when the VI scans out a colour image whose last drawing was
-skipped, foir neither converts nor presents it, so the screen keeps the last rendered frame instead of flashing an old one (`held` in the log). The suxty menu offers Off / Every 2nd / 2 of 3 / 3 of 4 / Auto (levels 0-3 and `auto`; the names count skipped frames).
+**Overscan crop.** Both bools take a fixed number of *VI pixels* (pixels of the framebuffer image, not screen pixels) off each edge: `CropOverscanH` 8 columns left and right, `CropOverscanV` 12 lines top and bottom (a 320x237 frame becomes 304x213). The cropped image fills the same 4:3 box (or the window with `Widescreen`), so it is scaled up by 5 % / 11 %, in whole VI pixels: nearest-neighbour stays even. A hi-res image (width of 512 or more) crops 16 columns and a frame of 360 or more lines 24, so the same part of the picture goes; an axis whose image would fall below 32 pixels is left alone. Only the conversion of the VI image changes: the RDRAM, framebuffer and `foir-replay` checksums do not, and the screenshot (`ReadScreen2`) shows the cropped image. Under `InterlaceHack` the crop is even, so line pairs and fields stay together. Why these values: in the playtest captures the edge artefacts are in the framebuffer itself, not in the VI registers (`H_START`/`V_START` are the standard 108-748 / 37-511 in the games checked): Jet Force Gemini and Pilotwings 64 carry a garbage last column (1-2 px), Pilotwings and Mario Golf draw black borders of 7-10 px of their own, and hardware hides the outer edge behind the TV's overscan. 8 columns clear the garbage and most of the games' own borders, 12 lines match the 5 % of a typical NTSC overscan; both stay off by default because a game that fills its frame loses real picture. Per game, suxty's `[foir]` section can turn them on.
+
+**FrameSkip.** `N` renders one frame in `N+1`; in `auto` mode the achieved frame interval is measured over windows of 60 presented frames: above 112 % of the VI period (16.67 ms) the skip level goes up, below 92 % it goes down; level 1 renders every second frame, level 2 one frame in three. The rules that decide what a skipped frame drops (the playtest artefacts of Mario Golf, Paper Mario and Star Fox 64 came from breaking them; [design.md](design.md#frame-skip)):
+
+- A *frame* is a VI period: everything drawn into scanned-out buffers between two scan-outs. (Counting `SYNC_FULL`s let a game that syncs twice per frame, or renders in two passes, lock the skip pattern onto one of them: Paper Mario's screen frames were skipped every time.)
+- Only triangles and texture rectangles into a **scanned-out** colour image are dropped. Off-screen targets (a colour image the VI never scans out) are always drawn, because a later frame may texture from them; fill and copy rectangles are always drawn (cheap, and the only thing that repaints a border or a backdrop).
+- A period is skipped only if the previous one drew at least 100 primitives into scanned-out buffers (`FOIR_SKIP_MINPRIMS`; a light frame saves nothing, and 2D / menu frames are the ones that draw on top of what is already in the buffer) and was not rendered in fields (interlaced `SET_SCISSOR` field bit).
+- A buffer whose last frame was skipped is refilled from the last frame that was rendered before the first drawing into it in a rendered frame, so a game that draws on top of the buffer's old content (a pause menu over a frozen scene) does not keep the hole.
+- The buffer list is 16 colour images (it was 4: a game with three scan buffers and three off-screen targets thrashed it and showed buffers that still held a pre-skip frame). When the VI scans out a colour image whose last drawing was skipped, foir neither converts nor presents it, so the screen keeps the last rendered frame (`held` in the log).
+
+Known limit: a game that reads its own picture with the CPU or RSP (a snapshot of the screen for a transition effect; Mario Golf's course intro keeps a 160 KB copy at 0x2e8000) sees a buffer that lacks the skipped frames, and foir cannot see CPU reads (the core's frame-buffer hooks are off under the dynarec). Those scenes show wrong frames while skipping lasts, as before. The suxty menu offers Off / Every 2nd / 2 of 3 / 3 of 4 / Auto (levels 0-3 and `auto`; the names count skipped frames).
 
 Removed options: a `JIT` entry that an older config file may still contain is ignored (the compile-at-run-time pipeline it was reserved for was dropped in favour of the static variants); a `SkipCoverage` knob existed for a while and was removed because it produced seams along polygon edges.
 
@@ -41,6 +55,12 @@ Always available:
 | `FOIR_SPEC=0` | Same as `Specialize = False`. |
 | `FOIR_SPEC_COMB=auto\|exact\|shape\|generic` | Combiner dispatch: exact variant, then shape kernel, then generic kernel (`auto`), or only some of them. |
 | `FOIR_SPEC_TEX=auto\|exact\|shape\|generic` | Texture dispatch: exact variant, then "any format" kernel, then generic kernel (`shape` = "any format" kernels only). |
+| `FOIR_FRAMESKIP=N\|auto` | Overrides `FrameSkip` (tests). |
+| `FOIR_SKIPLOG=1` | Log one line per VI scan-out (shown or held, the colour images drawn since the last one with their primitives, drawn and skipped) and one per frame start (heavy, skip or render). |
+| `FOIR_FRAMEHASH=1` | Log a hash of every presented frame and whether it was held (for comparing a FrameSkip run with an unskipped one: `tools/skiptest.py` does it offline, the in-game method is in [testing.md](testing.md)). |
+| `FOIR_SKIP_MINPRIMS=n` | The primitive count a period must have drawn before the next one may be skipped (default 100). |
+| `FOIR_SKIP_LEGACY=1` | FrameSkip as it was before the rules above (every primitive dropped, decided at every `SYNC_FULL`, four-entry history), to compare. |
+| `FOIR_SKIP_OPTS=bits` | Bisecting FrameSkip artefacts: 1 no refill, 2 no heavy-frame rule, 4 also skip off-screen targets, 8 also skip fills and copies, 32 do all the bookkeeping but skip nothing. With `FOIR_SKIPLOG`, `FOIR_RDRAM_BLOCKS=1` adds a hash of every 32 KB of RDRAM to each scan-out line. |
 | `FOIR_KNOBS=exact` | `RelaxedPrecision`, `FrameSkip` and `InterlaceHack` at their accuracy-preserving setting. |
 | `FOIR_EARLYZ=0\|1\|2` | Early Z ([design.md](design.md#pixel-stages)): `0` = off (original stage order), `1` = on for the NEON kernels (default; the scalar reference always keeps the original order), `2` = on for the scalar kernels too (testing). Exact in every position; for A/B timing and bisecting. |
 | `FOIR_NEON_MASK=bits` | Which stages use NEON, one bit each: texture 0x01, combine 0x02, zcmp 0x04, blend 0x08, store 0x10, fill 0x20, copy 0x40 (default `0x7f`). A stage that is not NEON is not specialised either; `0x3f` = everything but the NEON COPY kernel. |
@@ -80,8 +100,16 @@ foir exports one extra function, `FoirSuxtyGetInterface()` (declared in `src/foi
 | 7 | `Specialize` | bool | next launch |
 | 8 | `FastCombiner` | bool | next launch |
 | 9 | `RelaxedPrecision` | bool | next launch |
+| 10 | `CropOverscanH` | bool | at once |
+| 11 | `CropOverscanV` | bool | at once |
+| 12 | `VIAntiAliasing` | bool | at once |
+| 13 | `VIDivot` | bool | at once |
+| 14 | `VIDedither` | bool | at once |
+| 15 | `VIGamma` | bool | at once |
 
-*Why these are live.* `Widescreen` and `Filter` are read when the frame is drawn, `InterlaceHack` by the VI conversion and `FrameSkip` by the `SYNC_FULL` hook, all on the emulation thread and none in the workers' private copy of the config. *Why the others are not.* `Threads`, `NEON`, `Specialize` and `FastCombiner` choose the kernel tables and the worker pool at start; `RelaxedPrecision` is part of the specialisation key and is copied into every worker; `VSync` is applied when the window is created. Changing them mid-game would mean rebuilding the pipeline.
+Id 12 was the single `VIFilters` bool of the first version (never released); it now is `VIAntiAliasing`; there is no migration of the old key.
+
+*Why these are live.* `Widescreen` and `Filter` are read when the frame is drawn, `CropOverscanH`, `CropOverscanV`, `VIAntiAliasing`, `VIDivot`, `VIDedither` and `VIGamma` by the VI conversion (they are copied into the RDP's config at once, like `InterlaceHack`), `InterlaceHack` by the VI conversion and `FrameSkip` by the `SYNC_FULL` hook, all on the emulation thread and none in the workers' private copy of the config. *Why the others are not.* `Threads`, `NEON`, `Specialize` and `FastCombiner` choose the kernel tables and the worker pool at start; `RelaxedPrecision` is part of the specialisation key and is copied into every worker; `VSync` is applied when the window is created. Changing them mid-game would mean rebuilding the pipeline.
 
 *Thread safety.* `get()` / `set()` must be called on the emulation thread, not from inside a foir call. suxty's menu runs inside the buffer swap, which `UpdateScreen()` issues last, after the workers have been drained and the frame uploaded: nothing else touches the live options while the menu is open, and the next `ProcessRDPList()` starts after the menu returns. Once the ROM is open a call from another thread is refused.
 
