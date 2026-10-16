@@ -120,28 +120,52 @@ void vi_render_ex(const struct rdp *r, const struct vi_regs *regs, struct vi_fra
     const int ow = w - 2 * cx, oh = h - 2 * cy;
 
     uint32_t origin = regs->origin & 0xffffff;
-    /* InterlaceHack: the buffer holds one fresh field; weaving it would mix in the previous one, so show its rows twice */
-    bool fieldhack = r->cfg.interlace_hack && (regs->status & 0x40) && r->scfield && h >= 2;
-    int field = r->sckeepodd & 1;
+    /* InterlaceHack: a buffer the game draws one field at a time holds one fresh field and the previous one's rows in between; weaving would show both,
+     * so keep the fresh rows where they are and interpolate the others from them. Only for a buffer scanned out row by row (a VI stride wider than the
+     * buffer skips rows: it already shows one field) and only while it is drawn in fields (the scissor's field bit is state, not a property of the frame) */
+    int field = 0, roff = 0;
+    const struct fld_buf *fb = r->cfg.interlace_hack && (regs->status & 0x40) && h >= 2 ? rdp_fld_find(r, origin, &roff) : NULL;
+    const bool fieldhack = fb && stride <= fb->width;
+    if (fieldhack) field = (fb->odd ^ roff) & 1;
     struct vi_filter_ctx fc;
     const bool any_opt = r->cfg.vi_aa || r->cfg.vi_divot || r->cfg.vi_dedither || r->cfg.vi_gamma;
     const bool filt = any_opt && vi_filter_setup(r, regs, &fc);
     const bool raw = allow_raw16 && type == 2 && !filt;
+    const size_t px = raw ? 2 : 4;
+    uint8_t *base = (uint8_t *)out->pixels;
+#define ROWP(y) (base + (size_t)(y) * (size_t)ow * px)
+#define CONV(sy, dst) do { \
+        if (raw) row16_raw(r, (origin >> 1) + (uint32_t)((sy) * stride + cx), ow, (uint16_t *)(dst)); \
+        else if (filt) vi_filter_row(r, &fc, (sy), cx, ow, (uint32_t *)(dst)); \
+        else if (type == 2) row16(r, (origin >> 1) + (uint32_t)((sy) * stride + cx), ow, (uint32_t *)(dst)); \
+        else row32(r, (origin >> 2) + (uint32_t)((sy) * stride + cx), ow, (uint32_t *)(dst)); } while (0)
     for (int y = 0; y < oh; y++) {
-        int yy = y + cy;       /* line of the uncropped image; cy is even, so line pairs stay together */
-        int sy = fieldhack ? ((yy & ~1) | field) : yy;
-        if (raw) {
-            uint16_t *d16 = (uint16_t *)out->pixels + (size_t)y * (size_t)ow;
-            if (fieldhack && (yy & 1)) { memcpy(d16, d16 - ow, (size_t)ow * 2); continue; }
-            row16_raw(r, (origin >> 1) + (uint32_t)(sy * stride + cx), ow, d16);
-            continue;
-        }
-        uint32_t *dst = &out->pixels[y * ow];
-        if (fieldhack && (yy & 1)) { memcpy(dst, dst - ow, (size_t)ow * 4); continue; }
-        if (filt) { vi_filter_row(r, &fc, sy, cx, ow, dst); continue; }
-        if (type == 2) row16(r, (origin >> 1) + (uint32_t)(sy * stride + cx), ow, dst);
-        else           row32(r, (origin >> 2) + (uint32_t)(sy * stride + cx), ow, dst);
+        int yy = y + cy;       /* line of the uncropped image */
+        if (!fieldhack || (yy & 1) == field) CONV(yy, ROWP(y));
     }
+    if (fieldhack) {
+        /* the other lines: the mean of the fresh lines above and below (at the edge of the image, or of the crop, the one that exists) */
+        uint8_t edge[2][VI_MAX_W * 4];
+        for (int y = 0; y < oh; y++) {
+            int yy = y + cy;
+            if ((yy & 1) == field) continue;
+            const uint8_t *up = NULL, *dn = NULL;
+            if (yy >= 1)     { if (y >= 1)       up = ROWP(y - 1); else { CONV(yy - 1, edge[0]); up = edge[0]; } }
+            if (yy + 1 < h)  { if (y + 1 < oh)   dn = ROWP(y + 1); else { CONV(yy + 1, edge[1]); dn = edge[1]; } }
+            uint8_t *d = ROWP(y);
+            if (!up) up = dn;
+            if (!dn) dn = up;
+            if (raw) {
+                const uint16_t *a = (const uint16_t *)up, *b = (const uint16_t *)dn; uint16_t *o = (uint16_t *)d;
+                for (int x = 0; x < ow; x++) o[x] = (uint16_t)((a[x] & b[x]) + (((a[x] ^ b[x]) & 0xf7bcu) >> 1));   /* per 5-bit channel, alpha bit kept by the and */
+            } else {
+                const uint32_t *a = (const uint32_t *)up, *b = (const uint32_t *)dn; uint32_t *o = (uint32_t *)d;
+                for (int x = 0; x < ow; x++) o[x] = (a[x] & b[x]) + (((a[x] ^ b[x]) & 0xfefefefeu) >> 1);
+            }
+        }
+    }
+#undef CONV
+#undef ROWP
     out->raw16 = raw;
     out->width = ow;
     out->height = oh;

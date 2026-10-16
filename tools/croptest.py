@@ -59,11 +59,17 @@ def main():
                 if key in seen_geo:
                     continue   # one dump per geometry is enough
                 seen_geo[key] = os.path.basename(d)
-                if weave and weave[0] == '--field':   # InterlaceHack must actually engage: lines come in equal pairs
-                    pairs = all(base[(2 * y * w) * 3:((2 * y + 1) * w) * 3] == base[((2 * y + 1) * w) * 3:((2 * y + 2) * w) * 3] for y in range(h // 2))
+                if weave and weave[0] == '--field':   # InterlaceHack must engage: the fresh lines are the frame's own, the others the mean of their neighbours
+                    (_, _, wv), _ = render(a.replay, runner, path, ['--weave'] + weave, tmp)
+                    fld = int(weave[1]); R = w * 3
+                    row = lambda p, y: p[y * R:(y + 1) * R]
+                    fresh = all(row(base, y) == row(wv, y) for y in range(fld, h, 2))
+                    mean = all(row(base, y) == bytes((u + v) >> 1 for u, v in zip(row(base, y - 1), row(base, y + 1))) for y in range(1 if fld == 0 else 2, h - 1, 2))
+                    engaged = base != wv
                     checks += 1
-                    bad += not pairs
-                    print('%-4s %s %s: field-hack frame has line-doubled pairs' % ('ok' if pairs else 'FAIL', os.path.basename(d), ' '.join(weave)))
+                    bad += not (fresh and mean and engaged)
+                    print('%-4s %s %s: field-hack frame keeps the fresh lines (%s), the others are their mean (%s), differs from the weave (%s)' % (
+                        'ok' if fresh and mean and engaged else 'FAIL', os.path.basename(d), ' '.join(weave), fresh, mean, engaged))
                 for flags in (['--crop-h'], ['--crop-v'], ['--crop-h', '--crop-v']):
                     (cw, ch, pix), sc = render(a.replay, runner, path, weave + flags, tmp)
                     cx = CROP_H * (2 if w >= 512 else 1) if '--crop-h' in flags and w - 2 * CROP_H * (2 if w >= 512 else 1) >= 32 else 0
