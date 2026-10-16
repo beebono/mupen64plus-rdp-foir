@@ -20,6 +20,8 @@ struct foir_config {
     bool vsync;
     bool filter;
     bool widescreen;
+    bool crop_h;             /* CropOverscanH: VI_CROP_H pixels off the left and right edges (live) */
+    bool crop_v;             /* CropOverscanV: VI_CROP_V lines off the top and bottom (live) */
 };
 
 void foir_config_defaults(struct foir_config *c);

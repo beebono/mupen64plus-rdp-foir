@@ -159,7 +159,7 @@ An earlier plan was to compile pipeline variants at run time with GNU Lightning.
 
 ## VI output
 
-- foir emulates no VI filters. It crops the active framebuffer region and converts it to RGBA8888 with NEON (about 0.2 ms for 320x237), uploads it as **one texture** through the core's video extension (GLES2; about 0.7 ms including draw and swap on the RK3566), and scales it to the window (`Filter` selects bilinear, `Widescreen` stretches instead of keeping 4:3).
+- foir emulates no VI filters. It crops the active framebuffer region and converts it to RGBA8888 with NEON (about 0.2 ms for 320x237), uploads it as **one texture** through the core's video extension (GLES2; about 0.7 ms including draw and swap on the RK3566), and scales it to the window (`Filter` selects bilinear, `Widescreen` stretches instead of keeping 4:3). `CropOverscanH` / `CropOverscanV` drop a fixed number of VI pixels off each edge during that conversion (see [options.md](options.md#overscan-crop)).
 - `InterlaceHack`: for interlaced output of frames the game rendered one field at a time (`SET_SCISSOR` field bits), only the freshest field is scanned out, line doubled, instead of weaving it with the previous field.
 - A front-end or plugin that overrides VidExt, such as mupen64plus-input-suxty, can draw its overlay on top of that texture.
 

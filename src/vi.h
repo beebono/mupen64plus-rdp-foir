@@ -6,6 +6,12 @@
 #define VI_MAX_W 1024
 #define VI_MAX_H 768
 
+/* Overscan crop (CropOverscanH / CropOverscanV), per edge, in VI pixels of a low-resolution (<= 320 wide / 240 line) image.
+ * A hi-res image (width >= 512) crops twice as many columns, a frame of >= 360 lines twice as many lines, so the same
+ * part of the picture goes.  An axis whose image would drop below 32 pixels is left alone. */
+#define VI_CROP_H 8
+#define VI_CROP_V 12
+
 struct vi_regs {
     uint32_t status, origin, width, h_start, v_start, x_scale, y_scale;
 };

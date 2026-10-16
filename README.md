@@ -62,12 +62,13 @@ Main `[Video-Foir]` options (all of them, the environment variables and the suxt
 | `VSync` | `True` | Wait for vertical sync when presenting |
 | `Threads` | `0` | Worker threads: `0` = auto (cores - 1), `-1` = none (render on the emulation thread), `1`..`7` |
 | `FrameSkip` | `0` | `0` = off, `N` = render one frame in `N+1`, `auto` = skip to hold full speed |
+| `CropOverscanH`, `CropOverscanV` | `False` | Crop 8 columns (left and right) / 12 lines (top and bottom) of VI pixels off the image, to hide edge artefacts; display only |
 | `InterlaceHack` | `True` | Show only the freshest field of field-rendered interlaced frames |
 | `RelaxedPrecision` | `False` | `True` = faster Z compare for opaque/transparent modes (about 3 % of pixel-worker time); not exact (see Status) |
 | `SyncHelper`, `FastCombiner`, `NEON`, `Specialize` | `True` | Speed paths; each is exact, `False` falls back to slower code |
 
 **In-game menu.** With mupen64plus-input-suxty as the input plugin, its menu gets a *FOIR Options* page: Widescreen, Smoothing (`Filter`), Interlace
-Hack and Frame Skip apply at once; VSync, Worker Threads, NEON, Specialised Kernels, Fast Combiner and Relaxed Precision apply at the next launch, and
+Hack, Frame Skip and the two overscan crops apply at once; VSync, Worker Threads, NEON, Specialised Kernels, Fast Combiner and Relaxed Precision apply at the next launch, and
 can be stored per game.
 
 ## Status, accuracy and known gaps

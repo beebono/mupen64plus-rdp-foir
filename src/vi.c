@@ -113,26 +113,33 @@ void vi_render_ex(const struct rdp *r, const struct vi_regs *regs, struct vi_fra
     if (w > VI_MAX_W) w = VI_MAX_W;
     if (h > VI_MAX_H) h = VI_MAX_H;
 
+    /* display-only overscan crop: fewer columns / lines are converted, nothing else changes */
+    int cx = 0, cy = 0;
+    if (r->cfg.crop_h) { cx = VI_CROP_H * (w >= 512 ? 2 : 1); if (w - 2 * cx < 32) cx = 0; }
+    if (r->cfg.crop_v) { cy = VI_CROP_V * (h >= 360 ? 2 : 1); if (h - 2 * cy < 32) cy = 0; }
+    const int ow = w - 2 * cx, oh = h - 2 * cy;
+
     uint32_t origin = regs->origin & 0xffffff;
     /* InterlaceHack: the buffer holds one fresh field; weaving it would mix in the previous one, so show its rows twice */
     bool fieldhack = r->cfg.interlace_hack && (regs->status & 0x40) && r->scfield && h >= 2;
     int field = r->sckeepodd & 1;
     const bool raw = allow_raw16 && type == 2;
-    for (int y = 0; y < h; y++) {
-        int sy = fieldhack ? ((y & ~1) | field) : y;
+    for (int y = 0; y < oh; y++) {
+        int yy = y + cy;       /* line of the uncropped image; cy is even, so line pairs stay together */
+        int sy = fieldhack ? ((yy & ~1) | field) : yy;
         if (raw) {
-            uint16_t *d16 = (uint16_t *)out->pixels + (size_t)y * (size_t)w;
-            if (fieldhack && (y & 1)) { memcpy(d16, d16 - w, (size_t)w * 2); continue; }
-            row16_raw(r, (origin >> 1) + (uint32_t)(sy * stride), w, d16);
+            uint16_t *d16 = (uint16_t *)out->pixels + (size_t)y * (size_t)ow;
+            if (fieldhack && (yy & 1)) { memcpy(d16, d16 - ow, (size_t)ow * 2); continue; }
+            row16_raw(r, (origin >> 1) + (uint32_t)(sy * stride + cx), ow, d16);
             continue;
         }
-        uint32_t *dst = &out->pixels[y * w];
-        if (fieldhack && (y & 1)) { memcpy(dst, dst - w, (size_t)w * 4); continue; }
-        if (type == 2) row16(r, (origin >> 1) + (uint32_t)(sy * stride), w, dst);
-        else           row32(r, (origin >> 2) + (uint32_t)(sy * stride), w, dst);
+        uint32_t *dst = &out->pixels[y * ow];
+        if (fieldhack && (yy & 1)) { memcpy(dst, dst - ow, (size_t)ow * 4); continue; }
+        if (type == 2) row16(r, (origin >> 1) + (uint32_t)(sy * stride + cx), ow, dst);
+        else           row32(r, (origin >> 2) + (uint32_t)(sy * stride + cx), ow, dst);
     }
     out->raw16 = raw;
-    out->width = w;
-    out->height = h;
+    out->width = ow;
+    out->height = oh;
     out->valid = true;
 }

@@ -23,7 +23,8 @@ int main(int argc, char **argv)
 {
     const char *in = NULL, *out_rdram = NULL, *out_ppm = NULL;
     int repeats = 1;
-    bool neon = true, nopix = false, fast = false, weave = false, spec = true;
+    bool neon = true, nopix = false, fast = false, weave = false, spec = true, crop_h = false, crop_v = false;
+    int force_field = -1;
     int threads = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-o") && i + 1 < argc) out_rdram = argv[++i];
@@ -35,11 +36,14 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--setup-only")) nopix = true;
         else if (!strcmp(argv[i], "--fast")) fast = true;
         else if (!strcmp(argv[i], "--weave")) weave = true;
+        else if (!strcmp(argv[i], "--field") && i + 1 < argc) force_field = atoi(argv[++i]) & 1;
+        else if (!strcmp(argv[i], "--crop-h")) crop_h = true;
+        else if (!strcmp(argv[i], "--crop-v")) crop_v = true;
         else if (!strcmp(argv[i], "-t") && i + 1 < argc) threads = atoi(argv[++i]);
         else if (argv[i][0] != '-') in = argv[i];
         else { fprintf(stderr, "unknown option %s\n", argv[i]); return 2; }
     }
-    if (!in) { fprintf(stderr, "usage: %s dump.fdump [-o out.rdram] [-p out.ppm] [-n repeats] [--scalar] [--nospec] [-t threads] [--fast] [--weave]\n", argv[0]); return 2; }
+    if (!in) { fprintf(stderr, "usage: %s dump.fdump [-o out.rdram] [-p out.ppm] [-n repeats] [--scalar] [--nospec] [-t threads] [--fast] [--weave] [--crop-h] [--crop-v] [--field 0|1]\n", argv[0]); return 2; }
 
     FILE *fp = fopen(in, "rb");
     if (!fp) { perror(in); return 1; }
@@ -65,6 +69,7 @@ int main(int argc, char **argv)
     /* the reference comparison runs with the accuracy-preserving knob settings; --fast turns RelaxedPrecision on */
     cfg.relaxed_precision = fast;
     if (weave) cfg.interlace_hack = false;
+    cfg.crop_h = crop_h; cfg.crop_v = crop_v;
 
     static struct rdp r;
 #ifdef FOIR_STAGETIME
@@ -170,11 +175,13 @@ int main(int argc, char **argv)
     }
     if (out_ppm) {
         static struct vi_frame fr;
+        if (force_field >= 0) { r.scfield = 1; r.sckeepodd = force_field; }   /* test hook: a field-rendered frame for InterlaceHack */
         struct vi_regs v = { h.vi[0], h.vi[1], h.vi[2], h.vi[3], h.vi[4], h.vi[5], h.vi[6] };
         vi_render(&r, &v, &fr);
         FILE *o = fopen(out_ppm, "wb");
         if (!o) { perror(out_ppm); return 1; }
         int w = fr.valid ? fr.width : 320, hh = fr.valid ? fr.height : 240;
+        fprintf(stderr, "foir-replay: vi frame %dx%d screen %.4f x %.4f\n", w, hh, fr.screen_w, fr.screen_h);
         fprintf(o, "P6\n%d %d\n255\n", w, hh);
         for (int i = 0; i < w * hh; i++) {
             uint32_t px = fr.valid ? fr.pixels[i] : 0;

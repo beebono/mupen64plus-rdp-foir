@@ -8,6 +8,8 @@ foir reads its settings from the `[Video-Foir]` section of `mupen64plus.cfg` (wr
 |---|---|---|
 | `Widescreen` | `False` | Stretch the image to the whole window instead of keeping 4:3. |
 | `Filter` | `False` | Bilinear filtering when scaling the VI image to the window (off = nearest neighbour). |
+| `CropOverscanH` | `False` | Crop 8 VI pixels off both the left and the right edge of the image (16 each for a hi-res image, 512 or more pixels wide) before it is scaled. Hides the edge garbage some games leave in the outermost columns, which a TV's overscan would hide. Display only. Applies at once. |
+| `CropOverscanV` | `False` | Crop 12 lines off both the top and the bottom edge (24 each for a frame of 360 or more lines). Same purpose; display only. Applies at once. |
 | `VSync` | `True` | Wait for vertical sync when presenting. |
 | `Threads` | `0` | Rendering worker threads. `0` = auto (cores - 1: 3 on a 4-core chip; at most 7; one on a 2-core chip); `-1` = render on the emulation thread; `1`..`7` = that many. |
 | `FrameSkip` | `0` | `0` = off; `N` = render one frame in `N+1`; `auto` = skip when the achieved frame interval exceeds the VI period (see below). Skipped frames are still parsed (state, TMEM loads, syncs) but not rendered. |
@@ -21,6 +23,8 @@ foir reads its settings from the `[Video-Foir]` section of `mupen64plus.cfg` (wr
 `[Video-General]` holds the usual `Fullscreen` (default `False`), `ScreenWidth` (640) and `ScreenHeight` (480); foir registers them if they are not there yet.
 
 **Exact settings** (the output matches the scalar reference, and through it angrylion-rdp-plus): `RelaxedPrecision = False` (the default), `FrameSkip = 0` (the default), `InterlaceHack = False`; all other options are exact in either position. `FOIR_KNOBS=exact` forces these three (so only `InterlaceHack` differs from the defaults).
+
+**Overscan crop.** Both bools take a fixed number of *VI pixels* (pixels of the framebuffer image, not screen pixels) off each edge: `CropOverscanH` 8 columns left and right, `CropOverscanV` 12 lines top and bottom (a 320x237 frame becomes 304x213). The cropped image fills the same 4:3 box (or the window with `Widescreen`), so it is scaled up by 5 % / 11 %, in whole VI pixels: nearest-neighbour stays even. A hi-res image (width of 512 or more) crops 16 columns and a frame of 360 or more lines 24, so the same part of the picture goes; an axis whose image would fall below 32 pixels is left alone. Only the conversion of the VI image changes: the RDRAM, framebuffer and `foir-replay` checksums do not, and the screenshot (`ReadScreen2`) shows the cropped image. Under `InterlaceHack` the crop is even, so line pairs and fields stay together. Why these values: in the playtest captures the edge artefacts are in the framebuffer itself, not in the VI registers (`H_START`/`V_START` are the standard 108-748 / 37-511 in the games checked): Jet Force Gemini and Pilotwings 64 carry a garbage last column (1-2 px), Pilotwings and Mario Golf draw black borders of 7-10 px of their own, and hardware hides the outer edge behind the TV's overscan. 8 columns clear the garbage and most of the games' own borders, 12 lines match the 5 % of a typical NTSC overscan; both stay off by default because a game that fills its frame loses real picture. Per game, suxty's `[foir]` section can turn them on.
 
 **FrameSkip.** A fixed `N` renders the frames whose count is a multiple of `N+1`. In `auto` mode the achieved frame interval is measured over windows of 60 presented frames: above 112 % of the VI period (16.67 ms) the skip level goes up, below 92 % it goes down; level 1 renders every second frame, level 2 one frame in three. It is a simple controller and does not know about render-to-texture frames. Games rotate two or three framebuffers, and a
 fixed skip can leave one of them undrawn for as long as skipping lasts: when the VI scans out a colour image whose last drawing was
@@ -80,8 +84,10 @@ foir exports one extra function, `FoirSuxtyGetInterface()` (declared in `src/foi
 | 7 | `Specialize` | bool | next launch |
 | 8 | `FastCombiner` | bool | next launch |
 | 9 | `RelaxedPrecision` | bool | next launch |
+| 10 | `CropOverscanH` | bool | at once |
+| 11 | `CropOverscanV` | bool | at once |
 
-*Why these are live.* `Widescreen` and `Filter` are read when the frame is drawn, `InterlaceHack` by the VI conversion and `FrameSkip` by the `SYNC_FULL` hook, all on the emulation thread and none in the workers' private copy of the config. *Why the others are not.* `Threads`, `NEON`, `Specialize` and `FastCombiner` choose the kernel tables and the worker pool at start; `RelaxedPrecision` is part of the specialisation key and is copied into every worker; `VSync` is applied when the window is created. Changing them mid-game would mean rebuilding the pipeline.
+*Why these are live.* `Widescreen` and `Filter` are read when the frame is drawn, `CropOverscanH` / `CropOverscanV` by the VI conversion (they are copied into the RDP's config at once, like `InterlaceHack`), `InterlaceHack` by the VI conversion and `FrameSkip` by the `SYNC_FULL` hook, all on the emulation thread and none in the workers' private copy of the config. *Why the others are not.* `Threads`, `NEON`, `Specialize` and `FastCombiner` choose the kernel tables and the worker pool at start; `RelaxedPrecision` is part of the specialisation key and is copied into every worker; `VSync` is applied when the window is created. Changing them mid-game would mean rebuilding the pipeline.
 
 *Thread safety.* `get()` / `set()` must be called on the emulation thread, not from inside a foir call. suxty's menu runs inside the buffer swap, which `UpdateScreen()` issues last, after the workers have been drained and the frame uploaded: nothing else touches the live options while the menu is open, and the next `ProcessRDPList()` starts after the menu returns. Once the ROM is open a call from another thread is refused.
 
