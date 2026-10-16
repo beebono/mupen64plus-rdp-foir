@@ -348,6 +348,10 @@ struct rdp {
     uint32_t period;                /* VI periods (scan-outs that were followed by drawing into a scanned-out buffer) so far */
     uint32_t period_prims, last_rendered;   /* primitives into scanned-out buffers this period; the latest such buffer drawn while rendering */
     bool period_rendered;
+    /* buffers drawn in fields (SET_SCISSOR field bit), for InterlaceHack: the parity of the rows drawn last and the width the buffer was drawn with */
+    struct fld_buf { uint32_t addr; int width, rowbytes; int odd; } fld[4];
+    int fld_n, fld_next;
+    bool fld_dirty;                 /* the colour image or the scissor changed since fld was last updated */
     bool vi_since;                  /* the VI has scanned out since that frame began */
     struct px_batch batch;
     uint32_t stat_prims, stat_pixels;
@@ -394,6 +398,9 @@ void foir_stats_flush(void);   /* write the statistics to $FOIR_STATE_STATS_FILE
 void raster_draw(struct rdp *r, const struct prim_walk *pw, int start, int end);
 void rdp_fb_history_reset(struct rdp *r);
 void rdp_skip_decide(struct rdp *r);                            /* a frame starts: skip it (r->skip_pixels) according to FrameSkip? */
+void rdp_fld_update(struct rdp *r);                            /* record / forget the current colour image as field-rendered */
+void rdp_fld_note(struct rdp *r, uint32_t addr, int width, int rowbytes, int odd);
+const struct fld_buf *rdp_fld_find(const struct rdp *r, uint32_t origin, int *row_off);   /* the field-rendered buffer a VI origin points into, with the row offset */
 void rdp_vi_scanned(struct rdp *r);                            /* a scan-out happened (the next frame into the same buffer is a new one) */
 void rdp_note_scanout(struct rdp *r, uint32_t vi_origin);      /* the VI scanned out this origin */
 void rdp_fb_skip_log(struct rdp *r, uint32_t vi_origin, bool stale);   /* FOIR_SKIPLOG: one line per colour image, then the counters restart */

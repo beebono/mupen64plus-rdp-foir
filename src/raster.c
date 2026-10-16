@@ -691,6 +691,39 @@ void rdp_note_scanout(struct rdp *r, uint32_t vi_origin)
     r->scan_next = (r->scan_next + 1) & 7;
 }
 
+/* InterlaceHack applies to a buffer only while it is drawn in fields: other buffers (and this one once it is drawn whole) are shown as they are */
+void rdp_fld_note(struct rdp *r, uint32_t addr, int width, int rowbytes, int odd)
+{
+    for (int i = 0; i < r->fld_n; i++)
+        if (r->fld[i].addr == addr) { r->fld[i] = (struct fld_buf){ addr, width, rowbytes, odd }; return; }
+    int i = r->fld_n < 4 ? r->fld_n++ : (r->fld_next++ & 3);
+    r->fld[i] = (struct fld_buf){ addr, width, rowbytes, odd };
+}
+
+void rdp_fld_update(struct rdp *r)
+{
+    r->fld_dirty = false;
+    if (r->scfield) {
+        static const uint8_t bpp[4] = { 0, 1, 2, 4 };   /* bytes per pixel (4-bit buffers are never scanned out) */
+        rdp_fld_note(r, r->fb_address, r->fb_width, r->fb_width * bpp[r->fb_size & 3], r->sckeepodd & 1);
+        return;
+    }
+    for (int i = 0; i < r->fld_n; i++)
+        if (r->fld[i].addr == r->fb_address) { r->fld[i] = r->fld[--r->fld_n]; break; }
+}
+
+const struct fld_buf *rdp_fld_find(const struct rdp *r, uint32_t origin, int *row_off)
+{
+    origin &= 0xffffff;
+    for (int i = 0; i < r->fld_n; i++) {
+        const struct fld_buf *f = &r->fld[i];
+        if (f->rowbytes <= 0 || origin < f->addr || origin - f->addr > (uint32_t)f->rowbytes) continue;
+        *row_off = origin != f->addr;
+        return f;
+    }
+    return NULL;
+}
+
 void rdp_vi_scanned(struct rdp *r)
 {
     r->vi_since = true;

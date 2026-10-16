@@ -174,6 +174,7 @@ bool setup_walk(struct rdp *r, const int32_t *ew, struct prim_walk *pw, int *pst
     pw->xl0 = (uint32_t)(xl & ~1); pw->xli = (uint32_t)((dxldy >> 2) & ~1);
     pw->flip = flip;
     pw->ldflag = ldflag;
+    if (r->fld_dirty) rdp_fld_update(r);
     pw->scfield = r->scfield;
     pw->sckeepodd = r->sckeepodd;
     {

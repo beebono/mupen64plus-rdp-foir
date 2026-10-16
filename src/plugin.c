@@ -156,7 +156,7 @@ EXPORT m64p_error CALL PluginStartup(m64p_dynlib_handle core, void *context, voi
     ConfigSetDefaultBool(l_cfg_foir, "FastCombiner", l_cfg.fast_combiner, "Fast paths for common combiner/blender modes (the NEON kernels always take them)");
     ConfigSetDefaultBool(l_cfg_foir, "RelaxedPrecision", l_cfg.relaxed_precision, "Forces lower accuracy depth values and calculations for speed");
     ConfigSetDefaultString(l_cfg_foir, "FrameSkip", "0", "0 = off, N = fixed frame skip, auto = skip rendering to hold full speed");
-    ConfigSetDefaultBool(l_cfg_foir, "InterlaceHack", l_cfg.interlace_hack, "Render one field and line-double instead of full interlace logic");
+    ConfigSetDefaultBool(l_cfg_foir, "InterlaceHack", l_cfg.interlace_hack, "Field-rendered buffers: keep the fresh field, interpolate the other lines, instead of weaving stale rows");
     ConfigSetDefaultInt(l_cfg_foir, "Threads", l_cfg.threads, "Number of rendering worker threads: 0 = auto (cores - 1), -1 = render on the emulation thread");
     ConfigSetDefaultBool(l_cfg_foir, "SyncHelper", l_cfg.mt_helper, "The emulation thread renders for the workers while it waits for them (exact)");
     ConfigSetDefaultBool(l_cfg_foir, "Specialize", l_cfg.specialize, "Use the precompiled per-state pixel kernels; False = generic NEON kernels only (a stale JIT= entry in the config file is ignored)");
@@ -546,7 +546,7 @@ enum { OPT_WIDESCREEN, OPT_FILTER, OPT_INTERLACE, OPT_FRAMESKIP, OPT_VSYNC, OPT_
 static const struct foir_suxty_option l_opts[OPT_COUNT] = {
     [OPT_WIDESCREEN] = { "Widescreen", "Widescreen", "Stretch to the whole screen instead of 4:3", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 0 },
     [OPT_FILTER]     = { "Filter", "Smoothing", "Bilinear filtering when scaling the image", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 0 },
-    [OPT_INTERLACE]  = { "InterlaceHack", "Interlace Hack", "Show one field line-doubled instead of weaving fields", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 1 },
+    [OPT_INTERLACE]  = { "InterlaceHack", "Interlace Hack", "Keep the fresh field of field-rendered frames, no stale-row weave", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 1 },
     [OPT_FRAMESKIP]  = { "FrameSkip", "Frame Skip", "Skip rendering to hold full speed (Auto adapts)", FOIR_OPT_ENUM, FOIR_OPTF_LIVE, 0, 4, 1, l_lbl_frameskip, 0 },
     [OPT_VSYNC]      = { "VSync", "VSync", "Wait for vertical sync when presenting", FOIR_OPT_BOOL, 0, 0, 1, 1, NULL, 1 },
     [OPT_THREADS]    = { "Threads", "Worker Threads", "RDP worker threads (None = render on the emulation thread)", FOIR_OPT_ENUM, 0, 0, 8, 1, l_lbl_threads, 1 },

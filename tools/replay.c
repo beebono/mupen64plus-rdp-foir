@@ -220,7 +220,7 @@ int main(int argc, char **argv)
     }
     if (out_ppm) {
         static struct vi_frame fr;
-        if (force_field >= 0) { r.scfield = 1; r.sckeepodd = force_field; }   /* test hook: a field-rendered frame for InterlaceHack */
+        if (force_field >= 0) { r.scfield = 1; r.sckeepodd = force_field; rdp_fld_note(&r, h.vi[1] & 0xffffff, (int)(h.vi[2] & 0xfff), (int)(h.vi[2] & 0xfff) * ((h.vi[0] & 3) == 3 ? 4 : 2), force_field); }   /* test hook: a field-rendered frame for InterlaceHack */
         struct vi_regs v = { h.vi[0], h.vi[1], h.vi[2], h.vi[3], h.vi[4], h.vi[5], h.vi[6] };
         vi_render(&r, &v, &fr);
         FILE *o = fopen(out_ppm, "wb");

@@ -299,6 +299,7 @@ void rdp_run_command(struct rdp *r, const uint32_t *a)
         r->clip.yl = (a[1] >>  0) & 0xfff;
         r->scfield = (a[1] >> 25) & 1;
         r->sckeepodd = (a[1] >> 24) & 1;
+        r->fld_dirty = true;
         break;
     case CMD_SET_PRIM_DEPTH:
         r->primitive_z = a[1] & (0x7fffu << 16);
@@ -335,6 +336,7 @@ void rdp_run_command(struct rdp *r, const uint32_t *a)
         r->fb_size    = (a[0] >> 19) & 3;
         r->fb_width   = (a[0] & 0x3ff) + 1;
         r->fb_address = a[1] & 0x0ffffff;
+        r->fld_dirty = true;
         break;
     default:
         break;
