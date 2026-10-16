@@ -16,6 +16,10 @@ struct foir_config {
     bool neon;
     bool early_z;            /* batch-skip early Z (NEON kernels); FOIR_EARLYZ overrides */
     bool debug_nopixels;
+    int  skip_min_prims;     /* FOIR_SKIP_MINPRIMS: a VI period with fewer primitives into scanned-out buffers is not worth skipping (the next one is rendered) */
+    int  skip_opts;          /* FOIR_SKIP_OPTS bits, to bisect FrameSkip artefacts: 1 no refill, 2 no heavy-frame rule, 4 skip off-screen targets too, 8 skip fills and copies too */
+    bool skip_log;           /* FOIR_SKIPLOG: log each frame start (FrameSkip) and each VI scan-out */
+    bool skip_legacy;        /* FOIR_SKIP_LEGACY: FrameSkip drops every primitive, as before the off-screen / fill / copy rules (comparisons) */
 
     bool vsync;
     bool filter;

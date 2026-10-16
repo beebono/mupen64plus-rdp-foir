@@ -203,6 +203,24 @@ tools/                foir-replay, kfuzz, walkfuzz, ref-angrylion, neoncheck.py,
 test-data/            captured frames for the tests (not in the repository, see test-data/README.md)
 ```
 
+## Frame skip
+
+`FrameSkip` drops the rendering of some frames while the commands are still parsed (state, TMEM loads, syncs). What it may drop is decided in `raster_draw()` (`raster.c`), the pattern in `rdp_skip_decide()`; the options-level rules are in [options.md](options.md#frame-skip). The code, in the order a frame meets it:
+
+- **Frame boundary.** `frame_boundary()` starts a *VI period* with the first primitive into a scanned-out colour image after a scan-out (`rdp_vi_scanned()` from `UpdateScreen`; `rdp_note_scanout()` remembers the last eight VI origins, and a colour image holds one when the origin lies at most 64 KB above it). The skip decision (`FrameSkip` N: one period in N + 1; `auto`: the plugin's `skip_level`) and the eligibility rule (the previous period drew at least `skip_min_prims` primitives into scanned-out buffers and was not field-rendered) are applied there.
+- **What is dropped.** `skip_this()`: with the period skipped, a triangle or texture rectangle into a scanned-out buffer. Fill and copy rectangles and everything into other colour images are drawn.
+- **History.** 16 entries (address, size, whether the last frame into it was skipped). `rdp_fb_skipped()` tells `UpdateScreen` that the buffer the VI scans out was left holding a skipped frame, which is then not presented (the previous picture stays).
+- **Refill.** The first drawing into a buffer in a rendered period, if its last frame was skipped, copies the last rendered frame's colour image (and its coverage bits) over it (`repair_from_good()`, `mt_sync` first), so incremental drawing starts from a whole picture.
+- **Diagnostics.** `FOIR_SKIPLOG` / `FOIR_FRAMEHASH` / `FOIR_SKIP_*` ([options.md](options.md#environment-variables)).
+
+How the three playtest artefacts were found (rgdsplus and rg35xxsp, the scripted pad `input-det` of arMLEt's `tools/equiv`, `FOIR_FRAMEHASH` of every presented frame compared between a run without FrameSkip and runs with `FOIR_FRAMESKIP=1`, 50-60 s each; unskipped runs of Paper Mario and Mario Golf repeat their frame hashes exactly, Star Fox 64's did in the final comparison but an earlier pair differed from frame 20 on, so its numbers are less strict):
+
+- **Paper Mario** (title and first scenes): the old pattern counted `SYNC_FULL`s and the game syncs twice per frame (an off-screen target, then the screen), so every screen frame fell on the same side: 2,463 of 2,901 presented frames held, and the 438 shown ones had no backdrop (391 differ from the unskipped run: the backdrop is a copy rectangle and the old rule dropped it with everything else). Now 1,846 shown frames, none differs from the unskipped run (every shown frame identical, every held frame equal to the previous one).
+- **Star Fox 64** (mission menu and first scene): the screen buffers start with random RDRAM contents and the game clears each border once with a fill rectangle; that fill landed in skipped frames and was dropped, so the noise stayed on the borders until a mission redrew them. The fill is now drawn, and the borders are black (the legacy run keeps noise borders in the same frames; of 3,665 frames 24 shown ones still differ from the unskipped run).
+- **Mario Golf** (menus, course intro and fly-over): the game uses three scan buffers and three small off-screen targets per frame, six colour images against the four history entries, so the history forgot buffers whose last frame was skipped and showed them (flicker between an old and the current picture). That is fixed (1,286 shown frames differing from the unskipped run, 304 now). What remains is the CPU / RSP snapshot of the screen described under Known limit: the hash of RDRAM blocks shows the 160 KB region at 0x2e8000 differing from the unskipped run in every frame, and the frames that texture from it show stripes.
+
+Not an artefact of the rules but a property of dropping frames: a rendered frame cannot be right when it depends on content that only a skipped frame produces and that foir cannot see (a CPU read of the buffer, as above). `tools/skiptest.py` covers the cases foir can see.
+
 ## Known gaps
 
 - **VI.** The VI filters are opt-in (`VIFilters`) and skip the VI's resampling between source pixels, gamma-dither noise and the aa_mode 3 glitch; no 480i deinterlacing beyond `InterlaceHack`. `FBRead` / `FBWrite` only drain the workers: no framebuffer emulation for CPU effects (the core's frame-buffer hooks are off under the dynarec).
@@ -219,7 +237,7 @@ test-data/            captured frames for the tests (not in the repository, see 
   - Groups of 8 pixels that straddle two scanlines (10-30 % of the groups, 45 % in Paper Mario) take the scalar per-pixel path in the colour / Z buffer access; a vector form was measured and does not pay on the Cortex-A55.
 - **Verification scope.** Frames were compared for the first minute of each ROM, not full playthroughs. The row-ownership rule of the NEON windows (an odd-aligned or COPY window must not leave its row) is tested for equal output only, because ThreadSanitizer cannot run the NEON kernels on x86_64. Flip-0 COPY spans and 8-bit colour buffers are exercised only by the fuzzers, where both sides take the scalar kernel.
 - **Platforms.** The parallel-rsp pairing was verified on aarch64 devices (RK3566, H700). The x86_64 build (scalar kernels) is for development and testing and is slow.
-- `FrameSkip=auto` is a simple window-based controller and does not know about render-to-texture frames.
+- `FrameSkip=auto` is a simple window-based controller. FrameSkip is invisible to a game that reads its own picture with the CPU / RSP (see [Frame skip](#frame-skip)).
 
 ## Ideas not done
 

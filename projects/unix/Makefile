@@ -204,6 +204,7 @@ RUNNER ?=
 check: replay walkfuzz $(if $(filter AARCH,$(CPU)),fuzz)
 	$(RUNNER) ./$(WALKFUZZ) -n 40000
 	python3 $(TOOLDIR)/neoncheck.py --replay ./$(REPLAY) --runner "$(RUNNER)"
+	python3 $(TOOLDIR)/skiptest.py --replay ./$(REPLAY) --runner "$(RUNNER)"
 	python3 $(TOOLDIR)/mtfuzz.py -n 60 --replay ./$(REPLAY) --runner "$(RUNNER)"
 	python3 $(TOOLDIR)/mtfuzz.py -n 24 -s 7000 --stress --variants nohelper,g3 --replay ./$(REPLAY) --runner "$(RUNNER)"
 	python3 $(TOOLDIR)/mtfuzz.py -n 20 -s 100 --lag --variants nohelper,g3 --threads 2,3 --replay ./$(REPLAY) --runner "$(RUNNER)"

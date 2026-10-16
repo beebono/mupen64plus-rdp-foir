@@ -56,8 +56,9 @@ static struct vi_frame l_frame;
 static int l_win_w = 640, l_win_h = 480;
 static bool l_fullscreen;
 static double l_rdp_ms, l_vi_ms, l_sync_ms, l_last_log_ms, l_present_ms, l_syncfull_base;
-static unsigned l_rdp_frames, l_skipped_frames, l_stale_frames;
-static int l_skip_level;                 /* 0 none, 1 skip every other frame, 2 render one in three */
+static unsigned l_stale_frames;
+static bool l_skiplog;                   /* FOIR_SKIPLOG */
+static bool l_framehash;                 /* FOIR_FRAMEHASH: a hash of every frame as it is presented (tests) */
 static double l_win_start_ms, l_last_us_ms;
 static unsigned l_win_frames;
 static unsigned l_frames, l_lists;
@@ -92,19 +93,17 @@ static double now_ms(void)
 static void (*l_debug_cb)(void *, int, const char *);
 static void *l_debug_ctx;
 
+/* the legacy mode decides at every SYNC_FULL, the default at the first primitive of a frame into a scanned-out buffer (raster.c) */
 static void on_rdp_frame_end(void *ctx)
 {
     (void)ctx;
-    int fs = l_cfg.frame_skip;
-    bool skip = false;
-    l_rdp_frames++;
-    if (fs > 0) skip = (l_rdp_frames % (unsigned)(fs + 1)) != 0;
-    else if (fs == FOIR_FRAMESKIP_AUTO) {
-        if (l_skip_level == 1) skip = (l_rdp_frames & 1) != 0;
-        else if (l_skip_level == 2) skip = (l_rdp_frames % 3) != 0;
-    }
-    if (skip) l_skipped_frames++;
-    l_rdp.skip_pixels = skip;
+    if (l_cfg.skip_legacy) rdp_skip_decide(&l_rdp);
+}
+
+static void on_rdp_frame_start(void *ctx)
+{
+    (void)ctx;
+    rdp_skip_decide(&l_rdp);
 }
 
 static void plugin_log(void *ctx, int level, const char *msg)
@@ -233,6 +232,19 @@ static void load_config(void)
     if (ne && *ne) l_cfg.neon = atoi(ne) != 0;
     const char *he = getenv("FOIR_HELPER");
     if (he && *he) l_cfg.mt_helper = atoi(he) != 0;
+    const char *sl = getenv("FOIR_SKIPLOG");
+    l_skiplog = sl && *sl && atoi(sl) != 0;
+    l_cfg.skip_log = l_skiplog;
+    const char *fe = getenv("FOIR_FRAMESKIP");   /* tests: overrides FrameSkip (N or auto) */
+    if (fe && *fe) l_cfg.frame_skip = !strcmp(fe, "auto") ? FOIR_FRAMESKIP_AUTO : atoi(fe);
+    const char *sm = getenv("FOIR_SKIP_MINPRIMS");
+    if (sm && *sm) l_cfg.skip_min_prims = atoi(sm);
+    const char *so = getenv("FOIR_SKIP_OPTS");
+    if (so && *so) l_cfg.skip_opts = atoi(so);
+    const char *fh = getenv("FOIR_FRAMEHASH");
+    l_framehash = fh && *fh && atoi(fh) != 0;
+    const char *sg = getenv("FOIR_SKIP_LEGACY");
+    if (sg && *sg) l_cfg.skip_legacy = atoi(sg) != 0;
     const char *ke = getenv("FOIR_KNOBS");
     if (ke && !strcmp(ke, "exact")) {
         l_cfg.relaxed_precision = false; l_cfg.frame_skip = 0; l_cfg.interlace_hack = false;
@@ -267,10 +279,12 @@ EXPORT int CALL RomOpen(void)
     l_fl_on = framelog_open();
 #endif
     l_rdp.frame_end_cb = on_rdp_frame_end;
+    l_rdp.frame_start_cb = on_rdp_frame_start;
     l_rdp.skip_pixels = false;
     rdp_fb_history_reset(&l_rdp);
-    l_rdp_frames = l_skipped_frames = l_stale_frames = 0;
-    l_skip_level = 0;
+    l_stale_frames = 0;
+    l_rdp.skip_frames = l_rdp.stat_skipped = 0;
+    l_rdp.skip_level = 0;
     int nthreads = l_cfg.threads;
     const char *te = getenv("FOIR_THREADS");
     if (te && *te) nthreads = atoi(te);
@@ -406,12 +420,20 @@ EXPORT void CALL UpdateScreen(void)
     capture_frame(&l_rdp, &v);
     double t0 = now_ms();
     /* keep the last good frame on screen rather than a buffer FrameSkip left holding an older one */
+    rdp_note_scanout(&l_rdp, v.origin);
+    rdp_vi_scanned(&l_rdp);
     bool stale = rdp_fb_skipped(&l_rdp, v.origin);
+    if (l_skiplog) rdp_fb_skip_log(&l_rdp, v.origin, stale);
     l_stale_frames += stale;
     if (!stale) vi_render_ex(&l_rdp, &v, &l_frame, true);
     double t1 = now_ms();
     if (!stale) gl_out_present(l_frame.valid ? l_frame.pixels : NULL, l_frame.raw16, l_frame.width, l_frame.height, l_frame.screen_w, l_frame.screen_h, l_render_cb);
     double t2 = now_ms();
+    if (l_framehash) {
+        uint32_t hsh = 2166136261u;
+        for (int i = 0; l_frame.valid && i < l_frame.width * l_frame.height; i++) hsh = (hsh ^ l_frame.pixels[i]) * 16777619u;
+        foir_log(FOIR_LOG_INFO, "framehash %u %08x %s status %05x scfield %d", l_frames + 1, hsh, stale ? "held" : "shown", v.status, l_rdp.scfield);
+    }
     l_vi_ms += t1 - t0;
     l_present_ms += t2 - t1;
 #ifdef FOIR_FRAMELOG
@@ -421,8 +443,8 @@ EXPORT void CALL UpdateScreen(void)
         if (l_win_frames == 0) l_win_start_ms = t0;
         if (++l_win_frames >= 60) {
             double per = (t2 - l_win_start_ms) / l_win_frames;
-            if (per > 16.67 * 1.12 && l_skip_level < 2) l_skip_level++;
-            else if (per < 16.67 * 0.92 && l_skip_level > 0) l_skip_level--;
+            if (per > 16.67 * 1.12 && l_rdp.skip_level < 2) l_rdp.skip_level++;
+            else if (per < 16.67 * 0.92 && l_rdp.skip_level > 0) l_rdp.skip_level--;
             l_win_frames = 0;
         }
     }
@@ -440,7 +462,7 @@ EXPORT void CALL UpdateScreen(void)
         foir_log(FOIR_LOG_INFO, "frame %u: %.2f ms/frame wall, %.2f ms/frame RDP (%.2f parse+setup of which %.2f waiting at SYNC_FULL, %.2f drain; %u lists, %llu cmds, %u prims, %u px), %.2f ms/frame VI (%.2f convert + %.2f present), vi %dx%d type %u, skipped %u/%u level %d, held %u",
                  l_frames, per_frame, (l_rdp_ms + l_sync_ms) / 120, l_rdp_ms / 120, sfw / 120, l_sync_ms / 120, l_lists, (unsigned long long)(l_rdp.frame_cmds - l_cmds_base),
                  l_rdp.stat_prims - l_prims_base, pix - l_pix_base, (l_vi_ms + l_present_ms) / 120, l_vi_ms / 120, l_present_ms / 120,
-                 l_frame.width, l_frame.height, v.status & 3, l_skipped_frames, l_rdp_frames, l_skip_level, l_stale_frames);
+                 l_frame.width, l_frame.height, v.status & 3, l_rdp.stat_skipped, l_rdp.skip_frames, l_rdp.skip_level, l_stale_frames);
         {
             double all = cpu_ms(RUSAGE_SELF), emu = cpu_ms(RUSAGE_THREAD);
             foir_log(FOIR_LOG_INFO, "cpu: %.2f ms/frame in the process (%.2f on the emulation thread, %.2f on the other threads)",
@@ -617,7 +639,7 @@ static int suxty_set(unsigned i, int value)
     case OPT_CROP_V:     l_rdp.cfg.crop_v = value != 0; break;
     case OPT_VIFILTERS:  l_rdp.cfg.vi_filters = value != 0; break;
     case OPT_FRAMESKIP:
-        l_skip_level = 0; l_win_frames = 0; l_rdp.skip_pixels = false; break;
+        l_rdp.skip_level = 0; l_win_frames = 0; l_rdp.skip_pixels = false; break;
     }
     return FOIR_SUXTY_APPLIED;
 }

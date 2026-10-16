@@ -12,6 +12,10 @@
 #include "../src/vi.h"
 #include "fdump.h"
 
+static struct rdp *g_skip_r;
+static void skip_cb_end(void *ctx) { (void)ctx; if (g_skip_r->cfg.skip_legacy) rdp_skip_decide(g_skip_r); }
+static void skip_cb_start(void *ctx) { (void)ctx; rdp_skip_decide(g_skip_r); }
+
 static double now_ms(void)
 {
     struct timespec ts;
@@ -25,7 +29,11 @@ int main(int argc, char **argv)
     int repeats = 1;
     bool neon = true, nopix = false, fast = false, weave = false, spec = true, crop_h = false, crop_v = false, vi_filters = false;
     const char *vi_variants = NULL;
-    int vi_bench = 0;
+    int vi_bench = 0, skip_n = 0;
+    bool skip_legacy = false;
+    int skip_opts = 0;
+    uint32_t scan_orig[8];
+    int n_scan = 0;
     int force_field = -1;
     int threads = 0;
     for (int i = 1; i < argc; i++) {
@@ -40,6 +48,14 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--weave")) weave = true;
         else if (!strcmp(argv[i], "--field") && i + 1 < argc) force_field = atoi(argv[++i]) & 1;
         else if (!strcmp(argv[i], "--vi-filters")) vi_filters = true;
+        else if (!strcmp(argv[i], "--skip") && i + 1 < argc) skip_n = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--skip-legacy")) skip_legacy = true;
+        else if (!strcmp(argv[i], "--skip-opts") && i + 1 < argc) skip_opts = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--scan") && i + 1 < argc) {
+            char *l = strdup(argv[++i]);
+            for (char *t = strtok(l, ","); t && n_scan < 8; t = strtok(NULL, ",")) scan_orig[n_scan++] = (uint32_t)strtoul(t, NULL, 0);
+            free(l);
+        }
         else if (!strcmp(argv[i], "--vi-bench") && i + 1 < argc) vi_bench = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--vi-variants") && i + 1 < argc) vi_variants = argv[++i];
         else if (!strcmp(argv[i], "--crop-h")) crop_h = true;
@@ -48,7 +64,7 @@ int main(int argc, char **argv)
         else if (argv[i][0] != '-') in = argv[i];
         else { fprintf(stderr, "unknown option %s\n", argv[i]); return 2; }
     }
-    if (!in) { fprintf(stderr, "usage: %s dump.fdump [-o out.rdram] [-p out.ppm] [-n repeats] [--scalar] [--nospec] [-t threads] [--fast] [--weave] [--crop-h] [--crop-v] [--field 0|1] [--vi-filters] [--vi-variants s0,s1,..] [--vi-bench N]\n", argv[0]); return 2; }
+    if (!in) { fprintf(stderr, "usage: %s dump.fdump [-o out.rdram] [-p out.ppm] [-n repeats] [--scalar] [--nospec] [-t threads] [--fast] [--weave] [--crop-h] [--crop-v] [--field 0|1] [--vi-filters] [--vi-variants s0,s1,..] [--vi-bench N] [--skip N [--skip-legacy] [--skip-opts bits]] [--scan a,b,..]\n", argv[0]); return 2; }
 
     FILE *fp = fopen(in, "rb");
     if (!fp) { perror(in); return 1; }
@@ -75,6 +91,9 @@ int main(int argc, char **argv)
     cfg.relaxed_precision = fast;
     if (weave) cfg.interlace_hack = false;
     cfg.vi_filters = vi_filters;
+    cfg.frame_skip = skip_n;
+    cfg.skip_legacy = skip_legacy;
+    cfg.skip_opts = skip_opts;
     cfg.crop_h = crop_h; cfg.crop_v = crop_v;
 
     static struct rdp r;
@@ -88,6 +107,11 @@ int main(int argc, char **argv)
         rdp_init(&r, &cfg);
         rdp_attach_memory(&r, rdram, h.rdram_size);
         rdp_start_workers(&r, threads > 0 ? threads : 0);
+        g_skip_r = &r;
+        r.frame_end_cb = skip_cb_end;
+        r.frame_start_cb = skip_cb_start;
+        rdp_fb_history_reset(&r);
+        int sim_frame = 0;
 #ifdef FOIR_OVERDRAW
         od_reset(&r, h.vi[1]);
 #endif
@@ -97,6 +121,19 @@ int main(int argc, char **argv)
             if (i == h.nprelude) t0 = now_ms();
             uint32_t n = *p++;
             rdp_run_command(&r, p);
+            if (n_scan && ((p[0] >> 24) & 0x3f) == 0x29) {
+                /* FrameSkip test: a SYNC_FULL ends a frame; the VI scans out the next origin of the list.  One line per frame: a hash of the
+                 * buffer it shows and whether FrameSkip would hold the previous picture instead */
+                rdp_sync(&r);
+                const uint32_t org = scan_orig[sim_frame % n_scan];
+                rdp_note_scanout(&r, org);
+                const bool stale = rdp_fb_skipped(&r, org);
+                uint32_t hsh = 2166136261u;
+                for (uint32_t k = 0; k < 320 * 240 * 2 && (org & 0xffffff) + k + 4 <= h.rdram_size; k += 4) hsh = (hsh ^ *(const uint32_t *)(rdram + (org & 0xffffff) + k)) * 16777619u;
+                printf("skipframe %d origin %06x hash %08x %s\n", sim_frame, org, hsh, stale ? "stale" : "shown");
+                rdp_vi_scanned(&r);
+                sim_frame++;
+            }
             p += n;
         }
         double t_sub = now_ms();
