@@ -519,7 +519,7 @@ static const struct foir_suxty_option l_opts[OPT_COUNT] = {
     [OPT_NEON]       = { "NEON", "NEON Kernels", "Off = scalar reference kernels (slow)", FOIR_OPT_BOOL, 0, 0, 1, 1, NULL, 1 },
     [OPT_SPECIALIZE] = { "Specialize", "Specialised Kernels", "Per-state precompiled pixel kernels", FOIR_OPT_BOOL, 0, 0, 1, 1, NULL, 1 },
     [OPT_FASTCOMB]   = { "FastCombiner", "Fast Combiner", "Fast paths for common combiner/blender modes", FOIR_OPT_BOOL, 0, 0, 1, 1, NULL, 1 },
-    [OPT_RELAXED]    = { "RelaxedPrecision", "Relaxed Precision", "Forces lower accuracy depth values and calculations for speed", FOIR_OPT_BOOL, 0, 0, 1, 1, NULL, 1 },
+    [OPT_RELAXED]    = { "RelaxedPrecision", "Relaxed Precision", "Forces lower accuracy depth values and calculations for speed", FOIR_OPT_BOOL, 0, 0, 1, 1, NULL, 0 },
 };
 
 static bool l_staged_set[OPT_COUNT];

@@ -13,14 +13,14 @@ foir reads its settings from the `[Video-Foir]` section of `mupen64plus.cfg` (wr
 | `FrameSkip` | `0` | `0` = off; `N` = render one frame in `N+1`; `auto` = skip when the achieved frame interval exceeds the VI period (see below). Skipped frames are still parsed (state, TMEM loads, syncs) but not rendered. |
 | `InterlaceHack` | `True` | Show only the freshest field of field-rendered interlaced frames, line doubled, instead of weaving it with the previous field. |
 | `SyncHelper` | `True` | The emulation thread renders pending stripe classes while it waits for the workers (`SYNC_FULL`, VI scan-out, hazard barriers, full job ring). Exact; `False` = it idles. |
-| `RelaxedPrecision` | `True` | Depth compare of the opaque / transparent Z modes without the delta-Z terms for partially covered pixels; affects only coplanar edge cases. **Not exact.** |
+| `RelaxedPrecision` | `False` | `True` = depth compare of the opaque / transparent Z modes without the delta-Z terms for partially covered pixels; affects only coplanar edge cases and saves about 3 % of pixel-worker time ([measurement](performance.md#what-relaxedprecision-saves)). **Not exact when on.** |
 | `FastCombiner` | `True` | Use the NEON combiner and blender (exact). Off: the scalar reference combiner and blender. |
 | `NEON` | `True` | Use the NEON kernels when built in. `False` = scalar reference kernels (slow). |
 | `Specialize` | `True` | Use the precompiled per-state pixel kernel variants; `False` = the generic NEON kernels only (bit-identical output, slower). Needs `NEON`. |
 
 `[Video-General]` holds the usual `Fullscreen` (default `False`), `ScreenWidth` (640) and `ScreenHeight` (480); foir registers them if they are not there yet.
 
-**Exact settings** (the output matches the scalar reference, and through it angrylion-rdp-plus): `RelaxedPrecision = False`, `FrameSkip = 0`, `InterlaceHack = False`; all other options are exact in either position. `FOIR_KNOBS=exact` forces these three.
+**Exact settings** (the output matches the scalar reference, and through it angrylion-rdp-plus): `RelaxedPrecision = False` (the default), `FrameSkip = 0` (the default), `InterlaceHack = False`; all other options are exact in either position. `FOIR_KNOBS=exact` forces these three (so only `InterlaceHack` differs from the defaults).
 
 **FrameSkip.** A fixed `N` renders the frames whose count is a multiple of `N+1`. In `auto` mode the achieved frame interval is measured over windows of 60 presented frames: above 112 % of the VI period (16.67 ms) the skip level goes up, below 92 % it goes down; level 1 renders every second frame, level 2 one frame in three. It is a simple controller and does not know about render-to-texture frames. Games rotate two or three framebuffers, and a
 fixed skip can leave one of them undrawn for as long as skipping lasts: when the VI scans out a colour image whose last drawing was

@@ -62,8 +62,8 @@ int main(int argc, char **argv)
     cfg.neon = neon;
     cfg.specialize = spec;
     cfg.debug_nopixels = nopix;
-    /* the reference comparison runs with the accuracy-preserving knob settings; --fast uses the plugin defaults */
-    if (!fast) cfg.relaxed_precision = false;
+    /* the reference comparison runs with the accuracy-preserving knob settings; --fast turns RelaxedPrecision on */
+    cfg.relaxed_precision = fast;
     if (weave) cfg.interlace_hack = false;
 
     static struct rdp r;

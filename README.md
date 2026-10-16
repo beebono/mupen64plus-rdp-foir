@@ -63,7 +63,7 @@ Main `[Video-Foir]` options (all of them, the environment variables and the suxt
 | `Threads` | `0` | Worker threads: `0` = auto (cores - 1), `-1` = none (render on the emulation thread), `1`..`7` |
 | `FrameSkip` | `0` | `0` = off, `N` = render one frame in `N+1`, `auto` = skip to hold full speed |
 | `InterlaceHack` | `True` | Show only the freshest field of field-rendered interlaced frames |
-| `RelaxedPrecision` | `True` | Faster Z compare for opaque/transparent modes; not exact (see Status) |
+| `RelaxedPrecision` | `False` | `True` = faster Z compare for opaque/transparent modes (about 3 % of pixel-worker time); not exact (see Status) |
 | `SyncHelper`, `FastCombiner`, `NEON`, `Specialize` | `True` | Speed paths; each is exact, `False` falls back to slower code |
 
 **In-game menu.** With mupen64plus-input-suxty as the input plugin, its menu gets a *FOIR Options* page: Widescreen, Smoothing (`Filter`), Interlace
@@ -75,8 +75,8 @@ can be stored per game.
 Pre-alpha. Verified on the RK3566 (ROCKNIX) and the H700 RG35XX SP (spruce) with 23 ROMs that ran for about a minute each without a crash or hang, and
 offline on captured frames of 62 games. Known gaps (full list in [docs/design.md](docs/design.md#known-gaps)):
 
-- **`RelaxedPrecision` (on by default) is not exact**: it drops the delta-Z terms of the opaque/transparent depth compare for partially covered
-  pixels, which affects only coplanar edge cases. Turn it off, or set `FOIR_KNOBS=exact`, for the exact output.
+- **`RelaxedPrecision` (off by default) is not exact when turned on**: it drops the delta-Z terms of the opaque/transparent depth compare for partially covered
+  pixels, which affects only coplanar edge cases, and saves about 3 % of pixel-worker time (0.1-0.6 ms/frame). The default is exact.
 - **No VI filters** (anti-aliasing, divot, gamma, dither): the VI stage crops, converts and scales the framebuffer, with `InterlaceHack` for field-rendered
   interlaced frames. `FBRead` / `FBWrite` only drain the workers, so there is no framebuffer emulation for CPU effects.
 - **One-cycle perspective LOD with a max level above 0** is not angrylion-exact in the far part of a plane (the scalar reference differs, and the NEON path follows it).

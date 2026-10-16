@@ -4,7 +4,7 @@ void foir_config_defaults(struct foir_config *c)
 {
     memset(c, 0, sizeof(*c));
     c->fast_combiner = true;
-    c->relaxed_precision = true;
+    c->relaxed_precision = false;
     c->frame_skip = 0;
     c->interlace_hack = true;
     c->threads = 0;

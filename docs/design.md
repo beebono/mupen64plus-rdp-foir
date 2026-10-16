@@ -192,7 +192,7 @@ test-data/            captured frames for the tests (not in the repository, see 
 
 - **VI.** No VI filters (anti-aliasing, divot, gamma, dither) and no 480i deinterlacing beyond `InterlaceHack`. `FBRead` / `FBWrite` only drain the workers: no framebuffer emulation for CPU effects (the core's frame-buffer hooks are off under the dynarec).
 - **Exactness.**
-  - `RelaxedPrecision` (default on) is not exact. `FastCombiner` and everything else are; with exact settings the output is identical to the scalar reference.
+  - `RelaxedPrecision` (default off since 2026-10-16) is not exact when turned on. `FastCombiner` and everything else are; with exact settings the output is identical to the scalar reference.
   - One-cycle perspective LOD with a max level above 0 is not angrylion-exact in the far part of the plane (angrylion's `tclod_1cycle_current` has span-edge cases the scalar kernel does not model; the NEON path follows the scalar reference). Detail and sharpen occur in no captured frame; they are covered by the fuzzers and synthetic scenes only.
   - In the captured Kirby 64 frame compared with angrylion, 25 pixels differ (inherited from the scalar reference). Some hidden-bit and COPY-mode details are still approximations.
   - The pseudo-random noise is not the hardware sequence.
