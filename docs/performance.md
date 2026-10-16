@@ -389,7 +389,25 @@ Limits: the generic build carried `-DFOIR_FRAMELOG` in both settings (the overhe
 | aa0 + divot + dither restore | 1.20 | 1.60 | 1.39 | 4.11 |
 | scalar reference, same | 7.9 | 9.8 | 9.6 | 12.4 |
 
-The H700 (A53) numbers are within 5 % of these in every row except Snap's last (4.6 ms). Partially covered pixels: Banjo 0 %, Paper Mario 0 %, DKR 1 %, Snap 21 % (44 % of the 16-pixel groups). Cost of the first version (3-line reload per output line, 16-bit planes, scalar AA from RDRAM): 1.9-2.8 ms typical and 7.2 ms for Snap; the line cache, 8-bit planes and AA from the converted lines halved it. What it would still take: the restore filter is operation bound (24 compares and 24 adds per 16 pixels and channel; computing each neighbour pair once would save about a third), the scalar AA filter costs about 165 ns per partially covered pixel, and the pass could run on the idle workers (they are drained at the VI scan-out). **Decision:** `VIFilters` stays off by default: 1.2-1.6 ms is 7-10 % of a 60 fps frame on the emulation thread, 4 ms (25 %) in an edge-heavy 3D scene, for a quality gain most people notice only on the dither pattern and on Banjo-Kazooie-style jagged logos. The option is live and can be set per game from suxty.
+The H700 (A53) numbers are within 5 % of these in every row except Snap's last (4.6 ms). Partially covered pixels: Banjo 0 %, Paper Mario 0 %, DKR 1 %, Snap 21 % (44 % of the 16-pixel groups). Cost of the first version (3-line reload per output line, 16-bit planes, scalar AA from RDRAM): 1.9-2.8 ms typical and 7.2 ms for Snap; the line cache, 8-bit planes and AA from the converted lines halved it. What it would still take: the restore filter is operation bound (24 compares and 24 adds per 16 pixels and channel; computing each neighbour pair once would save about a third), the scalar AA filter costs about 165 ns per partially covered pixel, and the pass could run on the idle workers (they are drained at the VI scan-out). **Decision:** the four VI filters stay off by default (`VIAntiAliasing`, `VIDivot`, `VIDedither`, `VIGamma`; the first version had one switch, `VIFilters`): all four cost 1.4-1.9 ms, 7-10 % of a 60 fps frame on the emulation thread, and 4.4-4.8 ms (25-30 %) in an edge-heavy 3D scene, for a quality gain most people notice only on the dither pattern and on Banjo-Kazooie-style jagged logos. Each can be set per game from suxty. Costs per option are in the next table.
+
+**Per option (2026-10-16).** `foir-replay --vi-bench 200`, status with every filter enabled by the game (`aa_mode` 0, divot, dither restore, gamma) and the options set as listed; the glibc 2.17 build of foir-todo on both devices (rgdsplus `performance` 1.58 GHz real, rg35xxsp `cpu_perf.sh on` 1512 MHz), three rounds over the four dumps, medians in ms per VI frame (all spreads within 6 %, mostly 1 %). With no option on the plain conversion is taken (the first row), whatever the game enables; any one filter pays the pass's fixed ~0.35 ms plus its own work.
+
+| options | Banjo A55 | DKR A55 | Paper A55 | Snap A55 | Banjo A53 | DKR A53 | Paper A53 | Snap A53 |
+|---|---|---|---|---|---|---|---|---|
+| none (plain conversion) | 0.17 | 0.20 | 0.20 | 0.20 | 0.19 | 0.22 | 0.22 | 0.22 |
+| AA | 0.51 | 0.79 | 0.58 | 3.33 | 0.53 | 0.84 | 0.59 | 3.82 |
+| divot | 0.61 | 0.70 | 0.71 | 0.70 | 0.62 | 0.71 | 0.71 | 0.71 |
+| dither restore | 0.92 | 1.07 | 1.08 | 1.07 | 0.90 | 1.04 | 1.04 | 1.04 |
+| gamma | 0.60 | 0.69 | 0.69 | 0.69 | 0.62 | 0.71 | 0.71 | 0.71 |
+| AA + divot | 0.71 | 1.02 | 0.81 | 3.55 | 0.72 | 1.07 | 0.81 | 4.06 |
+| AA + dither restore | 1.02 | 1.38 | 1.18 | 3.94 | 1.00 | 1.40 | 1.14 | 4.37 |
+| divot + dither restore | 1.12 | 1.30 | 1.30 | 1.30 | 1.09 | 1.27 | 1.26 | 1.27 |
+| AA + divot + dither restore | 1.22 | 1.61 | 1.40 | 4.14 | 1.19 | 1.63 | 1.37 | 4.61 |
+| all four | 1.41 | 1.83 | 1.62 | 4.36 | 1.39 | 1.86 | 1.60 | 4.85 |
+| scalar reference, all four | 8.07 | 10.03 | 9.83 | 12.57 | 9.42 | 11.64 | 11.50 | 14.28 |
+
+The pass itself costs 0.41-0.47 ms with nothing enabled in the buffer (the earlier measurement above); on top of that AA adds about 0.1 ms in a scene with few partially covered pixels and 2.7-3.4 ms in Snap, divot and gamma about 0.2 ms each, dither restore about 0.5 ms. So in terms of the plain conversion each option alone costs 0.3-0.6 ms (AA; 3.1-3.6 in Snap), 0.5 (divot), 0.5 (gamma) and 0.7-0.85 (dither restore).
 
 ## Tried and rejected
 

@@ -24,7 +24,10 @@ struct foir_config {
     bool vsync;
     bool filter;
     bool widescreen;
-    bool vi_filters;         /* VIFilters: the VI filter pass (AA, divot, dither restore, gamma), live */
+    bool vi_aa;              /* VIAntiAliasing, VIDivot, VIDedither, VIGamma: allow that VI filter when the game enables it in VI_STATUS (live) */
+    bool vi_divot;
+    bool vi_dedither;
+    bool vi_gamma;
     bool crop_h;             /* CropOverscanH: VI_CROP_H pixels off the left and right edges (live) */
     bool crop_v;             /* CropOverscanV: VI_CROP_V lines off the top and bottom (live) */
 };

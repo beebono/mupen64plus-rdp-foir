@@ -124,7 +124,8 @@ void vi_render_ex(const struct rdp *r, const struct vi_regs *regs, struct vi_fra
     bool fieldhack = r->cfg.interlace_hack && (regs->status & 0x40) && r->scfield && h >= 2;
     int field = r->sckeepodd & 1;
     struct vi_filter_ctx fc;
-    const bool filt = r->cfg.vi_filters && vi_filter_setup(r, regs, &fc);
+    const bool any_opt = r->cfg.vi_aa || r->cfg.vi_divot || r->cfg.vi_dedither || r->cfg.vi_gamma;
+    const bool filt = any_opt && vi_filter_setup(r, regs, &fc);
     const bool raw = allow_raw16 && type == 2 && !filt;
     for (int y = 0; y < oh; y++) {
         int yy = y + cy;       /* line of the uncropped image; cy is even, so line pairs stay together */

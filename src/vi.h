@@ -24,7 +24,8 @@ struct vi_frame {
     float screen_w, screen_h;
 };
 
-/* VI filter pass (VIFilters): AA from coverage, divot, dither restore and gamma, as angrylion-rdp-plus does at an exact source pixel */
+/* VI filter pass (VIAntiAliasing, VIDivot, VIDedither, VIGamma; each needs the game bit and the option): AA from coverage, divot, dither restore and
+ * gamma, as angrylion-rdp-plus does at an exact source pixel.  Setup returns false when no filter is left, then the plain conversion is used. */
 struct vi_filter_ctx {
     uint32_t base, stride;     /* first pixel (in 16 or 32-bit units) and the line width */
     bool t32, divot, gamma, dither;

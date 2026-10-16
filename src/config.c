@@ -16,7 +16,7 @@ void foir_config_defaults(struct foir_config *c)
     c->vsync = true;
     c->filter = false;
     c->widescreen = false;
-    c->vi_filters = false;
+    c->vi_aa = c->vi_divot = c->vi_dedither = c->vi_gamma = false;
     c->crop_h = false;
     c->crop_v = false;
 }

@@ -36,6 +36,7 @@
 static ptr_ConfigOpenSection ConfigOpenSection;
 static ptr_ConfigSaveSection ConfigSaveSection;
 static ptr_ConfigSetParameter ConfigSetParameter;
+static ptr_ConfigGetParameterType ConfigGetParameterType;
 static ptr_ConfigSetDefaultInt ConfigSetDefaultInt;
 static ptr_ConfigSetDefaultBool ConfigSetDefaultBool;
 static ptr_ConfigSetDefaultString ConfigSetDefaultString;
@@ -135,6 +136,7 @@ EXPORT m64p_error CALL PluginStartup(m64p_dynlib_handle core, void *context, voi
     SYM(ConfigOpenSection, ptr_ConfigOpenSection, "ConfigOpenSection");
     SYM(ConfigSaveSection, ptr_ConfigSaveSection, "ConfigSaveSection");
     SYM(ConfigSetParameter, ptr_ConfigSetParameter, "ConfigSetParameter");
+    SYM(ConfigGetParameterType, ptr_ConfigGetParameterType, "ConfigGetParameterType");
     SYM(ConfigSetDefaultInt, ptr_ConfigSetDefaultInt, "ConfigSetDefaultInt");
     SYM(ConfigSetDefaultBool, ptr_ConfigSetDefaultBool, "ConfigSetDefaultBool");
     SYM(ConfigSetDefaultString, ptr_ConfigSetDefaultString, "ConfigSetDefaultString");
@@ -164,9 +166,23 @@ EXPORT m64p_error CALL PluginStartup(m64p_dynlib_handle core, void *context, voi
     ConfigSetDefaultBool(l_cfg_foir, "VSync", l_cfg.vsync, "Wait for vertical sync when presenting");
     ConfigSetDefaultBool(l_cfg_foir, "Filter", l_cfg.filter, "Use bilinear filtering when scaling the VI image to the window");
     ConfigSetDefaultBool(l_cfg_foir, "Widescreen", l_cfg.widescreen, "Stretch the image to the whole window instead of keeping 4:3");
-    ConfigSetDefaultBool(l_cfg_foir, "VIFilters", l_cfg.vi_filters, "Apply the VI filters the game enables (anti-aliasing, divot, dither restore, gamma); costs emulation-thread time");
+    ConfigSetDefaultBool(l_cfg_foir, "VIAntiAliasing", l_cfg.vi_aa, "Apply the VI's anti-aliasing when the game enables it; costs emulation-thread time");
+    ConfigSetDefaultBool(l_cfg_foir, "VIDivot", l_cfg.vi_divot, "Apply the VI's divot filter when the game enables it; costs emulation-thread time");
+    ConfigSetDefaultBool(l_cfg_foir, "VIDedither", l_cfg.vi_dedither, "Apply the VI's dither restore when the game enables it; costs emulation-thread time");
+    ConfigSetDefaultBool(l_cfg_foir, "VIGamma", l_cfg.vi_gamma, "Apply the VI's gamma correction when the game enables it; costs emulation-thread time");
     ConfigSetDefaultBool(l_cfg_foir, "CropOverscanH", l_cfg.crop_h, "Crop 8 VI pixels off the left and right edges of the image (hides edge artefacts; display only)");
     ConfigSetDefaultBool(l_cfg_foir, "CropOverscanV", l_cfg.crop_v, "Crop 12 VI lines off the top and bottom edges of the image (hides edge artefacts; display only)");
+    {   /* the single VIFilters key of the first version: if a config file still holds it set, all four new keys are turned on and it is cleared */
+        m64p_type t;
+        if (ConfigGetParameterType(l_cfg_foir, "VIFilters", &t) == M64ERR_SUCCESS && t == M64TYPE_BOOL) {
+            int on = ConfigGetParamBool(l_cfg_foir, "VIFilters") != 0, off = 0;
+            if (on) {
+                static const char *const keys[] = { "VIAntiAliasing", "VIDivot", "VIDedither", "VIGamma" };
+                for (unsigned i = 0; i < 4; i++) ConfigSetParameter(l_cfg_foir, keys[i], M64TYPE_BOOL, &on);
+            }
+            ConfigSetParameter(l_cfg_foir, "VIFilters", M64TYPE_BOOL, &off);
+        }
+    }
     ConfigSaveSection("Video-General");
     ConfigSaveSection("Video-Foir");
 
@@ -211,7 +227,10 @@ static void read_foir_section(struct foir_config *c)
     c->vsync = ConfigGetParamBool(l_cfg_foir, "VSync") != 0;
     c->filter = ConfigGetParamBool(l_cfg_foir, "Filter") != 0;
     c->widescreen = ConfigGetParamBool(l_cfg_foir, "Widescreen") != 0;
-    c->vi_filters = ConfigGetParamBool(l_cfg_foir, "VIFilters") != 0;
+    c->vi_aa = ConfigGetParamBool(l_cfg_foir, "VIAntiAliasing") != 0;
+    c->vi_divot = ConfigGetParamBool(l_cfg_foir, "VIDivot") != 0;
+    c->vi_dedither = ConfigGetParamBool(l_cfg_foir, "VIDedither") != 0;
+    c->vi_gamma = ConfigGetParamBool(l_cfg_foir, "VIGamma") != 0;
     c->crop_h = ConfigGetParamBool(l_cfg_foir, "CropOverscanH") != 0;
     c->crop_v = ConfigGetParamBool(l_cfg_foir, "CropOverscanV") != 0;
     const char *fs = ConfigGetParamString(l_cfg_foir, "FrameSkip");
@@ -535,7 +554,7 @@ static const char *const l_lbl_threads[] = { "None", "Auto", "1", "2", "3", "4",
 /* Option ids are the ABI: append only.  enum values: FrameSkip index 0..3 = skip level 0..3, 4 = auto; Threads index =
  * Threads + 1 (so -1 "None" = render on the emulation thread). */
 enum { OPT_WIDESCREEN, OPT_FILTER, OPT_INTERLACE, OPT_FRAMESKIP, OPT_VSYNC, OPT_THREADS, OPT_NEON, OPT_SPECIALIZE,
-       OPT_FASTCOMB, OPT_RELAXED, OPT_CROP_H, OPT_CROP_V, OPT_VIFILTERS, OPT_COUNT };
+       OPT_FASTCOMB, OPT_RELAXED, OPT_CROP_H, OPT_CROP_V, OPT_VIAA, OPT_VIDIVOT, OPT_VIDEDITHER, OPT_VIGAMMA, OPT_COUNT };
 
 static const struct foir_suxty_option l_opts[OPT_COUNT] = {
     [OPT_WIDESCREEN] = { "Widescreen", "Widescreen", "Stretch to the whole screen instead of 4:3", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 0 },
@@ -550,7 +569,10 @@ static const struct foir_suxty_option l_opts[OPT_COUNT] = {
     [OPT_RELAXED]    = { "RelaxedPrecision", "Relaxed Precision", "Forces lower accuracy depth values and calculations for speed", FOIR_OPT_BOOL, 0, 0, 1, 1, NULL, 0 },
     [OPT_CROP_H]     = { "CropOverscanH", "Crop Overscan H", "Hide edge artefacts: crop 8 VI pixels off the left and right", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 0 },
     [OPT_CROP_V]     = { "CropOverscanV", "Crop Overscan V", "Hide edge artefacts: crop 12 VI lines off the top and bottom", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 0 },
-    [OPT_VIFILTERS]  = { "VIFilters", "VI Filters", "Anti-aliasing, divot and dither restore as the VI does (costs time)", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 0 },
+    [OPT_VIAA]       = { "VIAntiAliasing", "VI Anti-Aliasing", "Edge anti-aliasing as the VI does, where the game uses it (costs time)", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 0 },
+    [OPT_VIDIVOT]    = { "VIDivot", "VI Divot", "Divot filter as the VI does, where the game uses it (costs time)", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 0 },
+    [OPT_VIDEDITHER] = { "VIDedither", "VI Dither Restore", "Dither restore as the VI does, where the game uses it (costs time)", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 0 },
+    [OPT_VIGAMMA]    = { "VIGamma", "VI Gamma", "Gamma correction as the VI does, where the game uses it (costs time)", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 0 },
 };
 
 static bool l_staged_set[OPT_COUNT];
@@ -571,7 +593,10 @@ static int opt_load(const struct foir_config *c, unsigned i)
     case OPT_RELAXED:    return c->relaxed_precision;
     case OPT_CROP_H:     return c->crop_h;
     case OPT_CROP_V:     return c->crop_v;
-    case OPT_VIFILTERS:  return c->vi_filters;
+    case OPT_VIAA:       return c->vi_aa;
+    case OPT_VIDIVOT:    return c->vi_divot;
+    case OPT_VIDEDITHER: return c->vi_dedither;
+    case OPT_VIGAMMA:    return c->vi_gamma;
     }
     return 0;
 }
@@ -591,7 +616,10 @@ static void opt_store(struct foir_config *c, unsigned i, int v)
     case OPT_RELAXED:    c->relaxed_precision = v != 0; break;
     case OPT_CROP_H:     c->crop_h = v != 0; break;
     case OPT_CROP_V:     c->crop_v = v != 0; break;
-    case OPT_VIFILTERS:  c->vi_filters = v != 0; break;
+    case OPT_VIAA:       c->vi_aa = v != 0; break;
+    case OPT_VIDIVOT:    c->vi_divot = v != 0; break;
+    case OPT_VIDEDITHER: c->vi_dedither = v != 0; break;
+    case OPT_VIGAMMA:    c->vi_gamma = v != 0; break;
     }
 }
 
@@ -637,7 +665,10 @@ static int suxty_set(unsigned i, int value)
     case OPT_INTERLACE:  l_rdp.cfg.interlace_hack = value != 0; break;
     case OPT_CROP_H:     l_rdp.cfg.crop_h = value != 0; break;
     case OPT_CROP_V:     l_rdp.cfg.crop_v = value != 0; break;
-    case OPT_VIFILTERS:  l_rdp.cfg.vi_filters = value != 0; break;
+    case OPT_VIAA:       l_rdp.cfg.vi_aa = value != 0; break;
+    case OPT_VIDIVOT:    l_rdp.cfg.vi_divot = value != 0; break;
+    case OPT_VIDEDITHER: l_rdp.cfg.vi_dedither = value != 0; break;
+    case OPT_VIGAMMA:    l_rdp.cfg.vi_gamma = value != 0; break;
     case OPT_FRAMESKIP:
         l_rdp.skip_level = 0; l_win_frames = 0; l_rdp.skip_pixels = false; break;
     }

@@ -47,15 +47,18 @@ static void gamma_init(void)
 
 bool vi_filter_setup(const struct rdp *r, const struct vi_regs *regs, struct vi_filter_ctx *c)
 {
-    (void)r;
     uint32_t st = regs->status;
     c->t32 = (st & 3) == 3;
     c->stride = regs->width & 0xfff;
     c->base = (regs->origin & 0xffffff) >> (c->t32 ? 2 : 1);
+    /* a filter runs when the game enables it and the option allows it; AA off reads the buffer as aa_mode 2 (full coverage) */
     c->aa = (int)((st >> 8) & 3);
-    c->divot = (st >> 4) & 1;
-    c->gamma = (st >> 3) & 1;
-    c->dither = (st >> 16) & 1;
+    if (!r->cfg.vi_aa && c->aa <= AA_RESAMP_EXTRA) c->aa = AA_RESAMP_ONLY;
+    c->divot = ((st >> 4) & 1) && r->cfg.vi_divot;
+    c->gamma = ((st >> 3) & 1) && r->cfg.vi_gamma;
+    c->dither = ((st >> 16) & 1) && r->cfg.vi_dedither;
+    /* nothing left to do: the caller takes the plain conversion */
+    if (c->aa > AA_RESAMP_EXTRA && !c->divot && !c->gamma && !c->dither) return false;
     static uint32_t gen;
     c->gen = ++gen;
     gamma_init();

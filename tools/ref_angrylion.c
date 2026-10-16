@@ -19,12 +19,12 @@ static void intr_cb(void) {}
 int main(int argc, char **argv)
 {
     const char *in = NULL, *out_rdram = NULL, *out_ppm = NULL;
-    uint32_t vstat[64], vorg[64];
+    uint32_t vstat[128], vorg[128];
     int nvstat = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-o") && i + 1 < argc) out_rdram = argv[++i];
         else if (!strcmp(argv[i], "-p") && i + 1 < argc) out_ppm = argv[++i];
-        else if (!strcmp(argv[i], "-V") && i + 1 < argc && nvstat < 64) { char *c = strchr(argv[i + 1], ':'); vorg[nvstat] = c ? (uint32_t)strtoul(c + 1, NULL, 0) : h_origin_unset; vstat[nvstat++] = (uint32_t)strtoul(argv[++i], NULL, 0); }
+        else if (!strcmp(argv[i], "-V") && i + 1 < argc && nvstat < 128) { char *c = strchr(argv[i + 1], ':'); vorg[nvstat] = c ? (uint32_t)strtoul(c + 1, NULL, 0) : h_origin_unset; vstat[nvstat++] = (uint32_t)strtoul(argv[++i], NULL, 0); }
         else in = argv[i];
     }
     if (!in) { fprintf(stderr, "usage: ref-angrylion dump.fdump -o out.rdram [-p out.ppm]\n"); return 2; }
