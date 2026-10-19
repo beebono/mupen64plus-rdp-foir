@@ -2,6 +2,7 @@
 /projects/unix/_obj*/
 /projects/unix/_out_*/
 /projects/unix/*.so
+/projects/unix/*.a
 /projects/unix/foir-replay
 /projects/unix/foir-kfuzz
 /projects/unix/foir-walkfuzz

@@ -47,13 +47,22 @@ endif
 
 SRCDIR = ../../src
 TOOLDIR = ../../tools
+# BUNDLE=1: static archive for the single-binary bundle (symbols prefixed foir_)
+BUNDLEDIR ?= ../../../mupen64plus-pow2/bundle
+ifeq ($(BUNDLE), 1)
+  POSTFIX := $(POSTFIX)-bundle
+endif
 OBJDIR = _obj$(if $(CROSS_COMPILE),_cross_$(CPU),)$(POSTFIX)
 OUTDIR = $(if $(CROSS_COMPILE),_out_$(CPU)/,)
 
 OPTFLAGS ?= -O3
 WARNFLAGS ?= -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare
 CFLAGS += -std=gnu11 $(OPTFLAGS) $(WARNFLAGS) -fwrapv -fno-strict-aliasing -fvisibility=hidden -I$(SRCDIR)
-LDFLAGS += $(SHARED)
+ifeq ($(BUNDLE), 1)
+  CFLAGS += -include $(BUNDLEDIR)/rename-foir.h
+else
+  LDFLAGS += $(SHARED)
+endif
 
 ifeq ($(PIC), 1)
   CFLAGS += -fPIC
@@ -70,7 +79,9 @@ ifeq ($(NEON), 1)
 endif
 
 ifeq ($(OS), LINUX)
-  LDFLAGS += -Wl,-version-script,$(SRCDIR)/foir_api_export.ver
+  ifneq ($(BUNDLE), 1)
+    LDFLAGS += -Wl,-version-script,$(SRCDIR)/foir_api_export.ver
+  endif
   LDLIBS += -ldl -lm -lpthread
 endif
 
@@ -160,7 +171,11 @@ OBJECTS := $(CORE_OBJECTS) $(PLUGIN_OBJECTS) $(REPLAY_OBJECTS) $(FUZZ_OBJECTS) $
 OBJDIRS = $(dir $(OBJECTS))
 $(shell $(MKDIR) $(OBJDIRS) $(OUTDIR))
 
-TARGET = $(OUTDIR)mupen64plus-rdp-foir$(POSTFIX).$(SO_EXTENSION)
+ifeq ($(BUNDLE), 1)
+  TARGET = $(OUTDIR)libfoir.a
+else
+  TARGET = $(OUTDIR)mupen64plus-rdp-foir$(POSTFIX).$(SO_EXTENSION)
+endif
 REPLAY = $(OUTDIR)foir-replay
 KFUZZ = $(OUTDIR)foir-kfuzz
 WALKFUZZ = $(OUTDIR)foir-walkfuzz
@@ -183,6 +198,7 @@ targets:
 	@echo "    APIDIR=path   == path to find Mupen64Plus Core headers"
 	@echo "    OPTFLAGS=flag == compiler optimization (default: -O3)"
 	@echo "    WARNFLAGS=flag == compiler warning levels"
+	@echo "    BUNDLE=1      == build libfoir.a for the static single-binary bundle (renamed symbols)"
 	@echo "    POSTFIX=name  == String added to the name of the build (default: '')"
 	@echo "    DEBUG=1       == add debugging symbols"
 	@echo "    V=1           == show verbose compiler output"
@@ -229,7 +245,7 @@ uninstall:
 	$(RM) "$(DESTDIR)$(PLUGINDIR)/$(notdir $(TARGET))"
 
 clean:
-	$(RM) -r _obj* _out_* mupen64plus-rdp-foir*.so foir-replay foir-kfuzz foir-walkfuzz ref-angrylion
+	$(RM) -r _obj* _out_* libfoir.a mupen64plus-rdp-foir*.so foir-replay foir-kfuzz foir-walkfuzz ref-angrylion
 
 rebuild: clean all
 
@@ -254,8 +270,15 @@ $(OBJDIR)/%.o: $(SRCDIR)/%.c
 $(OBJDIR)/tools/%.o: $(TOOLDIR)/%.c
 	$(COMPILE.c) -o $@ $<
 
+ifeq ($(BUNDLE), 1)
+$(TARGET): $(CORE_OBJECTS) $(PLUGIN_OBJECTS)
+	@echo '    AR  '$@
+	@$(RM) $@
+	@$(CROSS_COMPILE)$(if $(AR_LTO),$(AR_LTO),ar) rcs $@ $^
+else
 $(TARGET): $(CORE_OBJECTS) $(PLUGIN_OBJECTS)
 	$(LINK.o) $^ $(LOADLIBES) $(LDLIBS) -o $@
+endif
 
 $(KFUZZ): $(CORE_OBJECTS) $(FUZZ_OBJECTS)
 	$(Q_LD)$(CC) $(CFLAGS) $^ -lm -lpthread -o $@
