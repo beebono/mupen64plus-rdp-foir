@@ -48,7 +48,7 @@ endif
 SRCDIR = ../../src
 TOOLDIR = ../../tools
 # BUNDLE=1: static archive for the single-binary bundle (symbols prefixed foir_)
-BUNDLEDIR ?= ../../../mupen64plus-pow2/bundle
+BUNDLEDIR ?= $(firstword $(wildcard ../../../../bundle ../../../mupen64plus-pow2/bundle))
 ifeq ($(BUNDLE), 1)
   POSTFIX := $(POSTFIX)-bundle
 endif
@@ -88,7 +88,7 @@ endif
 ifneq ("$(APIDIR)","")
   CFLAGS += "-I$(APIDIR)"
 else
-  TRYDIR = ../../../mupen64plus-core/src/api
+  TRYDIR = ../../../mupen64plus-core-dento/src/api
   ifneq ("$(wildcard $(TRYDIR)/m64p_types.h)","")
     CFLAGS += -I$(TRYDIR)
   else
@@ -249,8 +249,8 @@ clean:
 
 rebuild: clean all
 
-# needs the sibling angrylion-rdp-plus checkout
-ANGRYDIR ?= ../../../angrylion-rdp-plus/src/core
+# needs the angrylion-rdp-plus checkout (W/upstream, or set ANGRYDIR)
+ANGRYDIR ?= ../../../../../upstream/angrylion-rdp-plus/src/core
 ref: ref-angrylion
 
 ref-angrylion: $(TOOLDIR)/ref_angrylion.c $(ANGRYDIR)/n64video.c $(ANGRYDIR)/parallel.cpp

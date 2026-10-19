@@ -11,7 +11,7 @@ cd projects/unix
 make check CROSS_COMPILE=aarch64-linux-gnu- HOST_CPU=aarch64 \
            RUNNER="qemu-aarch64-static -L /usr/aarch64-linux-gnu"
 
-# scalar reference against angrylion-rdp-plus (needs an angrylion-rdp-plus checkout next to this repository)
+# scalar reference against angrylion-rdp-plus (needs an angrylion-rdp-plus checkout: `upstream/angrylion-rdp-plus` of the workspace by default, or `ANGRYDIR=<its src/core>`)
 make all replay ref NEON=0 && python3 ../../tools/regress.py
 ```
 

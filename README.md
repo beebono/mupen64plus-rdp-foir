@@ -99,7 +99,7 @@ offline on captured frames of 62 games. Known gaps (full list in [docs/design.md
 
 ```sh
 cd projects/unix
-make all replay ref NEON=0     # x86_64: scalar plugin, offline replay tool, angrylion reference runner (ref needs an angrylion-rdp-plus checkout next to this repository)
+make all replay ref NEON=0     # x86_64: scalar plugin, offline replay tool, angrylion reference runner (ref needs an angrylion-rdp-plus checkout: `upstream/angrylion-rdp-plus` of the workspace by default, or `ANGRYDIR=<its src/core>`)
 make all replay fuzz CROSS_COMPILE=aarch64-linux-gnu- HOST_CPU=aarch64      # aarch64 cross build with NEON, products in _out_AARCH/
 make check CROSS_COMPILE=aarch64-linux-gnu- HOST_CPU=aarch64 RUNNER="qemu-aarch64-static -L /usr/aarch64-linux-gnu"   # bit-exactness suite
 ```

@@ -264,7 +264,7 @@ On Pokemon Snap the emulation thread renders about 5.2 ms of every frame on the 
 
 Batch-skip early Z ([design.md](design.md#pixel-stages)): the Z compare runs first where it cannot depend on the combiner, and a batch in which every lane failed Z skips texture, combine, blend and store. Output-neutral: RDRAM identical to the previous build on the 8 Pokemon Snap dumps below and on the 18 game dumps, NEON and scalar, 0 to 3 workers. Pokemon Snap's attract demo has a camera shot (VI frames about 1100-1340) with 11 layers per pixel on average, of which 58 % of the processed pixels fail Z.
 
-Replay, `--fast`, ms per run (pinned clocks, medians of 3 rounds of `-n 5`, old and new alternated, spread under 2 % on one thread). Both builds from `toolchains/rg35xxsp`, the same binaries on both devices:
+Replay, `--fast`, ms per run (pinned clocks, medians of 3 rounds of `-n 5`, old and new alternated, spread under 2 % on one thread). Both builds from `resources/toolchains/rg35xxsp`, the same binaries on both devices:
 
 | Snap dump | RK3566 1 thread | | RK3566 3 workers | | H700 1 thread | | H700 3 workers | |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
