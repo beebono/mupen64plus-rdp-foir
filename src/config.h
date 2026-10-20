@@ -15,6 +15,7 @@ struct foir_config {
     bool specialize;
     bool neon;
     bool early_z;            /* batch-skip early Z (NEON kernels); FOIR_EARLYZ overrides */
+    bool fill_dedup;         /* skip a FILL rectangle identical to one already drawn with nothing written since; FOIR_FILLDEDUP overrides */
     bool debug_nopixels;
     int  skip_min_prims;     /* FOIR_SKIP_MINPRIMS: a VI period with fewer primitives into scanned-out buffers is not worth skipping (the next one is rendered) */
     int  skip_opts;          /* FOIR_SKIP_OPTS bits, to bisect FrameSkip artefacts: 1 no refill, 2 no heavy-frame rule, 4 skip off-screen targets too, 8 skip fills and copies too */

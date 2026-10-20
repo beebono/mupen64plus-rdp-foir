@@ -13,6 +13,7 @@ void foir_config_defaults(struct foir_config *c)
     c->specialize = true;
     c->neon = true;
     c->early_z = true;
+    c->fill_dedup = true;
     c->vsync = true;
     c->filter = false;
     c->widescreen = false;

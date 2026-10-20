@@ -809,6 +809,7 @@ static void repair_from_good(struct rdp *r)
     if (r->mt) mt_sync(r);                                  /* the previous frame's workers must be done writing the source */
     memcpy(r->rdram + dst, r->rdram + src, n);
     if (r->fb_size == 2 && r->hidden) memcpy(r->hidden + (dst >> 1), r->hidden + (src >> 1), n >> 1);
+    raster_mem_written(r);
     r->stat_repairs++;
 }
 
@@ -847,6 +848,56 @@ static void frame_boundary(struct rdp *r)
                  r->skip_eligible, r->skip_pixels ? "SKIP" : "render", r->good_addr & 0xffffff);
 }
 
+/* the bytes [*a0, *a1) the colour image (z = false) or the Z image can be written in under the current scissor */
+static void image_range(const struct rdp *r, bool z, uint32_t *a0, uint32_t *a1)
+{
+    const uint32_t rows = ((uint32_t)r->clip.yl >> 2) + 1, w = (uint32_t)r->fb_width;
+    const uint32_t bpp = z || r->fb_size == PIXEL_SIZE_16BIT ? 2 : r->fb_size == PIXEL_SIZE_32BIT ? 4 : 1;
+    *a0 = z ? r->zb_address : r->fb_address;
+    *a1 = *a0 + w * bpp * rows;
+}
+
+void raster_mem_written(struct rdp *r)
+{
+    r->fill_n = 0;
+}
+
+/* FILL_RECTs drawn since nothing else wrote their bytes. A FILL_RECT identical to one of them writes the same bytes again (Pokemon Snap clears
+ * its Z buffer twice in a row): true, skip it. Else forget those the primitive about to be drawn may write, and note it if it is a FILL_RECT. */
+static bool fill_note(struct rdp *r)
+{
+    const struct other_modes *om = &r->om;
+    if (r->fill_pend)
+        for (int i = 0; i < r->fill_n; i++) {
+            const struct fill_rec *f = &r->fill_last[i];
+            if (f->w0 == r->fill_w[0] && f->w1 == r->fill_w[1] && f->fb_address == r->fb_address && f->fill_color == r->fill_color &&
+                f->fb_size == r->fb_size && f->fb_width == r->fb_width && f->scfield == r->scfield && f->sckeepodd == r->sckeepodd &&
+                !memcmp(&f->clip, &r->clip, sizeof(f->clip))) {
+                r->fill_pend = false;
+                r->stat_fill_skips++;
+                return true;
+            }
+        }
+    uint32_t c0, c1, z0 = 0, z1 = 0;
+    image_range(r, false, &c0, &c1);
+    if ((om->cycle_type == CYCLE_TYPE_1 || om->cycle_type == CYCLE_TYPE_2) && om->z_update_en) image_range(r, true, &z0, &z1);
+    int n = 0;
+    for (int i = 0; i < r->fill_n; i++) {
+        const struct fill_rec *f = &r->fill_last[i];
+        if ((f->a0 < c1 && c0 < f->a1) || (f->a0 < z1 && z0 < f->a1)) continue;
+        r->fill_last[n++] = *f;
+    }
+    r->fill_n = n;
+    if (!r->fill_pend) return false;
+    r->fill_pend = false;
+    if (r->fill_n == 4) { memmove(&r->fill_last[0], &r->fill_last[1], 3 * sizeof(r->fill_last[0])); r->fill_n = 3; }
+    struct fill_rec *f = &r->fill_last[r->fill_n++];
+    f->w0 = r->fill_w[0]; f->w1 = r->fill_w[1];
+    f->fb_address = r->fb_address; f->fill_color = r->fill_color; f->a0 = c0; f->a1 = c1;
+    f->fb_size = r->fb_size; f->fb_width = r->fb_width; f->scfield = r->scfield; f->sckeepodd = r->sckeepodd; f->clip = r->clip;
+    return false;
+}
+
 void raster_draw(struct rdp *r, const struct prim_walk *pw, int start, int end)
 {
     frame_boundary(r);
@@ -870,6 +921,7 @@ void raster_draw(struct rdp *r, const struct prim_walk *pw, int start, int end)
         else e->skip_tri++;
         return;
     }
+    if (fill_note(r)) return;
     e->drawn++;
     prim_prepare(r);
     if (r->mt) {

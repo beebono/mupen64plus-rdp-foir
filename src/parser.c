@@ -260,7 +260,12 @@ void rdp_run_command(struct rdp *r, const uint32_t *a)
         break;
     case CMD_TEX_RECT:      setup_texrect(r, a, false); break;
     case CMD_TEX_RECT_FLIP: setup_texrect(r, a, true); break;
-    case CMD_FILL_RECT:     setup_fillrect(r, a); break;
+    case CMD_FILL_RECT:
+        r->fill_pend = r->cfg.fill_dedup && r->om.cycle_type == CYCLE_TYPE_FILL;     /* raster_draw may skip it (fill_note) */
+        r->fill_w[0] = a[0]; r->fill_w[1] = a[1];
+        setup_fillrect(r, a);
+        r->fill_pend = false;
+        break;
 
     case CMD_SYNC_FULL:
         if (r->mt) {
@@ -352,6 +357,7 @@ void rdp_process_list(struct rdp *r)
     uint32_t end = (*r->dp_end & ~7u) >> 2;
     if (end <= cur) return;
 
+    raster_mem_written(r);     /* the CPU / RSP may have written RDRAM since the last list */
     bool xbus = r->dp_status && (*r->dp_status & DP_STATUS_XBUS_DMA);
     const uint32_t *dmem = (const uint32_t *)r->dmem;
 
@@ -406,6 +412,8 @@ void rdp_init(struct rdp *r, const struct foir_config *cfg)
         const char *e = getenv("FOIR_EARLYZ");
         const int mode = (e && *e) ? atoi(e) : 1;
         r->cfg.early_z = r->cfg.early_z && mode != 0 && (mode == 2 || r->kbase.zcmp != foir_kernels_scalar.zcmp);
+        e = getenv("FOIR_FILLDEDUP");
+        if (e && *e) r->cfg.fill_dedup = atoi(e) != 0;
     }
     foir_spec_init();
     r->ktab = r->kbase;

@@ -532,7 +532,7 @@ EXPORT void CALL ReadScreen2(void *dest, int *width, int *height, int front)
 }
 
 EXPORT void CALL FBRead(unsigned int addr) { (void)addr; if (l_rom_open) rdp_sync(&l_rdp); }
-EXPORT void CALL FBWrite(unsigned int addr, unsigned int size) { (void)addr; (void)size; if (l_rom_open) rdp_sync(&l_rdp); }
+EXPORT void CALL FBWrite(unsigned int addr, unsigned int size) { (void)addr; (void)size; if (l_rom_open) { rdp_sync(&l_rdp); raster_mem_written(&l_rdp); } }
 EXPORT void CALL FBGetFrameBufferInfo(void *p) { (void)p; }
 
 static const char *const l_lbl_frameskip[] = { "Off", "Every 2nd", "2 of 3", "3 of 4", "Auto" };

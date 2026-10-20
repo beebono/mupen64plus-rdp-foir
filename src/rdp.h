@@ -354,6 +354,11 @@ struct rdp {
     bool fld_dirty;                 /* the colour image or the scissor changed since fld was last updated */
     bool vi_since;                  /* the VI has scanned out since that frame began */
     struct px_batch batch;
+    struct fill_rec { uint32_t w0, w1, fb_address, fill_color, a0, a1; int fb_size, fb_width, scfield, sckeepodd; struct rectangle clip; } fill_last[4];
+    int fill_n;                     /* FILL rectangles drawn since anything else wrote their bytes: an identical one again is skipped */
+    bool fill_pend;                 /* the primitive being set up is a FILL_RECT (fill_w) that may be skipped or recorded */
+    uint32_t fill_w[2];
+    uint32_t stat_fill_skips;
     uint32_t stat_prims, stat_pixels;
 #ifdef FOIR_FRAMELOG
     uint32_t stat_loads;
@@ -396,6 +401,7 @@ void foir_stats_batch(const struct rdp *r, int npix);
 void foir_stats_flush(void);   /* write the statistics to $FOIR_STATE_STATS_FILE (if set) */
 
 void raster_draw(struct rdp *r, const struct prim_walk *pw, int start, int end);
+void raster_mem_written(struct rdp *r);   /* something outside the RDP may have written RDRAM */
 void rdp_fb_history_reset(struct rdp *r);
 void rdp_skip_decide(struct rdp *r);                            /* a frame starts: skip it (r->skip_pixels) according to FrameSkip? */
 void rdp_fld_update(struct rdp *r);                            /* record / forget the current colour image as field-rendered */
