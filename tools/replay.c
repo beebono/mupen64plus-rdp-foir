@@ -27,7 +27,7 @@ int main(int argc, char **argv)
 {
     const char *in = NULL, *out_rdram = NULL, *out_ppm = NULL;
     int repeats = 1;
-    bool neon = true, nopix = false, fast = false, weave = false, spec = true, crop_h = false, crop_v = false;
+    bool neon = true, nopix = false, fast = false, fastpersp = false, weave = false, spec = true, crop_h = false, crop_v = false;
     unsigned vi_opts = 0;   /* VI filter options allowed: 1 anti-aliasing, 2 divot, 4 dither restore, 8 gamma */
     const char *vi_variants = NULL;
     int vi_bench = 0, skip_n = 0;
@@ -46,6 +46,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--nospec")) spec = false;
         else if (!strcmp(argv[i], "--setup-only")) nopix = true;
         else if (!strcmp(argv[i], "--fast")) fast = true;
+        else if (!strcmp(argv[i], "--fastpersp")) fastpersp = true;
         else if (!strcmp(argv[i], "--weave")) weave = true;
         else if (!strcmp(argv[i], "--field") && i + 1 < argc) force_field = atoi(argv[++i]) & 1;
         else if (!strcmp(argv[i], "--vi-filters")) vi_opts = 0xf;
@@ -66,7 +67,7 @@ int main(int argc, char **argv)
         else if (argv[i][0] != '-') in = argv[i];
         else { fprintf(stderr, "unknown option %s\n", argv[i]); return 2; }
     }
-    if (!in) { fprintf(stderr, "usage: %s dump.fdump [-o out.rdram] [-p out.ppm] [-n repeats] [--scalar] [--nospec] [-t threads] [--fast] [--weave] [--crop-h] [--crop-v] [--field 0|1] [--vi-filters | --vi-opts mask] [--vi-variants s0[:origin[:mask]],..] [--vi-bench N] [--skip N [--skip-legacy] [--skip-opts bits]] [--scan a,b,..]\n", argv[0]); return 2; }
+    if (!in) { fprintf(stderr, "usage: %s dump.fdump [-o out.rdram] [-p out.ppm] [-n repeats] [--scalar] [--nospec] [-t threads] [--fast] [--fastpersp] [--weave] [--crop-h] [--crop-v] [--field 0|1] [--vi-filters | --vi-opts mask] [--vi-variants s0[:origin[:mask]],..] [--vi-bench N] [--skip N [--skip-legacy] [--skip-opts bits]] [--scan a,b,..]\n", argv[0]); return 2; }
 
     FILE *fp = fopen(in, "rb");
     if (!fp) { perror(in); return 1; }
@@ -91,6 +92,7 @@ int main(int argc, char **argv)
     cfg.debug_nopixels = nopix;
     /* the reference comparison runs with the accuracy-preserving knob settings; --fast turns RelaxedPrecision on */
     cfg.relaxed_precision = fast;
+    cfg.fast_persp = fastpersp;
     if (weave) cfg.interlace_hack = false;
     cfg.vi_aa = vi_opts & 1; cfg.vi_divot = vi_opts & 2; cfg.vi_dedither = vi_opts & 4; cfg.vi_gamma = vi_opts & 8;
     cfg.frame_skip = skip_n;

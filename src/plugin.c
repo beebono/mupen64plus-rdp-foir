@@ -155,6 +155,7 @@ EXPORT m64p_error CALL PluginStartup(m64p_dynlib_handle core, void *context, voi
     ConfigOpenSection("Video-Foir", &l_cfg_foir);
     ConfigSetDefaultBool(l_cfg_foir, "FastCombiner", l_cfg.fast_combiner, "Fast paths for common combiner/blender modes (the NEON kernels always take them)");
     ConfigSetDefaultBool(l_cfg_foir, "RelaxedPrecision", l_cfg.relaxed_precision, "Forces lower accuracy depth values and calculations for speed");
+    ConfigSetDefaultBool(l_cfg_foir, "FastPerspective", l_cfg.fast_persp, "Approximate perspective divide of texture coordinates, for speed (not exact)");
     ConfigSetDefaultString(l_cfg_foir, "FrameSkip", "0", "0 = off, N = fixed frame skip, auto = skip rendering to hold full speed");
     ConfigSetDefaultBool(l_cfg_foir, "InterlaceHack", l_cfg.interlace_hack, "Field-rendered buffers: keep the fresh field, interpolate the other lines, instead of weaving stale rows");
     ConfigSetDefaultInt(l_cfg_foir, "Threads", l_cfg.threads, "Number of rendering worker threads: 0 = auto (cores - 1), -1 = render on the emulation thread");
@@ -206,6 +207,7 @@ static void read_foir_section(struct foir_config *c)
 {
     c->fast_combiner = ConfigGetParamBool(l_cfg_foir, "FastCombiner") != 0;
     c->relaxed_precision = ConfigGetParamBool(l_cfg_foir, "RelaxedPrecision") != 0;
+    c->fast_persp = ConfigGetParamBool(l_cfg_foir, "FastPerspective") != 0;
     c->interlace_hack = ConfigGetParamBool(l_cfg_foir, "InterlaceHack") != 0;
     c->threads = ConfigGetParamInt(l_cfg_foir, "Threads");
     c->mt_helper = ConfigGetParamBool(l_cfg_foir, "SyncHelper") != 0;
@@ -253,7 +255,7 @@ static void load_config(void)
     if (sg && *sg) l_cfg.skip_legacy = atoi(sg) != 0;
     const char *ke = getenv("FOIR_KNOBS");
     if (ke && !strcmp(ke, "exact")) {
-        l_cfg.relaxed_precision = false; l_cfg.frame_skip = 0; l_cfg.interlace_hack = false;
+        l_cfg.relaxed_precision = false; l_cfg.fast_persp = false; l_cfg.frame_skip = 0; l_cfg.interlace_hack = false;
     }
 }
 
@@ -541,7 +543,8 @@ static const char *const l_lbl_threads[] = { "None", "Auto", "1", "2", "3", "4",
 /* Option ids are the ABI: append only.  enum values: FrameSkip index 0..3 = skip level 0..3, 4 = auto; Threads index =
  * Threads + 1 (so -1 "None" = render on the emulation thread). */
 enum { OPT_WIDESCREEN, OPT_FILTER, OPT_INTERLACE, OPT_FRAMESKIP, OPT_VSYNC, OPT_THREADS, OPT_NEON, OPT_SPECIALIZE,
-       OPT_FASTCOMB, OPT_RELAXED, OPT_CROP_H, OPT_CROP_V, OPT_VIAA, OPT_VIDIVOT, OPT_VIDEDITHER, OPT_VIGAMMA, OPT_COUNT };
+       OPT_FASTCOMB, OPT_RELAXED, OPT_CROP_H, OPT_CROP_V, OPT_VIAA, OPT_VIDIVOT, OPT_VIDEDITHER, OPT_VIGAMMA, OPT_FASTPERSP,
+       OPT_COUNT };
 
 static const struct foir_suxty_option l_opts[OPT_COUNT] = {
     [OPT_WIDESCREEN] = { "Widescreen", "Widescreen", "Stretch to the whole screen instead of 4:3", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 0 },
@@ -560,6 +563,7 @@ static const struct foir_suxty_option l_opts[OPT_COUNT] = {
     [OPT_VIDIVOT]    = { "VIDivot", "VI Divot", "Divot filter as the VI does, where the game uses it (costs time)", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 1 },
     [OPT_VIDEDITHER] = { "VIDedither", "VI Dither Restore", "Dither restore as the VI does, where the game uses it (costs time)", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 0 },
     [OPT_VIGAMMA]    = { "VIGamma", "VI Gamma", "Gamma correction as the VI does, where the game uses it (costs time)", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 1 },
+    [OPT_FASTPERSP]  = { "FastPerspective", "Fast Perspective", "Approximate texture perspective divide, for speed (not exact)", FOIR_OPT_BOOL, 0, 0, 1, 1, NULL, 0 },
 };
 
 static bool l_staged_set[OPT_COUNT];
@@ -584,6 +588,7 @@ static int opt_load(const struct foir_config *c, unsigned i)
     case OPT_VIDIVOT:    return c->vi_divot;
     case OPT_VIDEDITHER: return c->vi_dedither;
     case OPT_VIGAMMA:    return c->vi_gamma;
+    case OPT_FASTPERSP:  return c->fast_persp;
     }
     return 0;
 }
@@ -607,6 +612,7 @@ static void opt_store(struct foir_config *c, unsigned i, int v)
     case OPT_VIDIVOT:    c->vi_divot = v != 0; break;
     case OPT_VIDEDITHER: c->vi_dedither = v != 0; break;
     case OPT_VIGAMMA:    c->vi_gamma = v != 0; break;
+    case OPT_FASTPERSP:  c->fast_persp = v != 0; break;
     }
 }
 

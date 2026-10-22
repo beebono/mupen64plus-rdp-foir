@@ -969,6 +969,65 @@ static int run_builder(uint64_t seed, int verbose)
     return bad != 0;
 }
 
+/* -D: the fused texture-coordinate divide + clamp of the NEON sampling path against scalar tc_divide + tc_clamp17 on the low 16 bits, for every
+ * (coordinate, w) pair (t runs through the same values in another order), and the raw tc_divide4() of the LOD pass (17 bits + the two
+ * out-of-range flags) against scalar tc_divide; -D k checks one w in 2^k. FastPerspective (persp 2) is not exact: its
+ * error against the table divide is reported, by w range, not checked */
+void neon_tcdiv_test(int mode, const int32_t *s, const int32_t *t, const int32_t *w, int32_t *os, int32_t *ot);
+#include "../src/kernels_priv.h"
+static int run_tcdiv(int wstep)
+{
+    struct rdp *r = calloc(1, sizeof *r);
+    long bad = 0, n = 0;
+    long fe[3][6] = { { 0 } };          /* w 1..15, 16..255, >= 256 by |error| 0, 1, 2-3, 4-31, 32-1023, more */
+    for (int mode = 0; mode < 7; mode++) {
+        const int persp = mode & 3, raw = mode >> 2;
+        if (persp == 3 || mode == 6) continue;
+        r->om.persp_tex_en = persp != 0;
+        for (int32_t sw = -0x8000; sw < 0x8000; sw += wstep)
+            for (int32_t ss = -0x8000; ss < 0x8000; ss += 4) {
+                int32_t s[4], t[4], w[4], os[4], ot[4];
+                for (int k = 0; k < 4; k++) {
+                    int32_t a = ss + k, b = (int16_t)((a * 40503) ^ 0x5a5a);
+                    s[k] = a * 65536 + (k * 0x3fff); t[k] = b * 65536 + 0xffff - k; w[k] = sw * 65536 + 0x8000 * (k & 1);
+                }
+                neon_tcdiv_test(mode, s, t, w, os, ot);
+                for (int k = 0; k < 4; k++) {
+                    int32_t rs, rt;
+                    tc_divide(r, s[k] >> 16, t[k] >> 16, w[k] >> 16, &rs, &rt);
+                    const int32_t m = raw ? 0x7ffff : 0xffff;
+                    if (!raw) tc_clamp17(&rs, &rt);
+                    if (persp == 2) {
+                        if (sw <= 0) continue;
+                        int wr = sw < 16 ? 0 : sw < 256 ? 1 : 2;
+                        for (int c = 0; c < 2; c++) {
+                            int d = abs((int16_t)(c ? rt : rs) - (int16_t)(c ? ot[k] : os[k]));
+                            fe[wr][d == 0 ? 0 : d == 1 ? 1 : d < 4 ? 2 : d < 32 ? 3 : d < 1024 ? 4 : 5]++;
+                        }
+                        continue;
+                    }
+                    n += 2;
+                    if (((rs ^ os[k]) & m) || ((rt ^ ot[k]) & m)) {
+                        if (bad++ < 10)
+                            fprintf(stderr, "tcdiv persp %d raw %d: s %d t %d w %d: neon %x %x, scalar %x %x\n", persp, raw, s[k] >> 16, t[k] >> 16, sw, os[k] & m,
+                                    ot[k] & m, rs & m, rt & m);
+                    }
+                }
+            }
+    }
+    printf("kfuzz -D: %ld coordinates, %ld differing\n", n, bad);
+    static const char *const wn[3] = { "w 1..15", "w 16..255", "w >= 256" };
+    for (int i = 0; i < 3; i++) {
+        long t = 0;
+        for (int j = 0; j < 6; j++) t += fe[i][j];
+        if (t)
+            printf("kfuzz -D FastPerspective, %s (w <= 0 excluded: exact): |error| 0 %.3f%%, 1 %.3f%%, 2-3 %.3f%%, 4-31 %.4f%%, 32-1023 %.4f%%, more %.4f%%\n",
+                   wn[i], 100.0 * fe[i][0] / t, 100.0 * fe[i][1] / t, 100.0 * fe[i][2] / t, 100.0 * fe[i][3] / t, 100.0 * fe[i][4] / t, 100.0 * fe[i][5] / t);
+    }
+    free(r);
+    return bad != 0;
+}
+
 int main(int argc, char **argv)
 {
     long iters = 1000;
@@ -981,8 +1040,9 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "-v")) verbose = 1;
         else if (!strcmp(argv[i], "-S")) g_spec_mode = 1;
         else if (!strcmp(argv[i], "-L")) g_lod_mode = 1;
+        else if (!strcmp(argv[i], "-D")) { int k = i + 1 < argc ? atoi(argv[i + 1]) : 0; raster_init_tables(); kernels_tex_init_tables(); return run_tcdiv(1 << k); }
         else if (!strcmp(argv[i], "-T") && i + 1 < argc) g_spec_only = atoi(argv[++i]);
-        else { fprintf(stderr, "usage: kfuzz [-n iterations] [-s seed] [-m stage mask] [-v] [-S [-T table]] [-L]\n"); return 2; }
+        else { fprintf(stderr, "usage: kfuzz [-n iterations] [-s seed] [-m stage mask] [-v] [-S [-T table]] [-L] [-D [k]]\n"); return 2; }
     }
     raster_init_tables();
     foir_spec_init();

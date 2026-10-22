@@ -175,6 +175,25 @@ The profile listed "texture helpers" as 31.4 % of foir's CPU time in Banjo-Kazoo
 
 With three workers the LOD dumps are 6-18 % faster. Dumps without LOD stay within +-1.5 %. In game the emulation thread's RDP time falls 16 % in Donkey Kong 64 (4.24 -> 3.55 ms), 13 % in Banjo-Kazooie and 12 % in Paper Mario, and process CPU 5.9 %, 2.2 % and 3.8 %; the profile share of the texture helpers falls from 32.5 to 14.8 % (Banjo-Kazooie) and from 25.4 to 12.4 % (Donkey Kong 64).
 
+### Texture-coordinate divide
+
+The slow 3D scenes (2026-10-21; Earthworm Jim 3D, Gauntlet Legends, Hot Wheels Turbo Racing, Conker's Bad Fur Day from their slot-1 states, Pokemon Snap's zoom shot) spend 25-35 % of a single-threaded replay in the texture stage, all of it in specialised variants (bilinear, perspective; CI4 / CI8 with TLUT, RGBA16, mip-mapped in Earthworm Jim and Gauntlet). The hottest variant (CI4 TLUT, Snap and Gauntlet) is about 700 instructions per 8 pixels with no miss hotspot. By `perf` samples: the perspective divide and coordinate clamp 27 %, the per-axis shift / clamp / mask / mirror arithmetic (32-bit lanes, tile parameters tested per group) 21 %, address computation, gathers, TLUT and filter 46 %.
+
+- **Exact:** `clamp17v(tc_divide4())` on the sampling path became one fused computation (`tc_divclamp4`): the in-range quotient (product shifted by `shift - 13`, which covers `shift == 14`) sign-extended from 17 bits and saturated; out of range is "fewer than `shift` leading sign bits in `product << 2`" (`cls`), its value the sign for `shift <= 12` and bit 29 for 13 / 14. `tc_divide4` (the LOD pass, which needs the raw bits and flags) uses the same range test. Checked for all 2^32 (coordinate, w) pairs (`kfuzz -D`).
+- **`FastPerspective`** (option, off by default): the table divide is `ss * rcp >> (13 - shift)` with `rcp << shift` about `2^28 / w`, so the quotient is about `ss * 32768 / w`; a float reciprocal estimate with one Newton step replaces the table lookup, the range test and the shifts, in the sampling path and the LOD pass. Against the table, over all inputs with `w > 0`: 78 % of the coordinates exact, 18 % off by 1/32 texel, 4 % by 2-3/32, 0.1 % by up to 31/32, none by more. The table's 17-bit wrap of large quotients is not reproduced (adding it made those worse). In the five dumps 0.2-1 % of the pixels change, by at most 33/255.
+
+RK3566, `foir-replay -t 0 --fast`, median of 3 alternating runs, ms per frame (run-to-run noise about 1 %):
+
+| dump | before | exact divide | `FastPerspective` |
+|---|---:|---:|---:|
+| Hot Wheels Turbo Racing (s300) | 74.37 | 72.05 (-3.1 %) | 68.61 (-7.7 %) |
+| Pokemon Snap (1101) | 175.80 | 173.40 (-1.4 %) | 167.32 (-4.8 %) |
+| Conker's Bad Fur Day (s301) | 58.44 | 57.56 (-1.5 %) | 55.10 (-5.7 %) |
+| Gauntlet Legends (s300) | 39.36 | 39.27 (-0.2 %) | 37.79 (-4.0 %) |
+| Earthworm Jim 3D (s300) | 41.95 | 41.27 (-1.6 %) | 39.48 (-5.9 %) |
+
+The rest of the texture stage (axis arithmetic, gathers) is unchanged. A large share of the frame is outside the timed stages: `render_span_cycle` (batch building) is 13-21 % of the samples in these dumps.
+
 ### The emulation thread as helper
 
 Replay, three workers, ms per run (pinned clocks, medians of 3 rounds); "before" has no helper:

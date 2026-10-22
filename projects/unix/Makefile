@@ -234,6 +234,7 @@ ifeq ("$(CPU)","AARCH")
 	$(RUNNER) $(KFUZZ) -S -T 5 -n 15000 -s 500000
 	$(RUNNER) $(KFUZZ) -S -T 0 -n 8000 -s 900000
 	$(RUNNER) $(KFUZZ) -L -m 1 -n 20000 -s 600000
+	$(RUNNER) $(KFUZZ) -D 6
 	$(RUNNER) $(KFUZZ) -L -S -T 0 -n 8000 -s 950000
 endif
 

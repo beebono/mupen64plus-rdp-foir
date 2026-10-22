@@ -53,6 +53,58 @@ static unsigned lst_distinct(uint8x8_t v)
 
 FOIR_INLINE int32x4_t sign16(int32x4_t x) { return vshrq_n_s32(vshlq_n_s32(x, 16), 16); }
 
+/* the out-of-range test (bits 29 .. 29 - shift of the product not all equal) is "fewer than shift leading sign bits once shifted up by 2"; the
+ * quotient is the product shifted by shift - 13 (left by 1 for shift 14); the scalar code tests bit 29 of that quotient (of the product for
+ * shift 14), which is the product's sign for shift <= 12 and its bit 29 for 13 and 14 */
+struct tcdk { int32x4_t shift, cnt, e, rcp; uint32x4_t wcarry; };
+
+FOIR_INLINE struct tcdk tcd_keys(int32x4_t sw)
+{
+    struct tcdk k;
+    k.wcarry = vcleq_s32(sw, S32(0));
+    int32_t idx[4] ALIGN16, tab[4] ALIGN16;
+    vst1q_s32(idx, vandq_s32(sw, S32(0x7fff)));
+    tab[0] = k_tcdiv[idx[0]]; tab[1] = k_tcdiv[idx[1]]; tab[2] = k_tcdiv[idx[2]]; tab[3] = k_tcdiv[idx[3]];
+    int32x4_t tv = vld1q_s32(tab);
+    k.shift = vandq_s32(tv, S32(0xf));
+    k.rcp = vshrq_n_s32(tv, 4);
+    k.cnt = vsubq_s32(k.shift, S32(13));
+    k.e = vandq_s32(vreinterpretq_s32_u32(vcgeq_s32(k.shift, S32(13))), S32(2));
+    return k;
+}
+
+/* FastPerspective (persp 2): the table divide is ss * rcp >> (13 - shift) with rcp << shift ~ 2^28 / w, so the quotient is ~ ss * 32768 / w,
+ * here from a float reciprocal with one Newton step, rounded down. Against the table (kfuzz -D, clamped coordinates): no error above 31 (1/32
+ * texel units), 1-3 in about a fifth of the coordinates */
+FOIR_INLINE float32x4_t tcd_fast_rcp(int32x4_t sw)
+{
+    float32x4_t fw = vcvtq_f32_s32(sw);
+    float32x4_t rc = vrecpeq_f32(fw);
+    rc = vmulq_f32(rc, vrecpsq_f32(fw, rc));
+    return vmulq_n_f32(rc, 32768.0f);
+}
+
+FOIR_INLINE int32x4_t tcd_fast_q(int32x4_t ss, float32x4_t rc) { return vcvtmq_s32_f32(vmulq_f32(vcvtq_f32_s32(ss), rc)); }
+
+/* raw 17-bit coordinate with the out-of-range flags in bits 17 / 18 (scalar tc_divide); FastPerspective flags a quotient outside 17 bits by its sign */
+FOIR_INLINE int32x4_t tcd_raw(int persp, int32x4_t x, const struct tcdk *k, float32x4_t rc)
+{
+    int32x4_t ou;
+    int32x4_t q;
+    if (persp == 2) {
+        q = tcd_fast_q(x, rc);
+        uint32x4_t oob = vcgtq_u32(vreinterpretq_u32_s32(vaddq_s32(q, S32(0x10000))), vdupq_n_u32(0x1ffff));
+        ou = vandq_s32(vbslq_s32(vcltzq_s32(q), S32(1 << 17), S32(2 << 17)), vreinterpretq_s32_u32(oob));
+    } else {
+        int32x4_t p = vmulq_s32(x, k->rcp);
+        q = vshlq_s32(p, k->cnt);
+        uint32x4_t oob = vcltq_s32(vclsq_s32(vshlq_n_s32(p, 2)), k->shift);
+        ou = vandq_s32(vbslq_s32(vcltzq_s32(vshlq_s32(p, k->e)), S32(1 << 17), S32(2 << 17)), vreinterpretq_s32_u32(oob));
+    }
+    ou = vorrq_s32(ou, vandq_s32(S32(2 << 17), vreinterpretq_s32_u32(k->wcarry)));
+    return vorrq_s32(vandq_s32(q, S32(0x1ffff)), ou);
+}
+
 FOIR_INLINE void tc_divide4(int persp, int32x4_t s, int32x4_t t, int32x4_t w, int32x4_t *sss, int32x4_t *sst)
 {
     /* raw 16.16 interpolants; the divide uses the integer parts (the arithmetic shift gives the sign-extended 16-bit values scalar tc_divide() starts from) */
@@ -62,33 +114,12 @@ FOIR_INLINE void tc_divide4(int persp, int32x4_t s, int32x4_t t, int32x4_t w, in
         *sst = vandq_s32(st, S32(0x1ffff));
         return;
     }
-    uint32x4_t wcarry = vcleq_s32(sw, S32(0));
-    int32_t idx[4] ALIGN16, tab[4] ALIGN16;
-    vst1q_s32(idx, vandq_s32(sw, S32(0x7fff)));
-    tab[0] = k_tcdiv[idx[0]]; tab[1] = k_tcdiv[idx[1]]; tab[2] = k_tcdiv[idx[2]]; tab[3] = k_tcdiv[idx[3]];
-    int32x4_t tv = vld1q_s32(tab);
-    int32x4_t shift = vandq_s32(tv, S32(0xf));
-    int32x4_t rcp = vshrq_n_s32(tv, 4);
-
-    int32x4_t sprod = vmulq_s32(ss, rcp), tprod = vmulq_s32(st, rcp);
-    /* out of bounds: bits 29 .. 29 - shift of the product (scalar tempmask) are not all equal; shifted to the top and sign-extended they give 0 / -1 exactly when they are */
-    int32x4_t down = vsubq_s32(shift, S32(31));
-    uint32x4_t cs = vcgtq_u32(vreinterpretq_u32_s32(vaddq_s32(vshlq_s32(vshlq_n_s32(sprod, 2), down), S32(1))), vdupq_n_u32(1));
-    uint32x4_t ct = vcgtq_u32(vreinterpretq_u32_s32(vaddq_s32(vshlq_s32(vshlq_n_s32(tprod, 2), down), S32(1))), vdupq_n_u32(1));
-    int32x4_t cnt = vsubq_s32(shift, S32(13));           /* right shift by 13 - shift (left by 1 when shift == 14) */
-    int32x4_t temps = vshlq_s32(sprod, cnt), tempt = vshlq_s32(tprod, cnt);
-    uint32x4_t is_e = vceqq_s32(shift, S32(0xe));
-    int32x4_t chk_s = vbslq_s32(is_e, sprod, temps), chk_t = vbslq_s32(is_e, tprod, tempt);
-
-    int32x4_t ous = vbslq_s32(vtstq_s32(chk_s, S32(1 << 29)), S32(1 << 17), S32(2 << 17));
-    int32x4_t out = vbslq_s32(vtstq_s32(chk_t, S32(1 << 29)), S32(1 << 17), S32(2 << 17));
-    ous = vandq_s32(ous, vreinterpretq_s32_u32(cs));
-    out = vandq_s32(out, vreinterpretq_s32_u32(ct));
-    int32x4_t wc = vandq_s32(S32(2 << 17), vreinterpretq_s32_u32(wcarry));
-    ous = vorrq_s32(ous, wc);
-    out = vorrq_s32(out, wc);
-    *sss = vorrq_s32(vandq_s32(temps, S32(0x1ffff)), ous);
-    *sst = vorrq_s32(vandq_s32(tempt, S32(0x1ffff)), out);
+    struct tcdk k = { 0 };
+    float32x4_t rc = vdupq_n_f32(0);
+    if (persp == 2) { k.wcarry = vcleq_s32(sw, S32(0)); rc = tcd_fast_rcp(sw); }
+    else k = tcd_keys(sw);
+    *sss = tcd_raw(persp, ss, &k, rc);
+    *sst = tcd_raw(persp, st, &k, rc);
 }
 
 FOIR_INLINE int32x4_t clamp17v(int32x4_t x)
@@ -100,6 +131,46 @@ FOIR_INLINE int32x4_t clamp17v(int32x4_t x)
     v = vbslq_s32(vtstq_s32(x, S32(0x20000)), S32(0x8000), v);
     v = vbslq_s32(vtstq_s32(x, S32(0x40000)), S32(0x7fff), v);
     return v;
+}
+
+/* clamp17v(tc_divide4()) for the sampling path, which uses only the low 16 bits: the in-range quotient is sign-extended from 17 bits and
+ * saturated, out of range gives -0x8000 / 0x7fff by the tested bit, w <= 0 gives 0x7fff. FastPerspective saturates its quotient (the 17-bit
+ * wrap of the table divide made its large quotients worse) */
+FOIR_INLINE int32x4_t tcd_clamped(int persp, int32x4_t x, const struct tcdk *k, float32x4_t rc)
+{
+    int32x4_t q;
+    if (persp == 2) {
+        q = vmaxq_s32(vminq_s32(tcd_fast_q(x, rc), S32(0x7fff)), S32(-0x8000));
+    } else {
+        int32x4_t p = vmulq_s32(x, k->rcp);
+        q = vshlq_s32(p, k->cnt);
+        q = vshrq_n_s32(vshlq_n_s32(q, 15), 15);
+        q = vmaxq_s32(vminq_s32(q, S32(0x7fff)), S32(-0x8000));
+        uint32x4_t oob = vcltq_s32(vclsq_s32(vshlq_n_s32(p, 2)), k->shift);
+        q = vbslq_s32(oob, vbslq_s32(vcltzq_s32(vshlq_s32(p, k->e)), S32(-0x8000), S32(0x7fff)), q);
+    }
+    return vbslq_s32(k->wcarry, S32(0x7fff), q);
+}
+
+FOIR_INLINE void tc_divclamp4(int persp, int32x4_t s, int32x4_t t, int32x4_t w, int32x4_t *sss, int32x4_t *sst)
+{
+    int32x4_t ss = vshrq_n_s32(s, 16), st = vshrq_n_s32(t, 16), sw = vshrq_n_s32(w, 16);
+    if (!persp) { *sss = ss; *sst = st; return; }
+    struct tcdk k = { 0 };
+    float32x4_t rc = vdupq_n_f32(0);
+    if (persp == 2) { k.wcarry = vcleq_s32(sw, S32(0)); rc = tcd_fast_rcp(sw); }
+    else k = tcd_keys(sw);
+    *sss = tcd_clamped(persp, ss, &k, rc);
+    *sst = tcd_clamped(persp, st, &k, rc);
+}
+
+/* test hook for kfuzz -D: persp 0..2, + 4 for the raw tc_divide4() */
+void neon_tcdiv_test(int mode, const int32_t *s, const int32_t *t, const int32_t *w, int32_t *os, int32_t *ot)
+{
+    int32x4_t a, b;
+    if (mode & 4) tc_divide4(mode & 3, vld1q_s32(s), vld1q_s32(t), vld1q_s32(w), &a, &b);
+    else tc_divclamp4(mode & 3, vld1q_s32(s), vld1q_s32(t), vld1q_s32(w), &a, &b);
+    vst1q_s32(os, a); vst1q_s32(ot, b);
 }
 
 struct axis {
@@ -573,7 +644,7 @@ FOIR_INLINE void lod_pass_impl(const struct rdp *r, const int32_t *s, const int3
                     __atomic_fetch_add(&lst_xslow, 1, __ATOMIC_RELAXED);
 #endif
                     int32x4_t xs, xt;
-                    tc_divide4(1, vaddq_s32(sv, dsi), vaddq_s32(tv, dti), vaddq_s32(wv, dwi), &xs, &xt);
+                    tc_divide4(persp, vaddq_s32(sv, dsi), vaddq_s32(tv, dti), vaddq_s32(wv, dwi), &xs, &xt);
                     ns = vbslq_s32(ok, ns, xs); nt = vbslq_s32(ok, nt, xt);
                 }
             } else {
@@ -645,6 +716,10 @@ static __attribute__((noinline)) void lod_pass_p1t(const struct rdp *r, const in
 { lod_pass_impl(r, s, t, w, add, ng, lfo, lb, 1, 1); }
 static __attribute__((noinline)) void lod_pass_p1(const struct rdp *r, const int32_t *s, const int32_t *t, const int32_t *w, const int32_t add[3], int ng, int16_t *lfo, struct lodbuf *lb)
 { lod_pass_impl(r, s, t, w, add, ng, lfo, lb, 1, 0); }
+static __attribute__((noinline)) void lod_pass_p2t(const struct rdp *r, const int32_t *s, const int32_t *t, const int32_t *w, const int32_t add[3], int ng, int16_t *lfo, struct lodbuf *lb)
+{ lod_pass_impl(r, s, t, w, add, ng, lfo, lb, 2, 1); }
+static __attribute__((noinline)) void lod_pass_p2(const struct rdp *r, const int32_t *s, const int32_t *t, const int32_t *w, const int32_t add[3], int ng, int16_t *lfo, struct lodbuf *lb)
+{ lod_pass_impl(r, s, t, w, add, ng, lfo, lb, 2, 0); }
 static __attribute__((noinline)) void lod_pass_p0t(const struct rdp *r, const int32_t *s, const int32_t *t, const int32_t *w, const int32_t add[3], int ng, int16_t *lfo, struct lodbuf *lb)
 { lod_pass_impl(r, s, t, w, add, ng, lfo, lb, 0, 1); }
 static __attribute__((noinline)) void lod_pass_p0(const struct rdp *r, const int32_t *s, const int32_t *t, const int32_t *w, const int32_t add[3], int ng, int16_t *lfo, struct lodbuf *lb)
@@ -653,7 +728,8 @@ static __attribute__((noinline)) void lod_pass_p0(const struct rdp *r, const int
 FOIR_INLINE void lod_pass(const struct rdp *r, const int32_t *s, const int32_t *t, const int32_t *w, const int32_t add[3], int ng, int16_t *lfo,
                           struct lodbuf *lb, int persp, int tiles)
 {
-    if (persp) { if (tiles) lod_pass_p1t(r, s, t, w, add, ng, lfo, lb); else lod_pass_p1(r, s, t, w, add, ng, lfo, lb); }
+    if (persp == 2) { if (tiles) lod_pass_p2t(r, s, t, w, add, ng, lfo, lb); else lod_pass_p2(r, s, t, w, add, ng, lfo, lb); }
+    else if (persp) { if (tiles) lod_pass_p1t(r, s, t, w, add, ng, lfo, lb); else lod_pass_p1(r, s, t, w, add, ng, lfo, lb); }
     else       { if (tiles) lod_pass_p0t(r, s, t, w, add, ng, lfo, lb); else lod_pass_p0(r, s, t, w, add, ng, lfo, lb); }
 }
 
@@ -731,6 +807,7 @@ FOIR_INLINE void texture_body(struct rdp *r, struct px_batch *b, const struct ts
     const int ng = NGROUPS(b->n);
     const int32x4_t dsi = S32(pc->dsinc), dti = S32(pc->dtinc), dwi = S32(pc->dwinc);
     const int lodtiles = S->lodtiles;
+    const int persp = S->persp && r->cfg.fast_persp ? 2 : S->persp;
     (void)om;
 #ifdef FOIR_STATS
     {
@@ -744,13 +821,13 @@ FOIR_INLINE void texture_body(struct rdp *r, struct px_batch *b, const struct ts
     struct lodbuf lb, lbn;
     if (S->dolod) {
         static const int32_t zero3[3] = { 0, 0, 0 };
-        lod_pass(r, b->s, b->t, b->w, zero3, ng, b->lodfrac, &lb, S->persp, lodtiles);
+        lod_pass(r, b->s, b->t, b->w, zero3, ng, b->lodfrac, &lb, persp, lodtiles);
     }
     if (S->nx && lodtiles) {
         /* the next pixel is evaluated as a pixel of its own */
         const int32_t add[3] = { pc->dsinc, pc->dtinc, pc->dwinc };
         int16_t lfn[FOIR_LANES] ALIGN16;
-        lod_pass(r, b->s, b->t, b->w, add, ng, lfn, &lbn, S->persp, 1);
+        lod_pass(r, b->s, b->t, b->w, add, ng, lfn, &lbn, persp, 1);
     }
     const int32_t *lrs = LB(lb.rs_), *lrt = LB(lb.rt_), *nrs = LB(lbn.rs_), *nrt = LB(lbn.rt_);
 #ifdef FOIR_STATS
@@ -772,18 +849,18 @@ FOIR_INLINE void texture_body(struct rdp *r, struct px_batch *b, const struct ts
             int32x4_t a, bb;
             if (S->dolod) {
                 a = vld1q_s32(lrs + o + 4 * h); bb = vld1q_s32(lrt + o + 4 * h);
+                sss[h] = clamp17v(a); sst[h] = clamp17v(bb);
             } else {
-                tc_divide4(S->persp, vld1q_s32(&b->s[o + 4 * h]), vld1q_s32(&b->t[o + 4 * h]), vld1q_s32(&b->w[o + 4 * h]), &a, &bb);
+                tc_divclamp4(persp, vld1q_s32(&b->s[o + 4 * h]), vld1q_s32(&b->t[o + 4 * h]), vld1q_s32(&b->w[o + 4 * h]), &sss[h], &sst[h]);
             }
-            sss[h] = clamp17v(a); sst[h] = clamp17v(bb);
             if (S->nx) {
                 if (lodtiles) {
                     a = vld1q_s32(nrs + o + 4 * h); bb = vld1q_s32(nrt + o + 4 * h);
+                    nsss[h] = clamp17v(a); nsst[h] = clamp17v(bb);
                 } else {
                     int32x4_t s = vld1q_s32(&b->s[o + 4 * h]), t = vld1q_s32(&b->t[o + 4 * h]), w = vld1q_s32(&b->w[o + 4 * h]);
-                    tc_divide4(S->persp, vaddq_s32(s, dsi), vaddq_s32(t, dti), vaddq_s32(w, dwi), &a, &bb);
+                    tc_divclamp4(persp, vaddq_s32(s, dsi), vaddq_s32(t, dti), vaddq_s32(w, dwi), &nsss[h], &nsst[h]);
                 }
-                nsss[h] = clamp17v(a); nsst[h] = clamp17v(bb);
             }
         }
         if (S->t0) {
