@@ -10,7 +10,7 @@
  * A hi-res image (width >= 512) crops twice as many columns, a frame of >= 360 lines twice as many lines, so the same
  * part of the picture goes.  An axis whose image would drop below 32 pixels is left alone. */
 #define VI_CROP_H 8
-#define VI_CROP_V 12
+#define VI_CROP_V 6
 
 struct vi_regs {
     uint32_t status, origin, width, h_start, v_start, x_scale, y_scale;
