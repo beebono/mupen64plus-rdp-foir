@@ -72,7 +72,7 @@ Always available:
 | `FOIR_MT_STATS=1` | Print worker-pool counters (jobs, syncs, ring waits, helper tasks) when the plugin shuts down. |
 | `FOIR_LOGFILE=path` | Also append the plugin's log lines to this file (unbuffered). |
 | `FOIR_DUMP=prefix`, `FOIR_DUMP_FRAME=n`, `FOIR_DUMP_FRAMES=k` | Capture RDP frames for `foir-replay` (first frame, default 200; number of frames, default 2). |
-| `FOIR_SHOT_DIR=dir`, `FOIR_SHOT_FRAMES=a,b,...` | Write `frame_NNNNN.ppm` screenshots at these plugin frame numbers (up to 64). |
+| `FOIR_SHOT_DIR=dir`, `FOIR_SHOT_FRAMES=a,b,...` | Write `frame_NNNNN.ppm` screenshots at these plugin frame numbers; an entry may be a range `a-b` or `a-b/step` (up to 4096 shots). |
 
 Only in debug builds (`CFLAGS=-DFOIR_STATS` or `-DFOIR_FRAMELOG`, see [testing.md](testing.md#debug-builds-and-logs)):
 

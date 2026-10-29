@@ -110,7 +110,8 @@ void capture_frame(struct rdp *r, const struct vi_regs *vi)
 
 void capture_screenshot(const struct vi_frame *f)
 {
-    static int inited, frame, nshots, shots[64];
+    enum { MAXSHOTS = 4096 };
+    static int inited, frame, nshots, shots[MAXSHOTS];
     static char dir[512];
     if (!inited) {
         inited = 1;
@@ -118,8 +119,13 @@ void capture_screenshot(const struct vi_frame *f)
         if (!d || !l) return;
         snprintf(dir, sizeof(dir), "%s", d);
         char *tmp = strdup(l), *save = NULL;
-        for (char *t = strtok_r(tmp, ",", &save); t && nshots < 64; t = strtok_r(NULL, ",", &save))
-            shots[nshots++] = atoi(t);
+        for (char *t = strtok_r(tmp, ",", &save); t && nshots < MAXSHOTS; t = strtok_r(NULL, ",", &save)) {
+            int a, b, st = 1;      // a single frame, or a-b[/step]
+            if (sscanf(t, "%d-%d/%d", &a, &b, &st) >= 2 && st > 0)
+                for (int k = a; k <= b && nshots < MAXSHOTS; k += st) shots[nshots++] = k;
+            else
+                shots[nshots++] = atoi(t);
+        }
         free(tmp);
     }
     if (!nshots) return;
