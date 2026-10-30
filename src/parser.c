@@ -271,7 +271,7 @@ void rdp_run_command(struct rdp *r, const uint32_t *a)
         if (r->mt) {
             struct timespec t0, t1;
             clock_gettime(CLOCK_MONOTONIC, &t0);
-            rdp_sync(r);
+            mt_sync_frame(r);
             clock_gettime(CLOCK_MONOTONIC, &t1);
             r->sync_wait_ms += (double)(t1.tv_sec - t0.tv_sec) * 1e3 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
         }

@@ -31,6 +31,7 @@
 
 struct mt_job {
     int start, end;
+    uint32_t rlo[2], rhi[2];          /* the RDRAM bytes the job writes: colour rows, Z rows (rhi 0: none) */
     uint32_t state_gen, tmem_gen;
     uint16_t state_slot, tmem_slot;
     uint32_t cmask;
@@ -59,7 +60,7 @@ struct mt_class {
     char pad[56];
 };
 
-struct mt_stats { unsigned long jobs, region_syncs, range_syncs, full_syncs, alloc_waits, snap_waits, tmem_waits, help_tasks; };
+struct mt_stats { unsigned long jobs, region_syncs, range_syncs, full_syncs, alloc_waits, snap_waits, tmem_waits, help_tasks, range_waits; };
 
 struct rdp_mt {
     struct mt_stats st;
@@ -265,6 +266,41 @@ static void wait_all(struct rdp_mt *mt)
     }
 }
 
+/* Wait until every pending job that writes a byte of [lo, hi) is complete, helping meanwhile; the rest stays in flight. Per class
+ * the newest such job is found by scanning the pending jobs newest first (a class runs its tasks in job order, so once it is past
+ * that job its older tasks are done too); a class is past job j when its next task is a later job. Used for the VI scan-out under
+ * DeferredDrain: the displayed buffer was drawn a frame ago, so the wait is normally free while the current frame renders on. */
+void mt_wait_range(struct rdp *r, uint32_t lo, uint32_t hi)
+{
+    struct rdp_mt *mt = r->mt;
+    if (!mt) return;
+    uint64_t head = atomic_load_explicit(&mt->head, memory_order_relaxed), fl = mt_floor(mt);
+    uint32_t need[MT_MAXK];
+    uint32_t left = mt->K >= 32 ? 0xffffffffu : ((1u << mt->K) - 1), found = 0;
+    for (uint64_t j = head; j > fl && left; ) {
+        --j;
+        const struct mt_job *job = &mt->jobs[j & MT_JM];
+        bool hit = (lo < job->rhi[0] && job->rlo[0] < hi) || (lo < job->rhi[1] && job->rlo[1] < hi);
+        if (!hit) continue;
+        for (uint32_t m = job->cmask & left; m; m &= m - 1) {
+            int c = __builtin_ctz(m);
+            need[c] = (uint32_t)j;
+            found |= 1u << c;
+        }
+        left &= ~job->cmask;
+    }
+    if (!found) return;
+    mt->st.range_waits++;
+    int spins = 0;
+    for (uint32_t m = found; m; ) {
+        int c = __builtin_ctz(m);
+        uint64_t n = atomic_load_explicit(&mt->cls[c].st, memory_order_acquire) >> 1;
+        if (n == mt->tail_local[c] || (int32_t)(mt->cq[c][n & MT_JM] - need[c]) > 0) { m &= m - 1; continue; }
+        if (help_one(mt)) { spins = 0; continue; }
+        wait_progress(mt, &spins);
+    }
+}
+
 static struct rdp *new_ctx(const struct rdp *r, int nworkers, int id)
 {
     struct rdp *c = (struct rdp *)calloc(1, sizeof(struct rdp));
@@ -281,6 +317,14 @@ static int env_int(const char *name, int def)
 {
     const char *e = getenv(name);
     return (e && *e) ? atoi(e) : def;
+}
+
+static int l_skip = -1;       /* FOIR_SKIP_BARRIERS=mask (1: texture loads, 2: target conflicts, 4: SYNC_FULL and the VI scan-out): a measurement of what those barriers cost; the output is wrong */
+
+static int skip_mask(void)
+{
+    if (l_skip < 0) l_skip = env_int("FOIR_SKIP_BARRIERS", 0);
+    return l_skip;
 }
 
 bool mt_start(struct rdp *r, int nworkers)
@@ -353,6 +397,11 @@ void mt_sync(struct rdp *r)
         wait_all(mt);
     mt->floor_cache = atomic_load_explicit(&mt->head, memory_order_relaxed);
     mt->nreg = 0;
+}
+
+void mt_sync_frame(struct rdp *r)
+{
+    if (!r->cfg.defer_drain && !(skip_mask() & 4)) mt_sync(r);
 }
 
 void mt_stop(struct rdp *r)
@@ -479,9 +528,9 @@ const char *mt_stats_delta(struct rdp *r)
     struct rdp_mt *mt = r->mt;
     if (!mt) return "";
     struct mt_stats s = mt->st;
-    snprintf(buf, sizeof buf, "mt: %lu jobs, syncs %lu full + %lu target + %lu texload, waits %lu ring %lu state %lu tmem, %lu helps",
+    snprintf(buf, sizeof buf, "mt: %lu jobs, syncs %lu full + %lu target + %lu texload, %lu scan-out waits, waits %lu ring %lu state %lu tmem, %lu helps",
              (unsigned long)atomic_load(&mt->head) - last.jobs, s.full_syncs - last.full_syncs, s.region_syncs - last.region_syncs, s.range_syncs - last.range_syncs,
-             s.alloc_waits - last.alloc_waits, s.snap_waits - last.snap_waits, s.tmem_waits - last.tmem_waits, s.help_tasks - last.help_tasks);
+             s.range_waits - last.range_waits, s.alloc_waits - last.alloc_waits, s.snap_waits - last.snap_waits, s.tmem_waits - last.tmem_waits, s.help_tasks - last.help_tasks);
     last = s; last.jobs = (unsigned long)atomic_load(&mt->head);
     return buf;
 }
@@ -505,7 +554,7 @@ void mt_sync_range(struct rdp *r, uint32_t lo, uint32_t hi)
     struct rdp_mt *mt = r->mt;
     if (!mt || mt->nreg == 0) return;
     for (int i = 0; i < mt->nreg; i++)
-        if (lo < mt->reg[i].hi && mt->reg[i].lo < hi) { mt->st.range_syncs++; trace_barrier(r, "texload", lo, hi, &mt->reg[i]); mt_sync(r); return; }
+        if (lo < mt->reg[i].hi && mt->reg[i].lo < hi) { mt->st.range_syncs++; trace_barrier(r, "texload", lo, hi, &mt->reg[i]); if (!(skip_mask() & 1)) mt_sync(r); return; }
 }
 
 void mt_submit(struct rdp *r, const struct prim_walk *pw, int start, int end)
@@ -533,7 +582,7 @@ void mt_submit(struct rdp *r, const struct prim_walk *pw, int start, int end)
         for (int i = 0; i < nregs; i++) need += region_find(mt, &regs[i]) == NULL;
         barrier = mt->nreg + need > MT_MAXREG;
     }
-    if (barrier) { mt->st.region_syncs++; mt_sync(r); }
+    if (barrier) { mt->st.region_syncs++; if (!(skip_mask() & 2) || mt->nreg >= MT_MAXREG) mt_sync(r); }
     for (int i = 0; i < nregs; i++) region_add(mt, &regs[i]);
 
     uint64_t head = atomic_load_explicit(&mt->head, memory_order_relaxed);
@@ -592,6 +641,8 @@ void mt_submit(struct rdp *r, const struct prim_walk *pw, int start, int end)
         }
     }
     job->start = start; job->end = end;
+    job->rlo[0] = regs[0].lo; job->rhi[0] = regs[0].hi;
+    job->rlo[1] = nregs > 1 ? regs[1].lo : 0; job->rhi[1] = nregs > 1 ? regs[1].hi : 0;
     job->pw = *pw;
     job->pc = r->pc;
     job->cmask = cmask;

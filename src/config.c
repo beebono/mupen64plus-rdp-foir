@@ -11,6 +11,7 @@ void foir_config_defaults(struct foir_config *c)
     c->interlace_hack = true;
     c->threads = 0;
     c->mt_helper = true;
+    c->defer_drain = true;
     c->specialize = true;
     c->neon = true;
     c->early_z = true;

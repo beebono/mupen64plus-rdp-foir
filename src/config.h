@@ -13,6 +13,7 @@ struct foir_config {
     bool interlace_hack;
     int  threads;            /* 0 = auto */
     bool mt_helper;
+    bool defer_drain;        /* DeferredDrain: no drain at SYNC_FULL; the workers finish behind the game until the DP interrupt is delivered (the core's FullSyncDelivered hook) or the VI shows the buffer */
     bool specialize;
     bool neon;
     bool early_z;            /* batch-skip early Z (NEON kernels); FOIR_EARLYZ overrides */

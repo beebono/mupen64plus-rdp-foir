@@ -85,6 +85,24 @@ void vi_render(const struct rdp *r, const struct vi_regs *regs, struct vi_frame 
     vi_render_ex(r, regs, out, false);
 }
 
+bool vi_scan_range(const struct vi_regs *regs, uint32_t *lo, uint32_t *hi)
+{
+    int type = regs->status & 3;
+    int hstart = (regs->h_start >> 16) & 0x3ff, hend = regs->h_start & 0x3ff;
+    int vstart = (regs->v_start >> 16) & 0x3ff, vend = regs->v_start & 0x3ff;
+    int xscale = regs->x_scale & 0xfff, yscale = regs->y_scale & 0xfff;
+    int stride = (int)(regs->width & 0xfff);
+    if (type < 2 || hend <= hstart || vend <= vstart || xscale == 0 || yscale == 0 || stride == 0) return false;
+    int w = ((hend - hstart) * xscale) >> 10;
+    int h = (((vend - vstart) >> 1) * yscale) >> 10;
+    if (w <= 0 || h <= 0) return false;
+    if (h > VI_MAX_H) h = VI_MAX_H;
+    uint32_t bpp = type == 3 ? 4 : 2, origin = regs->origin & 0xffffff;
+    *lo = origin;
+    *hi = origin + (uint32_t)stride * bpp * (uint32_t)(h + 1);      /* one more row: the weave / filters read a neighbour */
+    return true;
+}
+
 void vi_render_ex(const struct rdp *r, const struct vi_regs *regs, struct vi_frame *out, bool allow_raw16)
 {
     int type = regs->status & 3;

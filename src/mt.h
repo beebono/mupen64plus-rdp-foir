@@ -9,6 +9,8 @@ bool mt_start(struct rdp *r, int threads);
 void mt_stop(struct rdp *r);
 void mt_submit(struct rdp *r, const struct prim_walk *pw, int start, int end);
 void mt_sync(struct rdp *r);
+void mt_sync_frame(struct rdp *r);
+void mt_wait_range(struct rdp *r, uint32_t lo, uint32_t hi);   /* wait for the pending jobs that write [lo, hi) only */     /* the drain at SYNC_FULL and at the VI scan-out (skipped by FOIR_SKIP_BARRIERS bit 4, a measurement) */
 uint32_t mt_pixels(struct rdp *r);
 void mt_coverage(struct rdp *r, uint64_t pix[COV_N], uint64_t *tex_all);
 #ifdef FOIR_FRAMELOG

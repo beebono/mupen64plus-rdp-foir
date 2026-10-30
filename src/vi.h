@@ -38,6 +38,8 @@ void vi_filter_row(const struct rdp *r, const struct vi_filter_ctx *c, int sy, i
 void vi_filter_row_ref(const struct rdp *r, const struct vi_filter_ctx *c, int sy, int x0, int n, uint32_t *dst);
 
 void vi_render(const struct rdp *r, const struct vi_regs *regs, struct vi_frame *out);
+/* the RDRAM bytes the VI scans out for these registers: false when it shows nothing */
+bool vi_scan_range(const struct vi_regs *regs, uint32_t *lo, uint32_t *hi);
 void vi_render_ex(const struct rdp *r, const struct vi_regs *regs, struct vi_frame *out, bool allow_raw16);
 
 #endif
