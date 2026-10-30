@@ -472,6 +472,20 @@ static void region_add(struct rdp_mt *mt, const struct mt_job_region *g)
     p->addr = g->addr; p->width = g->width; p->bpp = g->bpp; p->lo = g->lo; p->hi = g->hi;
 }
 
+const char *mt_stats_delta(struct rdp *r)
+{
+    static char buf[200];
+    static struct mt_stats last;
+    struct rdp_mt *mt = r->mt;
+    if (!mt) return "";
+    struct mt_stats s = mt->st;
+    snprintf(buf, sizeof buf, "mt: %lu jobs, syncs %lu full + %lu target + %lu texload, waits %lu ring %lu state %lu tmem, %lu helps",
+             (unsigned long)atomic_load(&mt->head) - last.jobs, s.full_syncs - last.full_syncs, s.region_syncs - last.region_syncs, s.range_syncs - last.range_syncs,
+             s.alloc_waits - last.alloc_waits, s.snap_waits - last.snap_waits, s.tmem_waits - last.tmem_waits, s.help_tasks - last.help_tasks);
+    last = s; last.jobs = (unsigned long)atomic_load(&mt->head);
+    return buf;
+}
+
 void mt_sync_range(struct rdp *r, uint32_t lo, uint32_t hi)
 {
     struct rdp_mt *mt = r->mt;

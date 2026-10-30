@@ -16,5 +16,7 @@ void mt_prof_enable(struct rdp *r);
 int mt_prof_read(struct rdp *r, uint64_t busy[8], uint64_t *jobs, uint64_t *sync_ns, uint64_t *help_ns);
 #endif
 void mt_sync_range(struct rdp *r, uint32_t lo, uint32_t hi);
+/* the pool counters since the previous call, formatted (empty string without a pool) */
+const char *mt_stats_delta(struct rdp *r);
 
 #endif

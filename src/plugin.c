@@ -25,9 +25,9 @@
 #include "gl_out.h"
 #include "capture.h"
 #include "foir_suxty.h"
+#include "mt.h"
 #ifdef FOIR_FRAMELOG
 #include "framelog.h"
-#include "mt.h"
 #endif
 #include <pthread.h>
 
@@ -477,6 +477,7 @@ EXPORT void CALL UpdateScreen(void)
                      (all - l_cpu_all_base) / 120, (emu - l_cpu_emu_base) / 120, (all - l_cpu_all_base - emu + l_cpu_emu_base) / 120);
             l_cpu_all_base = all; l_cpu_emu_base = emu;
         }
+        if (l_rdp.mt) foir_log(FOIR_LOG_INFO, "%s", mt_stats_delta(&l_rdp));
         {
             uint64_t cov[COV_N], texall;
             rdp_coverage(&l_rdp, cov, &texall);
