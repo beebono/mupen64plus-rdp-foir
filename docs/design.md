@@ -225,7 +225,7 @@ Not an artefact of the rules but a property of dropping frames: a rendered frame
 
 - **VI.** The VI filters are opt-in (`VIAntiAliasing`, `VIDivot`, `VIDedither`, `VIGamma`) and skip the VI's resampling between source pixels, gamma-dither noise and the aa_mode 3 glitch; no 480i deinterlacing beyond `InterlaceHack` (a field is shown as one frame; no half-line offset between the fields of a stride-2 buffer). `FBRead` / `FBWrite` only drain the workers: no framebuffer emulation for CPU effects (the core's frame-buffer hooks are off under the dynarec).
 - **Exactness.**
-  - `RelaxedPrecision` (default off since 2026-10-16) is not exact when turned on. `FastCombiner` and everything else are; with exact settings the output is identical to the scalar reference.
+  - `RelaxedPrecision` (default off since 2026-10-16) and `TextureLod = False` (mip-mapping off; `tex_lod_en` is cleared from the command's bit in `rdp_update_derived()` and the combiner's TEXEL1 / LOD-fraction selects are rewritten to TEXEL0 / 0, `comb_sel_nolod()`) are not exact when turned on. `FastCombiner` and everything else are; with exact settings the output is identical to the scalar reference.
   - One-cycle perspective LOD with a max level above 0 is not angrylion-exact in the far part of the plane (angrylion's `tclod_1cycle_current` has span-edge cases the scalar kernel does not model; the NEON path follows the scalar reference). Detail and sharpen occur in no captured frame; they are covered by the fuzzers and synthetic scenes only.
   - In the captured Kirby 64 frame compared with angrylion, 25 pixels differ (inherited from the scalar reference). Some hidden-bit and COPY-mode details are still approximations.
   - The pseudo-random noise is not the hardware sequence.

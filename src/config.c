@@ -6,6 +6,7 @@ void foir_config_defaults(struct foir_config *c)
     c->fast_combiner = true;
     c->relaxed_precision = false;
     c->fast_persp = false;
+    c->no_lod = false;
     c->frame_skip = 0;
     c->skip_min_prims = 100;
     c->interlace_hack = true;

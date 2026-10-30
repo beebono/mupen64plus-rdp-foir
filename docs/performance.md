@@ -350,6 +350,25 @@ Combiner pixels of the 39 unseen games, by kind of kernel:
 | + shape list made from the 23 test ROMs (out of sample) | 71.0 % | 13.5 % | **15.5 %** (median 2.5 %) | 4 |
 | + shape list from 62 games (shipped; in-sample) | 71.0 % | 29.0 % | 0.0 % | 0 |
 
+## What `TextureLod` off saves
+
+Measured 2026-10-30 on the rgdsplus (performance governor) and the rg35xxsp (N64 Performance mode, 1512 MHz), foir devel with the framelog, arMLEt, core-dento with `RdpFullSyncDelay = 600000` and the adaptive maximum off, from the Banjo-Tooie and Mario Tennis slot-1 states, frames 150-700, LOD on and off alternated, 3 runs each on the rgdsplus and 2 on the rg35xxsp. Both games draw every second VI (VI-locked 30 fps), so the figure is the wall time of a drawn VI, whose budget is 33.3 ms; "over" is the share of drawn VIs above 34 ms.
+
+| | drawn VI mean | median | p95 | over 34 ms | worker busy sum | emulation thread helping |
+|---|---|---|---|---|---|---|
+| Banjo-Tooie, rgdsplus, LOD on | 33.9 | 31.8 | 38.4 | 12.7 % | 52.4 | 16.8 |
+| Banjo-Tooie, rgdsplus, off | **32.1** | 30.1 | 36.4 | 8.7 % | 47.4 | 15.1 |
+| Mario Tennis, rgdsplus, LOD on | 28.5 | 26.9 | 37.7 | 10.1 % | 36.3 | 14.0 |
+| Mario Tennis, rgdsplus, off | **27.2** | 25.4 | 34.8 | 6.0 % | 31.8 | 12.6 |
+| Banjo-Tooie, rg35xxsp, LOD on | 36.4 | 34.3 | 41.7 | 63.9 % | 53.4 | 17.2 |
+| Banjo-Tooie, rg35xxsp, off | **34.8** | 32.6 | 40.5 | 15.5 % | 47.9 | 15.5 |
+| Mario Tennis, rg35xxsp, LOD on | 30.3 | 28.6 | 39.2 | 15.5 % | 34.8 | 13.7 |
+| Mario Tennis, rg35xxsp, off | **28.8** | 27.2 | 36.3 | 10.2 % | 30.2 | 12.5 |
+
+The pixel work falls by 4.5-5.5 ms of worker time a frame; the drawn VI falls by 1.3-1.9 ms, the part of it the emulation thread was spending as helper at barriers (its own rendering time falls by the same 1.2-1.7 ms), which is the thread on the critical path (the [profile](#the-helper-in-game)). On the rg35xxsp Banjo-Tooie's median crosses under the budget. What the picture loses: Banjo-Tooie's grass turns grainy towards the horizon, Mario Tennis's net shows a moire (8.7 k / 23 k of the 69 k / 86 k screen pixels differ in the first frame); in motion both shimmer.
+
+A per-triangle LOD (the level from the edge record's texture-coordinate steps, the fraction kept) would remove only the LOD pass (`lod_pass_p1t`, 2-4 % of the emulation thread against 5-9 % for the whole LOD texture path) and keep the second level's fetch, so it is bounded at about a third of this; it was not built.
+
 ## What `RelaxedPrecision` saves
 
 Measured 2026-10-16 on rgdsplus (4x A55, `performance` governor, effective ~1.58 GHz), foir devel working tree built with `-DFOIR_FRAMELOG` (generic armv8-a -O3), rsp-hle + parallel-rsp as `RspFallback`, rsp-timing shim, `FOIR_THREADS=3`, scripted input (Pokemon Snap with no input), 75 s per run, frames after VI 1440 (about 2000-3000 frames per run). `RelaxedPrecision` is read at launch, so each setting is a separate launch; 10 games x 2 settings x 3 repeats = 60 runs in 20 sessions of 3 runs, the order alternating `True False True` / `False True False`, the lead flipped every other game. The frame-time source is the swap-to-swap time of `FOIR_FRAMELOG` (`tools/framelog.py`); "worker ms/frame" is the summed busy time of the pixel workers per frame, "RDP" is the emulation thread's time in `ProcessRDPList` (parse + setup + waits). Raw files and scripts: the session scratchpad (not in the repo). The in-game option was verified per run from the written config (`RelaxedPrecision = True / False`).

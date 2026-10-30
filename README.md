@@ -67,10 +67,11 @@ Main `[Video-Foir]` options (all of them, the environment variables and the suxt
 | `CropOverscanH`, `CropOverscanV` | `False` | Crop 8 columns (left and right) / 12 lines (top and bottom) of VI pixels off the image, to hide edge artefacts; display only |
 | `InterlaceHack` | `True` | Show only the freshest field of field-rendered interlaced frames |
 | `RelaxedPrecision` | `False` | `True` = faster Z compare for opaque/transparent modes (about 3 % of pixel-worker time); not exact (see Status) |
+| `TextureLod` | `True` | `False` = no mip-mapping, always the finest texture level (1.3-1.9 ms of a drawn VI in Banjo-Tooie / Mario Tennis); not exact, distant textures shimmer (see Status) |
 | `SyncHelper`, `FastCombiner`, `NEON`, `Specialize` | `True` | Speed paths; each is exact, `False` falls back to slower code |
 
 **In-game menu.** With mupen64plus-input-suxty as the input plugin, its menu gets a *FOIR Options* page: Widescreen, Smoothing (`Filter`), Interlace
-Hack, Frame Skip and the two overscan crops apply at once; VSync, Worker Threads, NEON, Specialised Kernels, Fast Combiner and Relaxed Precision apply at the next launch, and
+Hack, Frame Skip and the two overscan crops apply at once; VSync, Worker Threads, NEON, Specialised Kernels, Fast Combiner, Relaxed Precision, Fast Perspective and Texture LOD apply at the next launch, and
 can be stored per game.
 
 ## Status, accuracy and known gaps
@@ -80,6 +81,7 @@ offline on captured frames of 62 games. Known gaps (full list in [docs/design.md
 
 - **`RelaxedPrecision` (off by default) is not exact when turned on**: it drops the delta-Z terms of the opaque/transparent depth compare for partially covered
   pixels, which affects only coplanar edge cases, and saves about 3 % of pixel-worker time (0.1-0.6 ms/frame). The default is exact.
+- **`TextureLod = False` (default `True`) is not exact**: mip-mapping off, the finest level everywhere, so minified textures alias and shimmer (grass, nets). It takes the per-pixel LOD and the second level's fetch out of the texture kernels: 1.3-1.9 ms of a drawn VI in Banjo-Tooie and Mario Tennis.
 - **VI filters**: `VIDivot` and `VIGamma` are on by default, `VIAntiAliasing` and `VIDedither` opt-in (all four: 1.4-1.9 ms per frame on the handhelds, about 4.4-4.8 ms in a scene full of edges): anti-aliasing, divot, dither restore and gamma
   as the game enables them and the option allows, bit-exact with angrylion at the source pixels (not the VI's own resampling, not gamma-dither noise); otherwise the VI stage crops, converts and
   scales the framebuffer, with `InterlaceHack` for field-rendered interlaced frames. `FBRead` / `FBWrite` only drain the workers, so there is no framebuffer emulation for CPU effects.

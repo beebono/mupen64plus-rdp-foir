@@ -8,6 +8,7 @@ enum { FOIR_FRAMESKIP_AUTO = -1 };
 struct foir_config {
     bool fast_combiner;
     bool relaxed_precision;
+    bool no_lod;             /* TextureLod = False: mip-mapping off (tile 0 for both cycles, LOD fraction 0), not exact */
     bool fast_persp;         /* FastPerspective: float reciprocal instead of the table divide of perspective texture coordinates (not exact) */
     int  frame_skip;
     bool interlace_hack;

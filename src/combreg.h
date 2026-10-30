@@ -59,4 +59,15 @@ FOIR_INLINE int comb_reg_alpha(int pos, int sel)
     }
 }
 
+/* TextureLod off: TEXEL1 reads TEXEL0 and the LOD fraction is 0 (the mip lerp collapses to tile 0) */
+FOIR_INLINE int comb_sel_nolod(int pos, int sel, int alpha)
+{
+    if (alpha) {
+        if (pos == 2) return sel == 2 ? 1 : sel == 0 ? 7 : sel;
+        return sel == 2 ? 1 : sel;
+    }
+    if (pos == 2) return sel == 2 ? 1 : sel == 9 ? 8 : sel == 13 ? 31 : sel;
+    return sel == 2 ? 1 : sel;
+}
+
 #endif

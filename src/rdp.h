@@ -92,6 +92,7 @@ struct tile {
 
 struct other_modes {
     int cycle_type, persp_tex_en, detail_tex_en, sharpen_tex_en, tex_lod_en;
+    int tex_lod_cmd;         /* tex_lod_en as set by the command; tex_lod_en is cleared from it when TextureLod is off */
     int en_tlut, tlut_type, sample_type, mid_texel, bi_lerp0, bi_lerp1, convert_one, key_en;
     int rgb_dither_sel, alpha_dither_sel;
     int blend_m1a[2], blend_m1b[2], blend_m2a[2], blend_m2b[2];

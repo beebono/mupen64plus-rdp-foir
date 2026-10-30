@@ -176,7 +176,8 @@ void foir_spec_keys(const struct rdp *r, union spec_key keys[SPEC_NSTAGES], bool
     {
         struct comb_key *k = &keys[SPEC_COMB].comb;
         ok[SPEC_COMB] = !om->key_en;
-        for (int i = two ? 0 : 8; i < 16; i++) k->sel[i] = (uint8_t)r->comb.raw[i];
+        const int nolod = r->cfg.no_lod && om->tex_lod_cmd;
+        for (int i = two ? 0 : 8; i < 16; i++) k->sel[i] = (uint8_t)(nolod ? comb_sel_nolod(i & 3, r->comb.raw[i], (i & 4) != 0) : r->comb.raw[i]);
         k->two = (uint8_t)two;
         k->rgbd = (uint8_t)om->rgb_dither_sel; k->ad = (uint8_t)om->alpha_dither_sel;
         k->acmp = (uint8_t)(two && om->alpha_compare_en);
@@ -439,7 +440,7 @@ void foir_spec_apply(int stage, const union spec_key *key, struct rdp *r)
         om->sample_type = k->smp; om->en_tlut = k->tlut;
         if (!k->any) { om->tlut_type = k->tlt; om->mid_texel = k->mid; }       /* any format: the state keeps whatever it had */
         om->persp_tex_en = k->persp; om->bi_lerp0 = k->bl0; om->bi_lerp1 = k->bl1; om->convert_one = 0;
-        om->tex_lod_en = k->lodt; om->detail_tex_en = om->sharpen_tex_en = 0;
+        om->tex_lod_en = om->tex_lod_cmd = k->lodt; om->detail_tex_en = om->sharpen_tex_en = 0;
         if (k->any) {
             /* any format: the tiles keep the (random) formats they have, except YUV, which the texture unit does not handle */
             for (int t = 0; t < 8; t++)

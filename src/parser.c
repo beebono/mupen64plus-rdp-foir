@@ -42,19 +42,21 @@ static int reg_in_group(int idx, int base) { return idx >= base && idx < base + 
 static void combiner_resolve(struct rdp *r)
 {
     const int *c = r->comb.raw;
+    const int nolod = r->cfg.no_lod && r->om.tex_lod_cmd;
     /* raw: [0..3] suba, subb, mul, add of rgb0; [4..7] same for alpha0; [8..15] cycle 1 (selector -> register mapping: combreg.h) */
     for (int cy = 0; cy < 2; cy++) {
         for (int ch = 0; ch < 3; ch++)
             for (int i = 0; i < 4; i++)
-                r->comb.rgb[cy][i][ch] = (uint8_t)comb_reg_rgb(i, c[cy * 8 + i], ch);
+                r->comb.rgb[cy][i][ch] = (uint8_t)comb_reg_rgb(i, nolod ? comb_sel_nolod(i, c[cy * 8 + i], 0) : c[cy * 8 + i], ch);
         for (int i = 0; i < 4; i++)
-            r->comb.alpha[cy][i] = (uint8_t)comb_reg_alpha(i, c[cy * 8 + 4 + i]);
+            r->comb.alpha[cy][i] = (uint8_t)comb_reg_alpha(i, nolod ? comb_sel_nolod(i, c[cy * 8 + 4 + i], 1) : c[cy * 8 + 4 + i]);
     }
 }
 
 void rdp_update_derived(struct rdp *r)
 {
     struct other_modes *om = &r->om;
+    om->tex_lod_en = om->tex_lod_cmd && !r->cfg.no_lod;
     combiner_resolve(r);
 
     int first = (om->cycle_type == CYCLE_TYPE_2) ? 0 : 1;
@@ -130,7 +132,7 @@ static void cmd_set_other_modes(struct rdp *r, const uint32_t *a)
     om->persp_tex_en     = (a[0] >> 19) & 1;
     om->detail_tex_en    = (a[0] >> 18) & 1;
     om->sharpen_tex_en   = (a[0] >> 17) & 1;
-    om->tex_lod_en       = (a[0] >> 16) & 1;
+    om->tex_lod_en       = om->tex_lod_cmd = (a[0] >> 16) & 1;
     om->en_tlut          = (a[0] >> 15) & 1;
     om->tlut_type        = (a[0] >> 14) & 1;
     om->sample_type      = (a[0] >> 13) & 1;
