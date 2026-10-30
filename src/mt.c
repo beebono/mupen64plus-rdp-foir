@@ -486,12 +486,26 @@ const char *mt_stats_delta(struct rdp *r)
     return buf;
 }
 
+static int l_trace = -1;      /* FOIR_SYNC_TRACE=N: the first N barriers from texture loads and render-target conflicts, to stderr */
+
+static void trace_barrier(struct rdp *r, const char *what, uint32_t lo, uint32_t hi, const struct mt_region *p)
+{
+    struct rdp_mt *mt = r->mt;
+    if (l_trace < 0) l_trace = env_int("FOIR_SYNC_TRACE", 0);
+    if (l_trace <= 0) return;
+    l_trace--;
+    uint64_t head = atomic_load_explicit(&mt->head, memory_order_relaxed), fl = mt_floor(mt);
+    fprintf(stderr, "sync-trace %s: range %06x-%06x (%u bytes) hits target %06x w%d b%d rows %d-%d of its %06x-%06x; %llu jobs pending; fb %06x zb %06x w%d ti %06x w%d s%d\n",
+            what, lo, hi, hi - lo, p->addr, p->width, p->bpp, (int)(lo - p->addr) / (p->width * p->bpp), (int)(hi - 1 - p->addr) / (p->width * p->bpp), p->lo, p->hi,
+            (unsigned long long)(head - fl), r->fb_address, r->zb_address, r->fb_width, r->ti_address, r->ti_width, r->ti_size);
+}
+
 void mt_sync_range(struct rdp *r, uint32_t lo, uint32_t hi)
 {
     struct rdp_mt *mt = r->mt;
     if (!mt || mt->nreg == 0) return;
     for (int i = 0; i < mt->nreg; i++)
-        if (lo < mt->reg[i].hi && mt->reg[i].lo < hi) { mt->st.range_syncs++; mt_sync(r); return; }
+        if (lo < mt->reg[i].hi && mt->reg[i].lo < hi) { mt->st.range_syncs++; trace_barrier(r, "texload", lo, hi, &mt->reg[i]); mt_sync(r); return; }
 }
 
 void mt_submit(struct rdp *r, const struct prim_walk *pw, int start, int end)
@@ -508,7 +522,12 @@ void mt_submit(struct rdp *r, const struct prim_walk *pw, int start, int end)
     if ((ct == CYCLE_TYPE_1 || ct == CYCLE_TYPE_2) && r->pf.need_z)
         make_region(&regs[nregs++], r->zb_address, r->fb_width, 2, start, end);
     bool barrier = false;
-    for (int i = 0; i < nregs; i++) barrier |= region_conflict(mt, &regs[i]);
+    for (int i = 0; i < nregs; i++)
+        if (region_conflict(mt, &regs[i])) {           /* the same bytes under another row geometry */
+            barrier = true;
+            for (int k = 0; k < mt->nreg; k++)
+                if (regs[i].lo < mt->reg[k].hi && mt->reg[k].lo < regs[i].hi) { trace_barrier(r, i ? "ztarget" : "target", regs[i].lo, regs[i].hi, &mt->reg[k]); break; }
+        }
     if (!barrier) {
         int need = 0;
         for (int i = 0; i < nregs; i++) need += region_find(mt, &regs[i]) == NULL;

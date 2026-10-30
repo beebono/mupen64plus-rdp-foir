@@ -69,7 +69,8 @@ Always available:
 | `FOIR_FILLDEDUP=0\|1` | Skip a FILL rectangle identical to one already drawn (same image, colour, rectangle and scissor) when nothing has written its bytes since (no overlapping primitive, same display list). Default `1`; exact. Pokemon Snap clears its Z buffer twice in a row every frame. |
 | `FOIR_NEON_MASK=bits` | Which stages use NEON, one bit each: texture 0x01, combine 0x02, zcmp 0x04, blend 0x08, store 0x10, fill 0x20, copy 0x40 (default `0x7f`). A stage that is not NEON is not specialised either; `0x3f` = everything but the NEON COPY kernel. |
 | `FOIR_NEON_VERIFY=1` | Run every NEON stage next to the scalar kernel and count mismatches; use with `FOIR_KNOBS=exact` ([testing.md](testing.md#in-plugin-verifier)). |
-| `FOIR_MT_STATS=1` | Print worker-pool counters (jobs, syncs, ring waits, helper tasks) when the plugin shuts down. |
+| `FOIR_MT_STATS=1` | Print worker-pool counters (jobs, syncs, ring waits, helper tasks) when the plugin shuts down; the same counters per 120 frames are in the log's periodic `mt:` line. |
+| `FOIR_SYNC_TRACE=N` | Print the first N barriers raised by a texture load or a render-target conflict to stderr: the byte range, the target region it hits with its rows, and the jobs pending at that moment. |
 | `FOIR_LOGFILE=path` | Also append the plugin's log lines to this file (unbuffered). |
 | `FOIR_DUMP=prefix`, `FOIR_DUMP_FRAME=n`, `FOIR_DUMP_FRAMES=k` | Capture RDP frames for `foir-replay` (first frame, default 200; number of frames, default 2). |
 | `FOIR_SHOT_DIR=dir`, `FOIR_SHOT_FRAMES=a,b,...` | Write `frame_NNNNN.ppm` screenshots at these plugin frame numbers; an entry may be a range `a-b` or `a-b/step` (up to 4096 shots). |
