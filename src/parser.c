@@ -278,6 +278,11 @@ void rdp_run_command(struct rdp *r, const uint32_t *a)
             r->sync_wait_ms += (double)(t1.tv_sec - t0.tv_sec) * 1e3 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
         }
         r->frame_seed++;
+        r->clk_sync += r->clk_acc;
+        r->clk_win_sum += r->clk_acc;
+        if (r->clk_acc > r->clk_win_max) r->clk_win_max = r->clk_acc > 0xffffffffu ? 0xffffffffu : (uint32_t)r->clk_acc;
+        r->clk_win_n++;
+        r->clk_acc = 0;
         if (r->frame_end_cb) r->frame_end_cb(r->frame_end_ctx);
         if (r->mi_intr) *r->mi_intr |= MI_INTR_DP;
         if (r->check_interrupts) r->check_interrupts();

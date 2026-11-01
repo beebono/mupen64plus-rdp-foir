@@ -489,6 +489,9 @@ EXPORT void CALL UpdateScreen(void)
                      (all - l_cpu_all_base) / 120, (emu - l_cpu_emu_base) / 120, (all - l_cpu_all_base - emu + l_cpu_emu_base) / 120);
             l_cpu_all_base = all; l_cpu_emu_base = emu;
         }
+        foir_log(FOIR_LOG_INFO, "rdp clocks (estimate): %u full syncs, %.0f a sync on average, %u at most, %.0f a frame",
+                 l_rdp.clk_win_n, l_rdp.clk_win_n ? (double)l_rdp.clk_win_sum / l_rdp.clk_win_n : 0.0, l_rdp.clk_win_max, (double)l_rdp.clk_win_sum / 120);
+        l_rdp.clk_win_sum = 0; l_rdp.clk_win_max = l_rdp.clk_win_n = 0;
         if (l_rdp.mt) foir_log(FOIR_LOG_INFO, "%s", mt_stats_delta(&l_rdp));
         {
             uint64_t cov[COV_N], texall;
@@ -548,6 +551,14 @@ EXPORT void CALL ReadScreen2(void *dest, int *width, int *height, int front)
 
 /* core-dento: just before a DP interrupt is delivered. The game is about to look at the frame: finish it (DeferredDrain) */
 EXPORT void CALL FullSyncDelivered(void) { if (l_rom_open) rdp_sync(&l_rdp); }
+
+/* core-dento: the estimated RDP clocks of the commands before the SYNC_FULLs since the last call, for the DP interrupt's timing */
+EXPORT unsigned int CALL RdpSyncClocks(void)
+{
+    uint64_t c = l_rdp.clk_sync;
+    l_rdp.clk_sync = 0;
+    return c > 0xffffffffu ? 0xffffffffu : (unsigned int)c;
+}
 
 EXPORT void CALL FBRead(unsigned int addr) { (void)addr; if (l_rom_open) rdp_sync(&l_rdp); }
 EXPORT void CALL FBWrite(unsigned int addr, unsigned int size) { (void)addr; (void)size; if (l_rom_open) { rdp_sync(&l_rdp); raster_mem_written(&l_rdp); } }

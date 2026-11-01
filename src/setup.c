@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include <limits.h>
+#include <math.h>
 #include "rdp.h"
 
 static int32_t normalize_dzpix(int32_t sum)
@@ -195,10 +196,41 @@ bool setup_walk(struct rdp *r, const int32_t *ew, struct prim_walk *pw, int *pst
     return true;
 }
 
+/* The width of the span between edges a and b (x at y0, slope per line; pixels) at line y, inside the scissor */
+static double span_w(double a, double da, double b, double db, double y0, double y, double cw)
+{
+    double w = fabs((a + da * (y - y0)) - (b + db * (y - y0)));
+    return w < cw ? w : cw;
+}
+
+/* The RDP's time for a primitive, from its shape alone (the model armN64 uses): its area inside the scissor (each triangle half as a
+ * trapezoid), 1 clock a pixel in 1-cycle mode, 2 in 2-cycle, 4 pixels a clock in fill and copy mode, and a fixed setup. An estimate for
+ * the core's DP interrupt timing (RdpSyncClocks), not for drawing: memory and texture-load stalls are left out (the core scales it) */
+static uint32_t prim_clocks(const struct rdp *r, const int32_t *ew)
+{
+    unsigned id = (ew[0] >> 24) & 0x3f;
+    double y0 = SIGN(ew[1], 14) / 4.0, y1 = SIGN(ew[1] >> 16, 14) / 4.0, y2 = SIGN(ew[0], 14) / 4.0;
+    double xh = SIGN(ew[4], 28) / 65536.0, xm = SIGN(ew[6], 28) / 65536.0, xl = SIGN(ew[2], 28) / 65536.0;
+    double dh = SIGN(ew[5], 30) / 65536.0, dm = SIGN(ew[7], 30) / 65536.0, dl = SIGN(ew[3], 30) / 65536.0;
+    double cy0 = r->clip.yh / 4.0, cy1 = r->clip.yl / 4.0, cw = ((int)r->clip.xl - (int)r->clip.xh) / 4.0;
+    double px = 0, a, b;
+    if (cw <= 0) return 0;
+    a = y0 > cy0 ? y0 : cy0; b = y1 < cy1 ? y1 : cy1;                  /* the upper half: the major edge and xm */
+    if (b > a) px += (b - a) * (span_w(xh, dh, xm, dm, y0, a, cw) + span_w(xh, dh, xm, dm, y0, b, cw)) / 2;
+    a = y1 > cy0 ? y1 : cy0; b = y2 < cy1 ? y2 : cy1;                  /* the lower half: the major edge and xl */
+    if (b > a) px += (b - a) * (span_w(xh + dh * (y1 - y0), dh, xl, dl, y1, a, cw) + span_w(xh + dh * (y1 - y0), dh, xl, dl, y1, b, cw)) / 2;
+    if (r->om.cycle_type == CYCLE_TYPE_FILL || r->om.cycle_type == CYCLE_TYPE_COPY)
+        px /= 4;
+    else if (r->om.cycle_type == CYCLE_TYPE_2)
+        px *= 2;
+    return (uint32_t)px + (id == CMD_TEX_RECT || id == CMD_TEX_RECT_FLIP || id == CMD_FILL_RECT ? 10 : 20);
+}
+
 static void walk_edges(struct rdp *r, const int32_t *ew)
 {
     struct prim_walk pw;
     int start, end;
+    r->clk_acc += prim_clocks(r, ew);
     if (!setup_walk(r, ew, &pw, &start, &end)) return;
     r->stat_prims++;
     raster_draw(r, &pw, start, end);

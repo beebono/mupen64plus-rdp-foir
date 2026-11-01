@@ -17,6 +17,7 @@ ReadScreen2;
 SetRenderingCallback;
 ResizeVideoOutput;
 FullSyncDelivered;
+RdpSyncClocks;
 FBRead;
 FBWrite;
 FBGetFrameBufferInfo;

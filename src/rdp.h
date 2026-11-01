@@ -361,6 +361,9 @@ struct rdp {
     uint32_t fill_w[2];
     uint32_t stat_fill_skips;
     uint32_t stat_prims, stat_pixels;
+    uint64_t clk_acc, clk_sync;     /* estimated RDP clocks (setup.c prim_clocks): since the last SYNC_FULL, and up to the SYNC_FULLs not yet read (RdpSyncClocks) */
+    uint64_t clk_win_sum;           /* the estimate per SYNC_FULL since the last log line: sum, max, count */
+    uint32_t clk_win_max, clk_win_n;
 #ifdef FOIR_FRAMELOG
     uint32_t stat_loads;
 #endif
